@@ -1,0 +1,18 @@
+# Architecture Decision Records (ADRs)
+
+Significant architectural, security, and platform-integration decisions for `paseo-permission-guardian` are tracked here.
+
+## Index
+
+| ID | Title | Status | Date |
+| --- | --- | --- | --- |
+| [ADR-0001](./0001-deterministic-ast-first-with-effect-tags.md) | Deterministic AST-first analysis with effect tags and combination rules | Accepted | 2026-11-08 |
+| [ADR-0002](./0002-session-context-taint-and-cache-invalidation.md) | Session context, taint/provenance tracking, and decision cache boundaries | Accepted | 2026-11-08 |
+| [ADR-0003](./0003-paseo-integration-and-config-source-of-truth.md) | Paseo hook integration boundaries and configuration source of truth | Accepted | 2026-11-08 |
+| [ADR-0004](./0004-cross-platform-shell-and-path-strategy.md) | Cross-platform shell parsing, path resolution, and phased P1 rollout | Accepted | 2026-11-08 |
+
+## Creating a New ADR
+
+1. Copy [0000-template.md](./0000-template.md) to `NNNN-short-kebab-title.md`.
+2. Fill in Status (`Proposed` | `Accepted` | `Deprecated` | `Superseded by ADR-XXXX`), Context, Decision, Consequences, and Alternatives Considered.
+3. Add a row to the index table above and link it from [DESIGN.md](../DESIGN.md) where relevant.
