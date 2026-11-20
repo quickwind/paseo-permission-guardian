@@ -2,6 +2,7 @@ import {
   type PluginSurfaceProps,
   useRpc,
   useSettings,
+  useTranslation,
 } from "@getpaseo/plugin/client";
 import {
   Loading,
@@ -19,39 +20,50 @@ import { Text, View } from "react-native";
 import { getGuardianStatus } from "../shared/rpc.js";
 import { guardianSettings, type GuardianSettings } from "../shared/settings.js";
 import type { GuardianStatusSnapshot } from "../shared/types.js";
-
-const MODE_OPTIONS = [
-  { label: "Shadow (observe & audit only)", value: "shadow" as const },
-  { label: "Off (disabled)", value: "off" as const },
-  { label: "Act (available in P2, currently shadow)", value: "act" as const },
-];
-
-const TIMELINE_OPTIONS = [
-  { label: "Notable events only", value: "notable" as const },
-  { label: "All events", value: "all" as const },
-  { label: "Off", value: "off" as const },
-];
-
-const WINDOWS_SHELL_OPTIONS = [
-  { label: "PowerShell 7 (pwsh)", value: "pwsh7" as const },
-  { label: "Windows PowerShell 5.1", value: "pwsh5" as const },
-  { label: "Command Prompt (cmd.exe)", value: "cmd" as const },
-];
+import { messages } from "./i18n.js";
 
 export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
+  const { t } = useTranslation(messages);
   const settings = useSettings(guardianSettings);
   const fetchStatus = useRpc(getGuardianStatus);
   const [status, setStatus] = useState<GuardianStatusSnapshot | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+
+  const modeOptions = useMemo(
+    () => [
+      { label: t("mode.options.shadow"), value: "shadow" as const },
+      { label: t("mode.options.off"), value: "off" as const },
+      { label: t("mode.options.act"), value: "act" as const },
+    ],
+    [t],
+  );
+
+  const timelineOptions = useMemo(
+    () => [
+      { label: t("timeline.options.notable"), value: "notable" as const },
+      { label: t("timeline.options.all"), value: "all" as const },
+      { label: t("timeline.options.off"), value: "off" as const },
+    ],
+    [t],
+  );
+
+  const windowsShellOptions = useMemo(
+    () => [
+      { label: t("windowsShell.options.pwsh7"), value: "pwsh7" as const },
+      { label: t("windowsShell.options.pwsh5"), value: "pwsh5" as const },
+      { label: t("windowsShell.options.cmd"), value: "cmd" as const },
+    ],
+    [t],
+  );
 
   const refreshStatus = useCallback(() => {
     setStatusError(null);
     void fetchStatus({})
       .then((snapshot) => setStatus(snapshot))
       .catch((error) => {
-        setStatusError(error instanceof Error ? error.message : "Failed to load status");
+        setStatusError(error instanceof Error ? error.message : t("settings.loadStatusError"));
       });
-  }, [fetchStatus]);
+  }, [fetchStatus, t]);
 
   useEffect(() => {
     refreshStatus();
@@ -94,9 +106,9 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
         <Text style={styles.errorText}>{settings.error}</Text>
         <SettingsCard>
           <SettingsAction
-            label="Reset settings"
-            hint="Restore default Permission Guardian settings."
-            actionLabel="Reset"
+            label={t("settings.resetLabel")}
+            hint={t("settings.resetHint")}
+            actionLabel={t("settings.resetAction")}
             onPress={() => {
               void settings.reset();
             }}
@@ -114,97 +126,106 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     });
   };
 
+  const effectiveModeLabel = status
+    ? status.effectiveMode === "off"
+      ? t("mode.effectiveValues.off")
+      : t("mode.effectiveValues.shadow")
+    : "...";
+
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <SettingsSection title="Runtime mode">
+      <SettingsSection title={t("sections.runtimeMode")}>
         <SettingsCard>
           <SettingsSelect
-            label="Guardian mode"
-            hint="Shadow mode records and reconciles every permission request without answering prompts."
+            label={t("mode.label")}
+            hint={t("mode.hint")}
             value={values.mode}
-            options={MODE_OPTIONS}
+            options={modeOptions}
             disabled={settings.saving}
             onValueChange={(mode) => update({ mode })}
           />
           <SettingsSwitch
-            label="Treat deny as ask"
-            hint="Convert deny verdicts into human prompts instead of automatically denying."
+            label={t("denyAsAsk.label")}
+            hint={t("denyAsAsk.hint")}
             value={values.denyAsAsk}
             disabled={settings.saving}
             onValueChange={(denyAsAsk) => update({ denyAsAsk })}
           />
           <SettingsSelect
-            label="Timeline verbosity"
-            hint="Controls which events are appended to agent timelines."
+            label={t("timeline.label")}
+            hint={t("timeline.hint")}
             value={values.timelineVerbosity}
-            options={TIMELINE_OPTIONS}
+            options={timelineOptions}
             disabled={settings.saving}
             onValueChange={(timelineVerbosity) => update({ timelineVerbosity })}
           />
         </SettingsCard>
       </SettingsSection>
 
-      <SettingsSection title="Audit & policy">
+      <SettingsSection title={t("sections.auditAndPolicy")}>
         <SettingsCard>
           <SettingsSwitch
-            label="Include raw payloads in audit log"
-            hint="Raw provider payloads are redacted for known secrets before writing to JSONL."
+            label={t("audit.includeRawLabel")}
+            hint={t("audit.includeRawHint")}
             value={values.includeRawInAudit}
             disabled={settings.saving}
             onValueChange={(includeRawInAudit) => update({ includeRawInAudit })}
           />
           <SettingsSelect
-            label="Default Windows shell"
-            hint="Used when a Windows exec request does not specify a shell."
+            label={t("windowsShell.label")}
+            hint={t("windowsShell.hint")}
             value={values.windowsDefaultShell}
-            options={WINDOWS_SHELL_OPTIONS}
+            options={windowsShellOptions}
             disabled={settings.saving}
             onValueChange={(windowsDefaultShell) => update({ windowsDefaultShell })}
           />
           <SettingsInput
-            label="User policy path"
-            hint="Local YAML policy file path (read-only from UI)."
+            label={t("policy.userPathLabel")}
+            hint={t("policy.userPathHint")}
             initialValue={values.userPolicyPath}
             placeholder="~/.paseo/permission-guardian/policy.yaml"
             disabled={settings.saving}
             onChangeText={(userPolicyPath) => update({ userPolicyPath })}
           />
           <SettingsInput
-            label="Team policy path"
-            hint="Optional local file path distributed via Git, dotfiles, or MDM."
+            label={t("policy.teamPathLabel")}
+            hint={t("policy.teamPathHint")}
             initialValue={values.teamPolicyPath}
-            placeholder="/path/to/team-policy.yaml"
+            placeholder={t("policy.teamPathPlaceholder")}
             disabled={settings.saving}
             onChangeText={(teamPolicyPath) => update({ teamPolicyPath })}
           />
         </SettingsCard>
       </SettingsSection>
 
-      <SettingsSection title="Shadow audit status">
+      <SettingsSection title={t("sections.shadowAuditStatus")}>
         <SettingsCard>
           {statusError ? (
-            <SettingsRow label="Status error">
+            <SettingsRow label={t("status.errorLabel")}>
               <Text style={styles.errorText}>{statusError}</Text>
             </SettingsRow>
           ) : null}
-          <SettingsRow label="Effective mode">
-            <Text style={styles.metricValue}>{status?.effectiveMode ?? "..."}</Text>
+          <SettingsRow label={t("status.effectiveModeLabel")}>
+            <Text style={styles.metricValue}>{effectiveModeLabel}</Text>
           </SettingsRow>
-          <SettingsRow label="Total requests">
+          <SettingsRow label={t("status.totalRequestsLabel")}>
             <Text style={styles.metricValue}>{String(status?.metrics.totalRequests ?? 0)}</Text>
           </SettingsRow>
-          <SettingsRow label="Reconciled / Pending">
+          <SettingsRow label={t("status.reconciledPendingLabel")}>
             <Text style={styles.metricValue}>
               {`${status?.metrics.reconciledCount ?? 0} / ${status?.metrics.pendingCount ?? 0}`}
             </Text>
           </SettingsRow>
-          <SettingsRow label="False allows">
+          <SettingsRow label={t("status.falseAllowsLabel")}>
             <Text style={styles.metricValue}>{String(status?.metrics.falseAllowCount ?? 0)}</Text>
           </SettingsRow>
-          <SettingsRow label="Audit directory" hint={status?.dataDir ?? "Loading..."} />
+          <SettingsRow
+            label={t("status.auditDirLabel")}
+            hint={status?.dataDir ?? t("status.loading")}
+          />
           <SettingsAction
-            label="Refresh metrics"
-            actionLabel="Refresh"
+            label={t("status.refreshLabel")}
+            actionLabel={t("status.refreshAction")}
             onPress={refreshStatus}
           />
         </SettingsCard>
@@ -213,9 +234,7 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
       {settings.saveError ? (
         <Text style={styles.errorText}>{settings.saveError}</Text>
       ) : (
-        <Text style={styles.notice}>
-          P0 runs in shadow-only mode. Deterministic AST rules and act mode arrive in P1a/P2.
-        </Text>
+        <Text style={styles.notice}>{t("settings.p0Notice")}</Text>
       )}
     </ScrollView>
   );
