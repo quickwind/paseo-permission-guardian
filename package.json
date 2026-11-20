@@ -10,6 +10,7 @@
     "OVERVIEW.*.md",
     "LICENSE",
     "NOTICE",
+    "THIRD_PARTY_NOTICES",
     "index.client.ts",
     "index.client.tsx",
     "index.server.ts",
@@ -33,5 +34,10 @@
     "typescript": "^5.9.3",
     "vitest": "^3.2.4",
     "zod": "^4.4.3"
+  },
+  "dependencies": {
+    "@vscode/tree-sitter-wasm": "^0.3.1",
+    "smol-toml": "^1.9.1",
+    "web-tree-sitter": "^0.27.2"
   }
 }

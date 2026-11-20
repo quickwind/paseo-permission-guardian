@@ -33,6 +33,37 @@ export type AgreementOutcome =
   | "plugin_ask_human_deny"
   | "unknown";
 
+export type EffectTagName =
+  | "read"
+  | "read_secret"
+  | "write_worktree"
+  | "write_outside"
+  | "write_protected"
+  | "delete_worktree"
+  | "delete_outside"
+  | "exec_project"
+  | "exec_inline"
+  | "exec_network_sourced"
+  | "pkg_install"
+  | "net_read"
+  | "net_egress"
+  | "vcs_remote"
+  | "infra_read"
+  | "infra_mutate"
+  | "privilege"
+  | "system_destructive"
+  | "opaque";
+
+export interface EffectTag {
+  tag: EffectTagName;
+  layer: number;
+  target?: string;
+  reversibility?: "reversible" | "irreversible";
+  recursive?: boolean;
+  pluginSelf?: boolean;
+  detail?: string;
+}
+
 export interface ActionHost {
   os: HostOs;
   wsl?: {
@@ -78,6 +109,8 @@ export interface GuardianDecision {
   level: RiskLevel;
   verdict: GuardianVerdict;
   reasons: string[];
+  effects?: EffectTag[];
+  opaqueReasons?: string[];
   neverAutoAnswer?: boolean;
 }
 

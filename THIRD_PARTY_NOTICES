@@ -1,0 +1,22 @@
+THIRD-PARTY NOTICES
+
+This project incorporates or derives data and libraries from the following third-party works:
+
+1. safe-chains
+   Source: https://github.com/michaeldhopkins/safe-chains
+   License: MIT OR Apache-2.0
+   Usage: Declarative command definition schema and baseline command rules adapted in
+   server/knowledge/sc-registry/.
+
+2. web-tree-sitter and @vscode/tree-sitter-wasm (including tree-sitter-bash grammar)
+   Source: https://github.com/tree-sitter/tree-sitter, https://github.com/microsoft/vscode-tree-sitter-wasm
+   License: MIT
+   Usage: Pure WebAssembly bash AST parsing in server/shell/bash.ts.
+
+3. smol-toml
+   Source: https://github.com/squirrelchat/smol-toml
+   License: MIT
+   Usage: TOML parsing for command registry definitions.
+
+Note: This project does NOT use, reference, or port any code, rules, or data from
+Destructive Command Guard (dcg).

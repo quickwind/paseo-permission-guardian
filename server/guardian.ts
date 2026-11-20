@@ -1,13 +1,13 @@
 import type { PluginHookEvents } from "@getpaseo/plugin/server";
 import { DEFAULT_GUARDIAN_SETTINGS, type GuardianSettings } from "../shared/settings.js";
 import type {
-  Action,
-  GuardianDecision,
   GuardianStatusSnapshot,
   GuardianVerdict,
   ResolutionActor,
 } from "../shared/types.js";
 import { AuditStore } from "./audit/store.js";
+import { SessionContextStore, type TimelineFetcher } from "./context/session.js";
+import { decideAction } from "./decide.js";
 import { detectHostOs, normalizePermissionRequest } from "./normalize/index.js";
 
 export interface PluginAnsweredEntry {
@@ -19,15 +19,17 @@ export interface GuardianServiceOptions {
   auditStore: AuditStore;
   pluginVersion: string;
   initialSettings?: GuardianSettings;
+  sessionStore?: SessionContextStore;
   answeredTtlMs?: number;
   now?: () => number;
 }
 
 const DEFAULT_ANSWERED_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const NEVER_AUTO_ANSWER_KINDS = new Set<Action["kind"]>(["question", "plan", "mode"]);
+const CONTEXT_SENSITIVE_KINDS = new Set(["exec", "fetch", "other"]);
 
 export class PermissionGuardianService {
   private readonly auditStore: AuditStore;
+  private readonly sessionStore: SessionContextStore;
   private readonly pluginVersion: string;
   private readonly answeredTtlMs: number;
   private readonly now: () => number;
@@ -37,6 +39,7 @@ export class PermissionGuardianService {
 
   constructor(options: GuardianServiceOptions) {
     this.auditStore = options.auditStore;
+    this.sessionStore = options.sessionStore ?? new SessionContextStore();
     this.pluginVersion = options.pluginVersion;
     this.answeredTtlMs = options.answeredTtlMs ?? DEFAULT_ANSWERED_TTL_MS;
     this.now = options.now ?? (() => Date.now());
@@ -49,6 +52,10 @@ export class PermissionGuardianService {
 
   getSettings(): GuardianSettings {
     return this.settings;
+  }
+
+  getSessionStore(): SessionContextStore {
+    return this.sessionStore;
   }
 
   getStatus(): GuardianStatusSnapshot {
@@ -78,6 +85,7 @@ export class PermissionGuardianService {
 
   async handlePermissionBefore(
     payload: PluginHookEvents["agent.permission.before"],
+    fetchTimeline?: TimelineFetcher,
   ): Promise<void> {
     if (this.settings.mode === "off") {
       return;
@@ -94,7 +102,36 @@ export class PermissionGuardianService {
         includeRaw: this.settings.includeRawInAudit,
       });
 
-      const decision = this.evaluateP0ShadowDecision(normalized.action, normalized.warnings);
+      const pathCtx = {
+        cwd: normalized.action.cwd,
+        worktreeRoot: normalized.action.worktreeRoot ?? payload.agent.cwd,
+        pluginDataDir: this.auditStore.getDataDir(),
+      };
+
+      // Incremental same-turn timeline sync for context-sensitive calls (ADR-0002)
+      const session = CONTEXT_SENSITIVE_KINDS.has(normalized.action.kind)
+        ? await this.sessionStore.syncFromTimeline(payload.agent.id, pathCtx, fetchTimeline)
+        : this.sessionStore.getOrCreate(payload.agent.id);
+
+      const evaluated = await decideAction(normalized.action, {
+        pathCtx,
+        session,
+        denyAsAsk: this.settings.denyAsAsk,
+      });
+
+      // Update live session context from this request's effects
+      if (evaluated.touchedSecret) {
+        this.sessionStore.markSecretTaint(payload.agent.id);
+      }
+      if (evaluated.touchedUntrusted) {
+        this.sessionStore.markUntrustedTaint(payload.agent.id);
+      }
+      if (normalized.action.kind === "edit" && normalized.action.paths) {
+        for (const p of normalized.action.paths) {
+          this.sessionStore.recordFileModification(payload.agent.id, p, pathCtx);
+        }
+      }
+
       const latencyMs = Math.max(0, this.now() - startedAt);
 
       await this.auditStore.recordBefore({
@@ -107,7 +144,7 @@ export class PermissionGuardianService {
         normalizedBy: normalized.normalizedBy,
         warnings: normalized.warnings,
         action: normalized.action,
-        decision,
+        decision: evaluated.decision,
       });
     } catch (error) {
       // Fail-to-human invariant: never auto-allow, never auto-deny, never break Paseo hook delivery.
@@ -149,33 +186,16 @@ export class PermissionGuardianService {
     }
   }
 
-  async flush(): Promise<void> {
-    await this.auditStore.flush();
+  handleTurnAfter(agentId: string): void {
+    this.sessionStore.onTurnEnd(agentId);
   }
 
-  private evaluateP0ShadowDecision(action: Action, warnings: string[]): GuardianDecision {
-    if (NEVER_AUTO_ANSWER_KINDS.has(action.kind)) {
-      return {
-        level: "L2",
-        verdict: "ask",
-        reasons: [`never_auto_answer:${action.kind}`],
-        neverAutoAnswer: true,
-      };
-    }
+  handleAgentClosed(agentId: string): void {
+    this.sessionStore.deleteSession(agentId);
+  }
 
-    const reasons = ["p0_shadow_only"];
-    if (action.kind === "other") {
-      reasons.push("unclassified_action");
-    }
-    if (warnings.length > 0) {
-      reasons.push(...warnings);
-    }
-
-    return {
-      level: "L1",
-      verdict: "ask",
-      reasons,
-    };
+  async flush(): Promise<void> {
+    await this.auditStore.flush();
   }
 
   private resolveActor(requestId: string): ResolutionActor {

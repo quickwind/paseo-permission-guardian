@@ -4,6 +4,7 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { getGuardianStatus } from "./shared/rpc.js";
 import { DEFAULT_GUARDIAN_SETTINGS, guardianSettings } from "./shared/settings.js";
 import { AuditStore } from "./server/audit/store.js";
+import type { TimelineFetcher } from "./server/context/session.js";
 import { PermissionGuardianService } from "./server/guardian.js";
 
 const PLUGIN_VERSION = "0.1.0";
@@ -50,12 +51,35 @@ export default function contribute(server: PluginServerContext) {
     }
   });
 
-  const removeBeforeHook = server.addHook("agent.permission.before", async (payload) => {
-    await guardian.handlePermissionBefore(payload);
-  });
+  const removeBeforeHook = server.addHook(
+    "agent.permission.before",
+    async (payload, context) => {
+      const fetchTimeline: TimelineFetcher = async (agentId) => {
+        const res = await context.paseo.agents.ref(agentId).timeline.refetch({
+          direction: "tail",
+          limit: 1,
+          wholeTurns: true,
+        });
+        return res.entries.map((entry) => entry.item);
+      };
+      await guardian.handlePermissionBefore(payload, fetchTimeline);
+    },
+  );
 
   const removeAfterHook = server.addHook("agent.permission.after", async (payload) => {
     await guardian.handlePermissionAfter(payload);
+  });
+
+  const removeTurnAfterHook = server.addHook("agent.turn.after", async (payload) => {
+    guardian.handleTurnAfter(payload.agent.id);
+  });
+
+  const removeCloseAfterHook = server.addHook("agent.close.after", async (payload) => {
+    guardian.handleAgentClosed(payload.agent.id);
+  });
+
+  const removeArchiveAfterHook = server.addHook("agent.archive.after", async (payload) => {
+    guardian.handleAgentClosed(payload.agent.id);
   });
 
   server.handle(getGuardianStatus, async () => guardian.getStatus());
@@ -63,6 +87,9 @@ export default function contribute(server: PluginServerContext) {
   return async () => {
     removeBeforeHook();
     removeAfterHook();
+    removeTurnAfterHook();
+    removeCloseAfterHook();
+    removeArchiveAfterHook();
     await unsubscribeSettings();
     await guardian.flush();
   };
