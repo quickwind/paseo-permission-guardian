@@ -117,6 +117,7 @@ export class PermissionGuardianService {
         pathCtx,
         session,
         denyAsAsk: this.settings.denyAsAsk,
+        envSnapshot: process.env,
       });
 
       // Update live session context from this request's effects

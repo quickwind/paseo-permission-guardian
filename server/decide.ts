@@ -6,6 +6,7 @@ import type {
   RiskLevel,
 } from "../shared/types.js";
 import type { SessionState } from "./context/session.js";
+import { redactString } from "./audit/redact.js";
 import {
   analyzeActionEffects,
   hasNetReadPipedToInterpreter,
@@ -69,7 +70,9 @@ function baseLevelForEffect(effect: EffectTag): { level: RiskLevel; reason?: str
       return { level: "L1", reason: `opaque:${effect.detail ?? effect.target ?? "unknown"}` };
 
     case "exec_inline":
-      return { level: "L1", reason: `exec_inline:${effect.detail ?? effect.target ?? ""}` };
+      return effect.detail === "execution_policy_bypass"
+        ? { level: "L2", reason: "execution_policy_bypass" }
+        : { level: "L1", reason: `exec_inline:${effect.detail ?? effect.target ?? ""}` };
 
     case "exec_network_sourced":
       return { level: "L1", reason: `exec_network_sourced:${effect.target ?? ""}` };
@@ -184,10 +187,35 @@ export async function decideAction(
     reasons.push("combo:secret_taint_and_net_egress");
   }
 
-  // Rule 3: net_read piped into an interpreter (curl | sh, wget | bash) -> L3 deny
+  // Rule 3: net_read piped into an interpreter, network read + dynamic eval, or downloaded-and-executed file -> L3 deny
   if (hasNetReadPipedToInterpreter(pipelines)) {
     maxLevel = elevateLevel(maxLevel, "L3");
     reasons.push("combo:net_read_piped_to_interpreter");
+  }
+
+  const hasAnyNetRead = effects.some((e) => e.tag === "net_read");
+  const hasDynamicPwshEval = effects.some(
+    (e) =>
+      e.tag === "exec_inline" &&
+      ((e.target === "Invoke-Expression" && e.detail !== "iex_static") ||
+        e.target === "[scriptblock]::Create"),
+  );
+  const hasAnyPwshEval = effects.some(
+    (e) =>
+      e.tag === "exec_inline" &&
+      (e.target === "Invoke-Expression" || e.target === "[scriptblock]::Create"),
+  );
+  if (hasAnyNetRead && hasDynamicPwshEval) {
+    maxLevel = elevateLevel(maxLevel, "L3");
+    reasons.push("combo:net_read_and_dynamic_eval");
+  } else if (hasAnyNetRead && hasAnyPwshEval) {
+    maxLevel = elevateLevel(maxLevel, "L2");
+    reasons.push("combo:net_read_and_static_eval");
+  }
+
+  if (effects.some((e) => e.tag === "exec_network_sourced" && e.detail === "downloaded_and_executed")) {
+    maxLevel = elevateLevel(maxLevel, "L3");
+    reasons.push("combo:download_and_execute_file");
   }
 
   const denyAsAsk = options.denyAsAsk ?? false;
@@ -197,13 +225,21 @@ export async function decideAction(
     reasons.push("deterministic_l0_safe");
   }
 
+  const redactedReasons = Array.from(new Set(reasons.map((r) => redactString(r))));
+  const redactedOpaqueReasons = Array.from(new Set(opaqueReasons.map((r) => redactString(r))));
+  const redactedEffects = effects.map((e) => ({
+    ...e,
+    ...(e.target !== undefined ? { target: redactString(e.target) } : {}),
+    ...(e.detail !== undefined ? { detail: redactString(e.detail) } : {}),
+  }));
+
   return {
     decision: {
       level: maxLevel,
       verdict,
-      reasons: Array.from(new Set(reasons)),
-      effects,
-      ...(opaqueReasons.length > 0 ? { opaqueReasons } : {}),
+      reasons: redactedReasons,
+      effects: redactedEffects,
+      ...(redactedOpaqueReasons.length > 0 ? { opaqueReasons: redactedOpaqueReasons } : {}),
     },
     touchedSecret: analysis.touchedSecret,
     touchedUntrusted: analysis.touchedUntrusted,

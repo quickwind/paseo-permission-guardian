@@ -67,7 +67,7 @@ export function normalizeClaudeRequest(
     };
   }
 
-  if (lowerTool === "bash" || lowerTool === "powershell" || lowerTool === "pwsh" || lowerTool === "shell") {
+  if (lowerTool === "bash" || lowerTool === "powershell" || lowerTool === "pwsh" || lowerTool === "cmd" || lowerTool === "shell") {
     const command =
       asNonEmptyString(input?.command) ??
       (request.detail?.type === "shell" ? asNonEmptyString(request.detail.command) : undefined);

@@ -271,20 +271,28 @@ describe("ADR-0005 environment classification & bash AST hardening", () => {
       expect(standaloneIfs.decision.verdict).toBe("ask");
     });
 
-    it("escalates relative paths after cd or inside env -C to L1 opaque", async () => {
-      const afterCd = await decideAction(bashAction("cd / && rm -f etc/passwd"), {
+    it("resolves static cd and env -C accurately while escalating dynamic cd and env -C to L1 opaque", async () => {
+      const staticCdOutside = await decideAction(bashAction("cd / && rm -f etc/passwd"), {
         pathCtx: defaultPathCtx,
         denyAsAsk: false,
       });
-      expect(afterCd.decision.level).toBe("L1");
-      expect(afterCd.decision.verdict).toBe("ask");
+      expect(staticCdOutside.decision.level).toBe("L2");
+      expect(staticCdOutside.decision.verdict).toBe("ask");
+      expect(staticCdOutside.decision.effects?.some((e) => e.tag === "delete_outside")).toBe(true);
 
-      const envChdir = await decideAction(bashAction("env -C / cat etc/passwd"), {
+      const dynamicAfterCd = await decideAction(bashAction('cd "$DIR" && rm -f etc/passwd'), {
         pathCtx: defaultPathCtx,
         denyAsAsk: false,
       });
-      expect(envChdir.decision.level).toBe("L1");
-      expect(envChdir.decision.verdict).toBe("ask");
+      expect(dynamicAfterCd.decision.level).toBe("L1");
+      expect(dynamicAfterCd.decision.verdict).toBe("ask");
+
+      const dynamicEnvChdir = await decideAction(bashAction('env -C "$DIR" cat etc/passwd'), {
+        pathCtx: defaultPathCtx,
+        denyAsAsk: false,
+      });
+      expect(dynamicEnvChdir.decision.level).toBe("L1");
+      expect(dynamicEnvChdir.decision.verdict).toBe("ask");
     });
   });
 

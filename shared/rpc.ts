@@ -28,3 +28,21 @@ export const getGuardianStatus = defineRpc({
     metrics: AuditMetricsSummarySchema,
   }),
 });
+
+export const evaluateGuardianDryRun = defineRpc({
+  name: "guardian.dry_run",
+  input: z.object({
+    shell: z.enum(["bash", "cmd", "pwsh5", "pwsh7", "argv"]),
+    source: z.string().max(32_768),
+    hostOs: z.enum(["darwin", "linux", "windows"]).default("linux"),
+    cwd: z.string().default("/tmp"),
+    worktreeRoot: z.string().optional(),
+    home: z.string().optional(),
+  }),
+  output: z.object({
+    level: z.enum(["L0", "L1", "L2", "L3"]),
+    verdict: z.enum(["allow", "ask", "deny"]),
+    reasons: z.array(z.string()),
+    touchedSecret: z.boolean(),
+  }),
+});

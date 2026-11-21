@@ -1,6 +1,25 @@
 import { realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, resolve } from "node:path";
+import {
+  classifyWindowsPath,
+  mapMsysToWindowsPath,
+  mapWindowsToWslPath,
+  mapWslToWindowsPath,
+  stripProviderDrive,
+  type WindowsPathClassification,
+  type WindowsPathContext,
+} from "./windows.js";
+
+export {
+  classifyWindowsPath,
+  mapMsysToWindowsPath,
+  mapWindowsToWslPath,
+  mapWslToWindowsPath,
+  stripProviderDrive,
+  type WindowsPathClassification,
+  type WindowsPathContext,
+};
 
 export interface PathContext {
   cwd: string;
@@ -9,6 +28,7 @@ export interface PathContext {
   pluginDataDir?: string;
   extraSensitivePatterns?: string[];
   extraProtectedPatterns?: string[];
+  skipHostRealpath?: boolean;
 }
 
 export interface PathClassification {
@@ -95,12 +115,29 @@ const ENTRYPOINT_BASENAMES = new Set([
   "taskfile.yaml",
 ]);
 
+function toPosixSlash(value: string): string {
+  return value.replaceAll("\\", "/");
+}
+
+function isPosixStyleRoot(p: string): boolean {
+  return p.startsWith("/") && !p.startsWith("//") && !/^[A-Za-z]:/.test(p);
+}
+
+function joinAware(base: string, ...segments: string[]): string {
+  return isPosixStyleRoot(base) ? posix.join(base, ...segments) : join(base, ...segments);
+}
+
 /**
  * Resolve the real path of an existing file/directory, or walk up to the nearest
  * existing ancestor, resolve its realpath, and re-append the remaining segments.
  * Prevents symlinked parent directories from escaping worktree checks (ADR-0004).
  */
 export function resolveAncestorRealPath(absolutePath: string): string {
+  // Preserve virtual POSIX paths (e.g. `/repo` in cross-platform tests) on Windows hosts
+  if (process.platform === "win32" && isPosixStyleRoot(absolutePath)) {
+    return posix.resolve(absolutePath);
+  }
+
   const normalized = resolve(absolutePath);
   const trailingSegments: string[] = [];
   let current = normalized;
@@ -124,48 +161,66 @@ export function resolveAncestorRealPath(absolutePath: string): string {
 }
 
 export function expandPosixPath(rawPath: string, cwd: string, home: string): string {
+  const usePosixRules =
+    isPosixStyleRoot(cwd) &&
+    !/^[A-Za-z]:/.test(rawPath.trim()) &&
+    !rawPath.includes("\\");
+  const pathJoin = isPosixStyleRoot(home) ? posix.join : join;
+
   let expanded = rawPath.trim();
   if (expanded === "~") {
     expanded = home;
   } else if (expanded.startsWith("~/")) {
-    expanded = join(home, expanded.slice(2));
+    expanded = pathJoin(home, expanded.slice(2));
   } else if (expanded.startsWith("$HOME/")) {
-    expanded = join(home, expanded.slice("$HOME/".length));
+    expanded = pathJoin(home, expanded.slice("$HOME/".length));
   } else if (expanded === "$HOME" || expanded === "${HOME}") {
     expanded = home;
   } else if (expanded.startsWith("${HOME}/")) {
-    expanded = join(home, expanded.slice("${HOME}/".length));
+    expanded = pathJoin(home, expanded.slice("${HOME}/".length));
+  } else if (expanded === "$PWD" || expanded === "${PWD}") {
+    expanded = cwd;
+  } else if (expanded.startsWith("$PWD/")) {
+    expanded = pathJoin(cwd, expanded.slice("$PWD/".length));
+  } else if (expanded.startsWith("${PWD}/")) {
+    expanded = pathJoin(cwd, expanded.slice("${PWD}/".length));
   }
 
+  if (usePosixRules && isPosixStyleRoot(expanded)) {
+    return posix.resolve(expanded);
+  }
+  if (usePosixRules && !/^[A-Za-z]:/.test(expanded)) {
+    return posix.resolve(cwd, expanded);
+  }
   return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
 }
 
 function isPathUnder(candidate: string, root: string): boolean {
-  const normCandidate = candidate.replace(/\/+$/, "") || "/";
-  const normRoot = root.replace(/\/+$/, "") || "/";
+  let normCandidate = toPosixSlash(candidate).replace(/\/+$/, "") || "/";
+  let normRoot = toPosixSlash(root).replace(/\/+$/, "") || "/";
+  if (/^[A-Za-z]:\//.test(normCandidate) || /^[A-Za-z]:\//.test(normRoot)) {
+    normCandidate = normCandidate.toLowerCase();
+    normRoot = normRoot.toLowerCase();
+  }
   if (normRoot === "/") {
-    return true;
+    return isPosixStyleRoot(normCandidate);
   }
   return normCandidate === normRoot || normCandidate.startsWith(`${normRoot}/`);
 }
 
 function hasPathSegment(candidate: string, segment: string): boolean {
-  const parts = candidate.split("/").filter(Boolean);
+  const parts = toPosixSlash(candidate).split("/").filter(Boolean);
   return parts.includes(segment);
 }
 
-function toPosixSlash(value: string): string {
-  return value.replaceAll("\\", "/");
-}
-
 function matchSimpleGlob(candidate: string, pattern: string): boolean {
-  const escaped = pattern
+  const escaped = toPosixSlash(pattern)
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*\*/g, "§GLOBSTAR§")
     .replace(/\*/g, "[^/]*")
     .replace(/§GLOBSTAR§/g, ".*");
   const regex = new RegExp(`^${escaped}$`);
-  return regex.test(candidate);
+  return regex.test(toPosixSlash(candidate));
 }
 
 export function isBuildOrScriptEntrypoint(filePath: string, worktreeRoot?: string): boolean {
@@ -178,7 +233,7 @@ export function isBuildOrScriptEntrypoint(filePath: string, worktreeRoot?: strin
   let rel = norm;
   if (worktreeRoot) {
     const normRoot = toPosixSlash(worktreeRoot).replace(/\/+$/, "");
-    if (norm.startsWith(`${normRoot}/`)) {
+    if (norm.toLowerCase().startsWith(`${normRoot.toLowerCase()}/`)) {
       rel = norm.slice(normRoot.length + 1);
     }
   }
@@ -193,13 +248,14 @@ export function isBuildOrScriptEntrypoint(filePath: string, worktreeRoot?: strin
 }
 
 export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassification {
+  const resolveReal = (p: string): string => (ctx.skipHostRealpath ? p : resolveAncestorRealPath(p));
   const home = ctx.home ?? homedir();
-  const realHome = resolveAncestorRealPath(home);
+  const realHome = resolveReal(home);
   const normalized = expandPosixPath(rawPath, ctx.cwd, home);
-  const realPath = resolveAncestorRealPath(normalized);
+  const realPath = resolveReal(normalized);
 
   const worktreeBase = ctx.worktreeRoot ?? ctx.cwd;
-  const realWorktree = resolveAncestorRealPath(worktreeBase);
+  const realWorktree = resolveReal(worktreeBase);
   const inWorktree = isPathUnder(realPath, realWorktree);
 
   const tempRoots = Array.from(
@@ -220,11 +276,14 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
 
   // Sensitive paths check (evaluated on both normalized and realPath)
   const candidates = Array.from(new Set([normalized, realPath]));
-  const base = basename(realPath);
+  const base = posix.basename(toPosixSlash(realPath));
 
   for (const candidate of candidates) {
     for (const sub of HOME_SENSITIVE_SUBPATHS) {
-      if (isPathUnder(candidate, join(home, sub)) || isPathUnder(candidate, join(realHome, sub))) {
+      if (
+        isPathUnder(candidate, joinAware(home, sub)) ||
+        isPathUnder(candidate, joinAware(realHome, sub))
+      ) {
         isSensitive = true;
         matchedRules.push(`sensitive:home:${sub}`);
       }
@@ -235,7 +294,7 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
         matchedRules.push(`sensitive:system:${sysPath}`);
       }
     }
-    if (/^\/proc\/(?:self|thread-self|\d+)\/environ$/.test(candidate)) {
+    if (/^\/proc\/(?:self|thread-self|\d+)\/environ$/.test(toPosixSlash(candidate))) {
       isSensitive = true;
       matchedRules.push("sensitive:system:proc_environ");
     }
@@ -250,8 +309,8 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
   }
 
   // Protected paths check
-  const pluginDir = ctx.pluginDataDir ?? join(home, ".paseo", "permission-guardian");
-  const realPluginDir = resolveAncestorRealPath(pluginDir);
+  const pluginDir = ctx.pluginDataDir ?? joinAware(home, ".paseo", "permission-guardian");
+  const realPluginDir = resolveReal(pluginDir);
   if (isPathUnder(realPath, realPluginDir) || isPathUnder(normalized, pluginDir)) {
     isProtected = true;
     isPluginSelf = true;
@@ -260,7 +319,10 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
 
   for (const candidate of candidates) {
     for (const sub of HOME_PROTECTED_SUBPATHS) {
-      if (isPathUnder(candidate, join(home, sub)) || isPathUnder(candidate, join(realHome, sub))) {
+      if (
+        isPathUnder(candidate, joinAware(home, sub)) ||
+        isPathUnder(candidate, joinAware(realHome, sub))
+      ) {
         isProtected = true;
         if (sub === ".paseo/permission-guardian") {
           isPluginSelf = true;
@@ -278,8 +340,8 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
     // Protect agent configs and CI workflows inside worktree or anywhere
     for (const prefix of REPO_PROTECTED_PREFIXES) {
       if (
-        isPathUnder(candidate, join(realWorktree, prefix)) ||
-        isPathUnder(candidate, join(worktreeBase, prefix))
+        isPathUnder(candidate, joinAware(realWorktree, prefix)) ||
+        isPathUnder(candidate, joinAware(worktreeBase, prefix))
       ) {
         isProtected = true;
         matchedRules.push(`protected:repo:${prefix}`);
@@ -315,4 +377,97 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
     isPluginSelf,
     matchedRules: Array.from(new Set(matchedRules)),
   };
+}
+
+/**
+ * Unified OS-aware path classifier.
+ * Routes Windows paths, UNC shares, and PowerShell provider drives to `classifyWindowsPath`,
+ * and checks DrvFs (`/mnt/<drive>/...`) paths case-insensitively across both worlds.
+ */
+export function classifyPath(
+  rawPath: string,
+  ctx: WindowsPathContext,
+): WindowsPathClassification {
+  const trimmed = rawPath.trim();
+  const isWinShellOrOs =
+    ctx.os === "windows" || ctx.shell === "cmd" || ctx.shell === "pwsh5" || ctx.shell === "pwsh7";
+  const isStrictWinLiteral =
+    (isWinShellOrOs ? /^[A-Za-z]:/.test(trimmed) : /^[A-Za-z]:[\\/]/.test(trimmed)) ||
+    trimmed.startsWith("\\\\") ||
+    /^\/\/(?:wsl\$|wsl\.localhost|localhost|127\.0\.0\.1)/i.test(trimmed) ||
+    (isWinShellOrOs && trimmed.startsWith("//")) ||
+    (isWinShellOrOs && stripProviderDrive(trimmed) !== null);
+  const isWinMacroLiteral =
+    (ctx.shell !== "pwsh5" && ctx.shell !== "pwsh7" && /%[^%\r\n=]+%/.test(trimmed)) ||
+    (ctx.shell !== "cmd" && /\$env:/i.test(trimmed));
+
+  if (ctx.shell !== "bash" && (ctx.os === "windows" || isStrictWinLiteral || isWinMacroLiteral)) {
+    return classifyWindowsPath(rawPath, ctx);
+  }
+  if (ctx.shell === "bash" && isStrictWinLiteral) {
+    return classifyWindowsPath(rawPath, { ...ctx, os: "windows" });
+  }
+
+  const automount = ctx.wsl?.automountRoot ?? "/mnt";
+  const toPosixCtxPath = (p: string | undefined, fallback: string): string => {
+    if (!p) return fallback;
+    if (/^[A-Za-z]:/.test(p) || p.startsWith("\\\\")) {
+      return mapWindowsToWslPath(p, automount) ?? toPosixSlash(p);
+    }
+    return p;
+  };
+
+  const skipHostRealpath = Boolean(ctx.wsl) && process.platform !== "linux";
+  const posixCtx: PathContext =
+    ctx.shell === "bash" && ctx.os === "windows"
+      ? {
+          ...ctx,
+          cwd: toPosixCtxPath(ctx.cwd, "/"),
+          worktreeRoot: ctx.worktreeRoot ? toPosixCtxPath(ctx.worktreeRoot, "/") : undefined,
+          home: toPosixCtxPath(ctx.home, "/home/user"),
+          skipHostRealpath,
+        }
+      : skipHostRealpath
+        ? { ...ctx, skipHostRealpath }
+        : ctx;
+
+  const posixRes = classifyPosixPath(rawPath, posixCtx);
+
+  // DrvFs (`/mnt/<drive>/...`) and MSYS/Git Bash (`/c/...`, `/cygdrive/c/...`) cross-world checks
+  const mapToWin = (p: string): string | null =>
+    mapWslToWindowsPath(p, automount) ??
+    (ctx.os === "windows" || p.startsWith("/cygdrive/") ? mapMsysToWindowsPath(p) : null);
+
+  const mappedWin = mapToWin(posixRes.realPath) ?? mapToWin(posixRes.normalized);
+  if (mappedWin) {
+    const winWorktree = ctx.worktreeRoot
+      ? /^[A-Za-z]:/.test(ctx.worktreeRoot) || ctx.worktreeRoot.startsWith("\\\\")
+        ? ctx.worktreeRoot
+        : (mapToWin(ctx.worktreeRoot) ?? undefined)
+      : undefined;
+    const winCwd =
+      /^[A-Za-z]:/.test(ctx.cwd) || ctx.cwd.startsWith("\\\\")
+        ? ctx.cwd
+        : (mapToWin(ctx.cwd) ?? "C:\\");
+    const winRes = classifyWindowsPath(mappedWin, {
+      ...ctx,
+      os: "windows",
+      cwd: winCwd,
+      worktreeRoot: winWorktree,
+    });
+    return {
+      ...posixRes,
+      inWorktree: posixRes.inWorktree || (Boolean(winWorktree) && winRes.inWorktree),
+      isSensitive: posixRes.isSensitive || winRes.isSensitive,
+      isProtected: posixRes.isProtected || winRes.isProtected,
+      isPluginSelf: posixRes.isPluginSelf || winRes.isPluginSelf,
+      windowsMappedPath: mappedWin,
+      ...(winRes.adsStream ? { adsStream: winRes.adsStream } : {}),
+      ...(winRes.hasUnresolvedShortName ? { hasUnresolvedShortName: true } : {}),
+      ...(winRes.isReservedDevice ? { isReservedDevice: true } : {}),
+      matchedRules: Array.from(new Set([...posixRes.matchedRules, ...winRes.matchedRules])),
+    };
+  }
+
+  return posixRes;
 }

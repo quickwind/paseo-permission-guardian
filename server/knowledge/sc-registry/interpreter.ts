@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 import { parse as parseToml } from "smol-toml";
-import { classifyPosixPath, type PathClassification, type PathContext } from "../../paths/index.js";
+import { classifyPath, type PathClassification, type PathContext } from "../../paths/index.js";
 import { BUILTINS_TOML } from "./builtins.js";
 
 export type SafeChainsLevel = "Inert" | "SafeRead" | "SafeWrite" | "ExecProject";
@@ -31,6 +31,7 @@ export interface RegistryMatchResult {
   level?: SafeChainsLevel;
   reason?: string;
   sweptPaths: PathClassification[];
+  dynamicPaths: string[];
 }
 
 const PATH_LIKE_FLAGS = new Set([
@@ -49,6 +50,7 @@ const PATH_LIKE_FLAGS = new Set([
   "-p",
   "--path",
   "--cwd",
+  "--prefix",
 ]);
 
 function normalizeCommandName(raw: string): string {
@@ -75,6 +77,35 @@ function looksLikePathCandidate(token: string): boolean {
   }
   return false;
 }
+
+const FILE_POSITIONAL_COMMANDS = new Set([
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "stat",
+  "file",
+  "diff",
+  "find",
+  "mkdir",
+  "touch",
+  "cp",
+  "mv",
+  "tee",
+]);
+
+const PATTERN_FIRST_FILE_REST_COMMANDS = new Set(["grep", "egrep", "fgrep", "rg", "jq"]);
+
+const GIT_FILE_SUBCOMMANDS = new Set(["add", "restore", "blame", "ls-files", "diff"]);
+const GIT_REV_PATH_SUBCOMMANDS = new Set([
+  "show",
+  "cat-file",
+  "rev-parse",
+  "log",
+  "diff",
+  "blame",
+]);
 
 export class SafeChainsRegistry {
   private readonly rulesByName = new Map<string, CommandRule>();
@@ -104,7 +135,12 @@ export class SafeChainsRegistry {
     }
   }
 
-  match(rawCommandName: string, argv: string[], pathCtx: PathContext): RegistryMatchResult {
+  match(
+    rawCommandName: string,
+    argv: string[],
+    pathCtx: PathContext,
+    argvDynamic?: boolean[],
+  ): RegistryMatchResult {
     const commandName = normalizeCommandName(rawCommandName);
     const rootRule = this.rulesByName.get(commandName);
     if (!rootRule) {
@@ -114,10 +150,11 @@ export class SafeChainsRegistry {
         matchedRulePath: [],
         reason: `unknown_command:${commandName}`,
         sweptPaths: [],
+        dynamicPaths: [],
       };
     }
 
-    const evalResult = this.evaluateRule(rootRule, argv, [commandName], rootRule.level);
+    const evalResult = this.evaluateRule(rootRule, argv, [commandName], rootRule.level, 0);
     if (!evalResult.matched) {
       return {
         matched: false,
@@ -125,18 +162,28 @@ export class SafeChainsRegistry {
         matchedRulePath: evalResult.rulePath,
         reason: evalResult.reason,
         sweptPaths: [],
+        dynamicPaths: [],
       };
     }
 
     // Mandatory path sweep (ADR-0004): every matched command has positional & path-like flag values checked
-    const sweptPaths = this.sweepArgumentsForPaths(argv, pathCtx);
+    const sweep = this.sweepArgumentsForPaths(
+      argv,
+      pathCtx,
+      evalResult.rulePath,
+      evalResult.level,
+      evalResult.leafPositionals,
+      evalResult.hasExplicitPatternFlag,
+      argvDynamic,
+    );
 
     return {
       matched: true,
       commandName,
       matchedRulePath: evalResult.rulePath,
       level: evalResult.level,
-      sweptPaths,
+      sweptPaths: sweep.sweptPaths,
+      dynamicPaths: sweep.dynamicPaths,
     };
   }
 
@@ -145,7 +192,15 @@ export class SafeChainsRegistry {
     argv: string[],
     rulePath: string[],
     inheritedLevel?: SafeChainsLevel,
-  ): { matched: boolean; level?: SafeChainsLevel; rulePath: string[]; reason?: string } {
+    argvOffset = 0,
+  ): {
+    matched: boolean;
+    level?: SafeChainsLevel;
+    rulePath: string[];
+    reason?: string;
+    leafPositionals?: Array<{ value: string; index: number }>;
+    hasExplicitPatternFlag?: boolean;
+  } {
     const effectiveLevel = rule.level ?? inheritedLevel;
     const denySet = new Set(rule.deny ?? []);
     const bareFlags = new Set(rule.bare_flags ?? []);
@@ -183,7 +238,7 @@ export class SafeChainsRegistry {
       const subToken = argv[i];
       if (!subToken) {
         if (rule.bare) {
-          return { matched: true, level: effectiveLevel, rulePath };
+          return { matched: true, level: effectiveLevel, rulePath, leafPositionals: [] };
         }
         return { matched: false, rulePath, reason: "missing_subcommand" };
       }
@@ -193,7 +248,12 @@ export class SafeChainsRegistry {
       );
       if (!subRule) {
         if (rule.tolerate_unknown_subcommands) {
-          return { matched: true, level: effectiveLevel, rulePath };
+          return {
+            matched: true,
+            level: effectiveLevel,
+            rulePath,
+            leafPositionals: argv.slice(i).map((value, idx) => ({ value, index: argvOffset + i + idx })),
+          };
         }
         return { matched: false, rulePath, reason: `unknown_subcommand:${subToken}` };
       }
@@ -203,16 +263,28 @@ export class SafeChainsRegistry {
         argv.slice(i + 1),
         [...rulePath, subRule.name],
         effectiveLevel,
+        argvOffset + i + 1,
       );
     }
 
     if (rule.allow_all) {
-      return { matched: true, level: effectiveLevel, rulePath };
+      const leafPositionals: Array<{ value: string; index: number }> = [];
+      let afterDash = false;
+      for (let idx = 0; idx < argv.length; idx++) {
+        const tok = argv[idx];
+        if (!afterDash && tok === "--") {
+          afterDash = true;
+          continue;
+        }
+        if (!afterDash && tok.startsWith("-") && tok.length > 1) continue;
+        leafPositionals.push({ value: tok, index: argvOffset + idx });
+      }
+      return { matched: true, level: effectiveLevel, rulePath, leafPositionals };
     }
 
     if (argv.length === 0) {
       if (rule.bare || (rule.max_positional === undefined && !rule.first_arg && !rule.require_any)) {
-        return { matched: true, level: effectiveLevel, rulePath };
+        return { matched: true, level: effectiveLevel, rulePath, leafPositionals: [] };
       }
       return { matched: false, rulePath, reason: "bare_invocation_not_allowed" };
     }
@@ -221,7 +293,9 @@ export class SafeChainsRegistry {
     let firstPositional: string | undefined;
     let afterDoubleDash = false;
     let sawWriteFlag = false;
+    let hasExplicitPatternFlag = false;
     const seenFlags = new Set<string>();
+    const leafPositionals: Array<{ value: string; index: number }> = [];
 
     for (let i = 0; i < argv.length; i++) {
       const token = argv[i];
@@ -240,7 +314,7 @@ export class SafeChainsRegistry {
         }
 
         if (standaloneSet.has(flagName) && argv.length === 1) {
-          return { matched: true, level: effectiveLevel, rulePath };
+          return { matched: true, level: effectiveLevel, rulePath, leafPositionals: [] };
         }
 
         if (writeFlags.has(flagName)) {
@@ -251,6 +325,9 @@ export class SafeChainsRegistry {
 
         if (valuedFlags.has(flagName)) {
           seenFlags.add(flagName);
+          if (flagName === "-e" || flagName === "-f") {
+            hasExplicitPatternFlag = true;
+          }
           if (eqIdx < 0) {
             i += 1; // consume value
           }
@@ -283,6 +360,7 @@ export class SafeChainsRegistry {
       }
 
       positionalCount += 1;
+      leafPositionals.push({ value: token, index: argvOffset + i });
       if (firstPositional === undefined) {
         firstPositional = token;
       }
@@ -316,21 +394,99 @@ export class SafeChainsRegistry {
     const finalLevel: SafeChainsLevel | undefined =
       sawWriteFlag && effectiveLevel === "SafeRead" ? "SafeWrite" : effectiveLevel;
 
-    return { matched: true, level: finalLevel, rulePath };
+    return {
+      matched: true,
+      level: finalLevel,
+      rulePath,
+      leafPositionals,
+      hasExplicitPatternFlag,
+    };
   }
 
-  private sweepArgumentsForPaths(argv: string[], pathCtx: PathContext): PathClassification[] {
+  private sweepArgumentsForPaths(
+    argv: string[],
+    pathCtx: PathContext,
+    rulePath: string[],
+    level?: SafeChainsLevel,
+    leafPositionals: Array<{ value: string; index: number }> = [],
+    hasExplicitPatternFlag = false,
+    argvDynamic?: boolean[],
+  ): { sweptPaths: PathClassification[]; dynamicPaths: string[] } {
     const results: PathClassification[] = [];
+    const dynamicPaths: string[] = [];
     const seen = new Set<string>();
+    const seenDyn = new Set<string>();
     let afterDoubleDash = false;
+    const rootCmd = rulePath[0] ?? "";
+    const subCmd = rulePath[1];
 
-    const inspect = (candidate: string) => {
-      if (seen.has(candidate)) return;
-      seen.add(candidate);
-      if (looksLikePathCandidate(candidate)) {
-        results.push(classifyPosixPath(candidate, pathCtx));
+    const unwrapGitRevPath = (candidate: string): { path: string; fromGitRev: boolean } => {
+      if (rootCmd === "git" && subCmd && GIT_REV_PATH_SUBCOMMANDS.has(subCmd)) {
+        const revMatch = candidate.match(/^([^\\/]*):([^:].*)$/);
+        if (
+          revMatch &&
+          !/^[A-Za-z]$/.test(revMatch[1]) &&
+          !/\$(?:INDEX_ALLOCATION|DATA)|Zone\.Identifier/i.test(revMatch[2])
+        ) {
+          let extractedPath = revMatch[2];
+          if (revMatch[1] === "") {
+            const stageMatch = extractedPath.match(/^[0-3]:(.+)$/);
+            if (stageMatch) extractedPath = stageMatch[1];
+          }
+          return { path: extractedPath, fromGitRev: true };
+        }
+      }
+      return { path: candidate, fromGitRev: false };
+    };
+
+    const inspect = (candidate: string, forcePathCheck = false, isDynamic = false) => {
+      if (!candidate || candidate === "-" || candidate === "--") return;
+      if (candidate.startsWith("http://") || candidate.startsWith("https://")) return;
+
+      const unwrapped = unwrapGitRevPath(candidate);
+      const resolvedCandidate = unwrapped.path;
+      const effectiveForce = forcePathCheck || unwrapped.fromGitRev;
+      if (
+        isDynamic &&
+        (effectiveForce ||
+          level === "SafeWrite" ||
+          (level !== "Inert" && looksLikePathCandidate(resolvedCandidate)))
+      ) {
+        if (!seenDyn.has(candidate)) {
+          seenDyn.add(candidate);
+          dynamicPaths.push(candidate);
+        }
+        return;
+      }
+
+      if (seen.has(resolvedCandidate)) return;
+      if (effectiveForce || looksLikePathCandidate(resolvedCandidate)) {
+        seen.add(resolvedCandidate);
+        results.push(classifyPath(resolvedCandidate, pathCtx));
       }
     };
+
+    // For filesystem SafeRead / SafeWrite commands, also sweep bare positional filenames
+    // (such as `cat id_rsa` after `cd ~/.ssh` or `cat foo` after uncertain cwd).
+    if (level === "SafeRead" || level === "SafeWrite") {
+      if (FILE_POSITIONAL_COMMANDS.has(rootCmd)) {
+        for (const pos of leafPositionals) {
+          if (rootCmd === "find" && (pos.value === "!" || pos.value === "(" || pos.value === ")")) {
+            continue;
+          }
+          inspect(pos.value, true, Boolean(argvDynamic?.[pos.index]));
+        }
+      } else if (PATTERN_FIRST_FILE_REST_COMMANDS.has(rootCmd)) {
+        const startIdx = hasExplicitPatternFlag ? 0 : 1;
+        for (const pos of leafPositionals.slice(startIdx)) {
+          inspect(pos.value, true, Boolean(argvDynamic?.[pos.index]));
+        }
+      } else if (rootCmd === "git" && subCmd && GIT_FILE_SUBCOMMANDS.has(subCmd)) {
+        for (const pos of leafPositionals) {
+          inspect(pos.value, true, Boolean(argvDynamic?.[pos.index]));
+        }
+      }
+    }
 
     for (let i = 0; i < argv.length; i++) {
       const token = argv[i];
@@ -339,25 +495,25 @@ export class SafeChainsRegistry {
         continue;
       }
 
-      if (!afterDoubleDash && token.startsWith("-")) {
+      if (!afterDoubleDash && token.startsWith("-") && !argvDynamic?.[i]) {
         const eqIdx = token.indexOf("=");
         if (eqIdx > 0) {
           const flag = token.slice(0, eqIdx);
           const val = token.slice(eqIdx + 1);
           if (PATH_LIKE_FLAGS.has(flag) || looksLikePathCandidate(val)) {
-            inspect(val);
+            inspect(val, PATH_LIKE_FLAGS.has(flag), Boolean(argvDynamic?.[i]));
           }
         } else if (PATH_LIKE_FLAGS.has(token) && i + 1 < argv.length) {
-          inspect(argv[i + 1]);
+          inspect(argv[i + 1], true, Boolean(argvDynamic?.[i + 1]));
           i += 1;
         }
         continue;
       }
 
-      inspect(token);
+      inspect(token, false, Boolean(argvDynamic?.[i]));
     }
 
-    return results;
+    return { sweptPaths: results, dynamicPaths };
   }
 }
 

@@ -1,11 +1,13 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { getGuardianStatus } from "./shared/rpc.js";
+import { evaluateGuardianDryRun, getGuardianStatus } from "./shared/rpc.js";
 import { DEFAULT_GUARDIAN_SETTINGS, guardianSettings } from "./shared/settings.js";
 import { AuditStore } from "./server/audit/store.js";
 import type { TimelineFetcher } from "./server/context/session.js";
+import { decideAction } from "./server/decide.js";
 import { PermissionGuardianService } from "./server/guardian.js";
+import { disposeSharedPwshHost } from "./server/shell/pwsh-host.js";
 
 const PLUGIN_VERSION = "0.1.0";
 
@@ -84,6 +86,37 @@ export default function contribute(server: PluginServerContext) {
 
   server.handle(getGuardianStatus, async () => guardian.getStatus());
 
+  server.handle(evaluateGuardianDryRun, async (input) => {
+    const res = await decideAction(
+      {
+        provider: "paseo",
+        agentId: "dry-run",
+        requestId: "dry-run",
+        kind: "exec",
+        toolName: input.shell,
+        host: { os: input.hostOs },
+        cwd: input.cwd,
+        worktreeRoot: input.worktreeRoot ?? input.cwd,
+        exec: { shell: input.shell, source: input.source },
+      },
+      {
+        pathCtx: {
+          os: input.hostOs,
+          cwd: input.cwd,
+          worktreeRoot: input.worktreeRoot ?? input.cwd,
+          home: input.home ?? (input.hostOs === "windows" ? "C:\\Users\\user" : homedir()),
+        },
+        denyAsAsk: guardian.getSettings().denyAsAsk,
+      },
+    );
+    return {
+      level: res.decision.level,
+      verdict: res.decision.verdict,
+      reasons: res.decision.reasons,
+      touchedSecret: res.touchedSecret,
+    };
+  });
+
   return async () => {
     removeBeforeHook();
     removeAfterHook();
@@ -92,5 +125,6 @@ export default function contribute(server: PluginServerContext) {
     removeArchiveAfterHook();
     await unsubscribeSettings();
     await guardian.flush();
+    await disposeSharedPwshHost();
   };
 }

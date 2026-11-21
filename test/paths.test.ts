@@ -33,9 +33,9 @@ describe("POSIX Path Model", () => {
     await mkdir(worktree, { recursive: true });
     await mkdir(outside, { recursive: true });
 
-    // Create a symlink inside worktree pointing outside
+    // Create a symlink inside worktree pointing outside (junction on Windows requires no elevation)
     const escapeLink = join(worktree, "escape");
-    await symlink(outside, escapeLink);
+    await symlink(outside, escapeLink, process.platform === "win32" ? "junction" : undefined);
 
     // Non-existent nested file under the symlinked directory
     const target = join(escapeLink, "nested", "new-file.txt");
