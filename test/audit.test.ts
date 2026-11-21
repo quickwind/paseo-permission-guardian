@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { redactString, redactValue } from "../server/audit/redact.js";
 import { AuditStore, computeAgreement } from "../server/audit/store.js";
+import { detectCredentialLiterals } from "../server/secrets/patterns.js";
 import type { Action } from "../shared/types.js";
 
 const tempDirs: string[] = [];
@@ -66,6 +67,22 @@ describe("redaction", () => {
     expect((redacted.nested as Record<string, unknown>).Authorization).toBe("[REDACTED]");
     expect((redacted.nested as Record<string, unknown>).safe).toBe("ok");
     expect(redacted.self).toBe("[CIRCULAR]");
+  });
+
+  it("redacts PGPASSWORD, sk_live, pypi-, and URL credentials consistently without regex state drift", () => {
+    const sample =
+      "PGPASSWORD=my-pg-pass FOO=sk_live_1234567890abcdef1234 BAR=pypi-AgEI1234567890abcdef1234 postgres://admin:s3cr3t@db.internal/app";
+
+    // Guard against /g lastIndex bugs on repeated calls
+    expect(detectCredentialLiterals(sample)).toEqual(["stripe_key", "pypi_token", "url_credentials"]);
+    expect(detectCredentialLiterals(sample)).toEqual(["stripe_key", "pypi_token", "url_credentials"]);
+
+    const output = redactString(sample);
+    expect(output).not.toContain("my-pg-pass");
+    expect(output).not.toContain("sk_live_");
+    expect(output).not.toContain("pypi-AgEI");
+    expect(output).not.toContain("s3cr3t");
+    expect(output).toContain("postgres://admin:[REDACTED]@db.internal/app");
   });
 });
 
@@ -168,6 +185,41 @@ describe("AuditStore", () => {
     }
     expect(lineCount).toBe(12);
     expect(store.getMetrics().totalRequests).toBe(12);
+  });
+
+  it("redacts secrets inside decision effects, reasons, and warnings", async () => {
+    const dataDir = await makeTempDir();
+    const store = new AuditStore({ dataDir, pluginVersion: "0.1.0" });
+
+    const record = await store.recordBefore({
+      requestId: "req-redact-decision",
+      agentId: "agent-1",
+      provider: "claude",
+      mode: "shadow",
+      requestedAt: "2026-11-21T00:00:00.000Z",
+      latencyMs: 1,
+      normalizedBy: "claude",
+      warnings: ["warning with sk-proj-abcdefghijklmnopqrstuvwxyz123456"],
+      action: sampleAction("req-redact-decision", "PGPASSWORD=secret123 git push"),
+      decision: {
+        level: "L2",
+        verdict: "ask",
+        reasons: ["vcs_remote:PGPASSWORD=secret123 git push"],
+        effects: [
+          {
+            tag: "vcs_remote",
+            layer: 0,
+            target: "PGPASSWORD=secret123 curl https://admin:topsecret@api.example.com",
+          },
+        ],
+      },
+    });
+    await store.flush();
+
+    const serialized = JSON.stringify(record);
+    expect(serialized).not.toContain("sk-proj-abcdefghijklmnopqrstuvwxyz123456");
+    expect(serialized).not.toContain("secret123");
+    expect(serialized).not.toContain("topsecret");
   });
 
   it("computes agreement outcomes correctly", () => {

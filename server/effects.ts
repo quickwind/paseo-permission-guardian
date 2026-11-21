@@ -6,8 +6,14 @@ import {
   type SafeChainsRegistry,
 } from "./knowledge/sc-registry/interpreter.js";
 import { classifyPosixPath, type PathContext } from "./paths/index.js";
+import {
+  detectCredentialLiterals,
+  isExecHijackEnvVar,
+  isRedirectOrTlsEnvVar,
+  isSensitiveEnvVarName,
+} from "./secrets/patterns.js";
 import { analyzeShellLayers } from "./shell/layers.js";
-import type { CommandFact, PipelineFact } from "./shell/types.js";
+import type { AssignmentFact, CommandFact, PipelineFact } from "./shell/types.js";
 
 export interface EffectAnalysisResult {
   effects: EffectTag[];
@@ -33,8 +39,6 @@ const DEFAULT_TRUSTED_DOMAINS = [
   "pkg.go.dev",
   "developer.mozilla.org",
 ];
-
-const SENSITIVE_ENV_VAR_PATTERN = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)/i;
 
 const INTERPRETER_BINARIES = new Set([
   "sh",
@@ -64,10 +68,31 @@ const SYSTEM_DESTRUCTIVE_COMMANDS = new Set([
   "poweroff",
 ]);
 
-const INFRA_MUTATE_COMMANDS = new Set(["kubectl", "terraform", "tofu", "helm", "aws", "gcloud", "az", "flyctl", "wrangler"]);
+const INFRA_MUTATE_COMMANDS = new Set([
+  "kubectl",
+  "terraform",
+  "tofu",
+  "helm",
+  "aws",
+  "gcloud",
+  "az",
+  "flyctl",
+  "wrangler",
+]);
+
+const DECLARATION_BUILTINS = new Set(["export", "declare", "typeset", "readonly", "local"]);
 
 function normalizeBin(name: string): string {
   return basename(name).toLowerCase().replace(/\.(?:exe|cmd|bat)$/, "");
+}
+
+function isRelativePath(raw: string): boolean {
+  return (
+    !raw.startsWith("/") &&
+    !raw.startsWith("~") &&
+    !raw.startsWith("$HOME") &&
+    !raw.startsWith("${HOME}")
+  );
 }
 
 function isUrlTrusted(href: string, trustedDomains: string[]): boolean {
@@ -110,6 +135,118 @@ function extractUrlFromArgv(argv: string[]): string | undefined {
   return argv.find((a) => /^https?:\/\//i.test(a));
 }
 
+function isPsEnvDump(argv: string[]): boolean {
+  for (const arg of argv) {
+    if (arg === "-E") return true;
+    // BSD options without leading '-' where 'e' requests process environments (e.g. ps e, ps eww, ps auxe)
+    if (!arg.startsWith("-") && /^[a-zA-Z]*e[a-zA-Z]*$/.test(arg)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasShortFlag(argv: string[], flagChar: string): boolean {
+  for (const arg of argv) {
+    if (arg === "--") break;
+    if (arg.startsWith("-") && !arg.startsWith("--") && arg.slice(1).includes(flagChar)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isCompgenEnvDump(argv: string[]): boolean {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-v" || arg === "-e") return true;
+    if (arg.startsWith("-") && !arg.startsWith("--") && (arg.includes("v") || arg.includes("e"))) {
+      return true;
+    }
+    if (arg === "-A" && (argv[i + 1] === "variable" || argv[i + 1] === "export")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function evaluateAssignments(
+  assignments: AssignmentFact[],
+  effects: EffectTag[],
+  opaqueReasons: string[],
+): void {
+  const seen = new Set<string>();
+
+  for (const a of assignments) {
+    const dedupKey = `${a.name}\u0000${a.value}\u0000${a.standalone}\u0000${a.depth}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
+
+    // Additive checks (ADR-0005): never early-exit across P0/P3/P4/P5,
+    // and never place raw assignment values into target/detail/opaqueReasons.
+
+    // P0: Credential literal in assignment value
+    for (const kind of detectCredentialLiterals(a.value)) {
+      effects.push({
+        tag: "read_secret",
+        layer: a.depth,
+        target: a.name,
+        detail: `inline_secret_literal:${kind}`,
+      });
+    }
+
+    // Standalone IFS=...; statement is an obfuscation/injection hazard (L1 opaque),
+    // while prefix `IFS=, read -r a b` stays L0.
+    if (a.name === "IFS") {
+      if (a.standalone && a.value.trim().length > 0) {
+        const reason = "standalone_ifs_assignment";
+        opaqueReasons.push(reason);
+        effects.push({
+          tag: "opaque",
+          layer: a.depth,
+          target: "IFS",
+          detail: reason,
+        });
+      }
+      continue;
+    }
+
+    // P3: Execution hijack env vars
+    if (isExecHijackEnvVar(a.name, a.value)) {
+      effects.push({
+        tag: "exec_inline",
+        layer: a.depth,
+        target: a.name,
+        detail: `env_exec_hijack:${a.name}`,
+      });
+    }
+
+    // P4: Redirect / proxy / TLS-disable env vars
+    if (isRedirectOrTlsEnvVar(a.name, a.value)) {
+      const reason = `env_redirect_or_tls:${a.name}`;
+      opaqueReasons.push(reason);
+      effects.push({
+        tag: "opaque",
+        layer: a.depth,
+        target: a.name,
+        detail: reason,
+      });
+    }
+
+    // P5: Sensitive credential variable name with non-empty value
+    if (a.value.trim().length > 0 && isSensitiveEnvVarName(a.name)) {
+      const reason = `sensitive_env_assignment:${a.name}`;
+      opaqueReasons.push(reason);
+      effects.push({
+        tag: "opaque",
+        layer: a.depth,
+        target: a.name,
+        detail: reason,
+      });
+    }
+  }
+}
+
 function classifyRmCommand(cmd: CommandFact, pathCtx: PathContext): EffectTag[] {
   const effects: EffectTag[] = [];
   let recursive = false;
@@ -132,6 +269,15 @@ function classifyRmCommand(cmd: CommandFact, pathCtx: PathContext): EffectTag[] 
   }
 
   for (const target of targets) {
+    if (cmd.cwdChanged && isRelativePath(target)) {
+      effects.push({
+        tag: "opaque",
+        layer: cmd.depth,
+        target,
+        detail: "relative_path_after_cwd_change",
+      });
+      continue;
+    }
     const p = classifyPosixPath(target, pathCtx);
     if (p.realPath === "/" || p.realPath === "/etc" || p.realPath === "/usr" || p.realPath === "/System") {
       effects.push({
@@ -177,6 +323,23 @@ function classifyRmCommand(cmd: CommandFact, pathCtx: PathContext): EffectTag[] 
   return effects;
 }
 
+function finalizeResult(
+  effects: EffectTag[],
+  opaqueReasons: string[],
+  pipelines: PipelineFact[],
+  commands: CommandFact[],
+  touchedUntrusted: boolean,
+): EffectAnalysisResult {
+  return {
+    effects,
+    opaqueReasons: Array.from(new Set(opaqueReasons)),
+    pipelines,
+    commands,
+    touchedSecret: effects.some((e) => e.tag === "read_secret"),
+    touchedUntrusted,
+  };
+}
+
 export async function analyzeActionEffects(
   action: Action,
   options: EffectAnalysisOptions,
@@ -186,14 +349,12 @@ export async function analyzeActionEffects(
   const trustedDomains = options.trustedDomains ?? DEFAULT_TRUSTED_DOMAINS;
   let pipelines: PipelineFact[] = [];
   let commands: CommandFact[] = [];
-  let touchedSecret = false;
   let touchedUntrusted = false;
 
   if (action.kind === "read") {
     for (const rawPath of action.paths ?? []) {
       const p = classifyPosixPath(rawPath, options.pathCtx);
       if (p.isSensitive) {
-        touchedSecret = true;
         effects.push({
           tag: "read_secret",
           layer: 0,
@@ -207,7 +368,7 @@ export async function analyzeActionEffects(
     if ((action.paths ?? []).length === 0) {
       effects.push({ tag: "read", layer: 0 });
     }
-    return { effects, opaqueReasons, pipelines, commands, touchedSecret, touchedUntrusted };
+    return finalizeResult(effects, opaqueReasons, pipelines, commands, touchedUntrusted);
   }
 
   if (action.kind === "edit") {
@@ -236,7 +397,7 @@ export async function analyzeActionEffects(
       effects.push({ tag: "opaque", layer: 0, detail: "edit_without_path" });
       opaqueReasons.push("edit_without_path");
     }
-    return { effects, opaqueReasons, pipelines, commands, touchedSecret, touchedUntrusted };
+    return finalizeResult(effects, opaqueReasons, pipelines, commands, touchedUntrusted);
   }
 
   if (action.kind === "delete") {
@@ -259,7 +420,7 @@ export async function analyzeActionEffects(
       effects.push({ tag: "opaque", layer: 0, detail: "delete_without_path" });
       opaqueReasons.push("delete_without_path");
     }
-    return { effects, opaqueReasons, pipelines, commands, touchedSecret, touchedUntrusted };
+    return finalizeResult(effects, opaqueReasons, pipelines, commands, touchedUntrusted);
   }
 
   if (action.kind === "fetch") {
@@ -285,11 +446,10 @@ export async function analyzeActionEffects(
         detail: trusted ? "trusted_domain" : "untrusted_domain",
       });
     }
-    return { effects, opaqueReasons, pipelines, commands, touchedSecret, touchedUntrusted };
+    return finalizeResult(effects, opaqueReasons, pipelines, commands, touchedUntrusted);
   }
 
   if (action.kind === "mcp") {
-    // Unlisted MCP tools go to L1 grey zone (ask) until configured in policy
     effects.push({
       tag: "opaque",
       layer: 0,
@@ -297,13 +457,23 @@ export async function analyzeActionEffects(
       detail: "unlisted_mcp_tool",
     });
     opaqueReasons.push("unlisted_mcp_tool");
-    return { effects, opaqueReasons, pipelines, commands, touchedSecret, touchedUntrusted };
+    return finalizeResult(effects, opaqueReasons, pipelines, commands, touchedUntrusted);
   }
 
   if (action.kind !== "exec" || !action.exec) {
     effects.push({ tag: "opaque", layer: 0, detail: `unclassified_kind:${action.kind}` });
     opaqueReasons.push(`unclassified_kind:${action.kind}`);
-    return { effects, opaqueReasons, pipelines, commands, touchedSecret, touchedUntrusted };
+    return finalizeResult(effects, opaqueReasons, pipelines, commands, touchedUntrusted);
+  }
+
+  // P0: Scan raw exec source for high-confidence credential literals BEFORE/regardless of parse errors
+  for (const kind of detectCredentialLiterals(action.exec.source)) {
+    effects.push({
+      tag: "read_secret",
+      layer: 0,
+      target: kind,
+      detail: "inline_secret_literal",
+    });
   }
 
   // Shell exec analysis
@@ -320,6 +490,21 @@ export async function analyzeActionEffects(
   effects.push(...layerResult.effects);
   opaqueReasons.push(...layerResult.opaque);
 
+  // P1: Root-level tree-wide envReads (covers heredocs, [[ ... ]], $((...)), standalone assignments)
+  for (const envVar of layerResult.envReads) {
+    if (isSensitiveEnvVarName(envVar)) {
+      effects.push({
+        tag: "read_secret",
+        layer: 0,
+        target: `$${envVar}`,
+        detail: "sensitive_env_expansion",
+      });
+    }
+  }
+
+  // Additive evaluation over all collected assignments (prefix, standalone, declaration, wrapper)
+  evaluateAssignments(layerResult.assignments, effects, opaqueReasons);
+
   const registry = options.registry ?? getDefaultSafeChainsRegistry();
 
   for (const cmd of commands) {
@@ -327,8 +512,7 @@ export async function analyzeActionEffects(
 
     // 1. Sensitive env var reads inside command
     for (const envVar of cmd.envReads) {
-      if (SENSITIVE_ENV_VAR_PATTERN.test(envVar)) {
-        touchedSecret = true;
+      if (isSensitiveEnvVarName(envVar)) {
         effects.push({
           tag: "read_secret",
           layer: cmd.depth,
@@ -341,6 +525,16 @@ export async function analyzeActionEffects(
     // 2. File redirections (write / read)
     for (const redir of cmd.redirections) {
       if (redir.target === "/dev/null") continue;
+      if (cmd.cwdChanged && isRelativePath(redir.target)) {
+        effects.push({
+          tag: "opaque",
+          layer: cmd.depth,
+          target: redir.target,
+          detail: "relative_path_after_cwd_change",
+        });
+        opaqueReasons.push("relative_path_after_cwd_change");
+        continue;
+      }
       const p = classifyPosixPath(redir.target, options.pathCtx);
       if (redir.isWrite) {
         if (p.isProtected) {
@@ -368,7 +562,6 @@ export async function analyzeActionEffects(
         }
       }
       if (redir.isRead && p.isSensitive) {
-        touchedSecret = true;
         effects.push({
           tag: "read_secret",
           layer: cmd.depth,
@@ -389,18 +582,100 @@ export async function analyzeActionEffects(
       continue;
     }
 
-    if (bin === "env" || bin === "printenv") {
-      if (cmd.argv.length === 0 || cmd.argv.some((a) => SENSITIVE_ENV_VAR_PATTERN.test(a))) {
-        touchedSecret = true;
+    if (bin === "cd") {
+      effects.push({ tag: "read", layer: cmd.depth, target: "cd" });
+      continue;
+    }
+
+    // env with no inner command (env, env -0, env -u FOO) -> full environment dump
+    if (bin === "env") {
+      effects.push({
+        tag: "read_secret",
+        layer: cmd.depth,
+        target: "env",
+        detail: "env_dump",
+      });
+      continue;
+    }
+
+    if (bin === "printenv") {
+      const positionals = cmd.argv.filter((a) => !a.startsWith("-"));
+      if (positionals.length === 0 || positionals.some((a) => isSensitiveEnvVarName(a))) {
+        effects.push({
+          tag: "read_secret",
+          layer: cmd.depth,
+          target: "printenv",
+          detail: "env_dump_or_secret_read",
+        });
+      } else {
+        effects.push({ tag: "read", layer: cmd.depth, target: "printenv" });
+      }
+      continue;
+    }
+
+    if (bin === "set") {
+      if (cmd.argv.length === 0) {
+        effects.push({
+          tag: "read_secret",
+          layer: cmd.depth,
+          target: "set",
+          detail: "env_dump",
+        });
+      } else if (cmd.argv[0].startsWith("-") || cmd.argv[0].startsWith("+")) {
+        effects.push({ tag: "read", layer: cmd.depth, target: "set" });
+      } else {
+        opaqueReasons.push("set_positional_args");
+        effects.push({ tag: "opaque", layer: cmd.depth, target: "set", detail: "set_positional_args" });
+      }
+      continue;
+    }
+
+    if (DECLARATION_BUILTINS.has(bin)) {
+      if ((bin === "declare" || bin === "typeset") && hasShortFlag(cmd.argv, "n")) {
+        opaqueReasons.push("indirect_var_nameref");
+        effects.push({
+          tag: "opaque",
+          layer: cmd.depth,
+          target: bin,
+          detail: "indirect_var_nameref",
+        });
+        continue;
+      }
+
+      const hasAssignments = Object.keys(cmd.assignments).length > 0;
+      const nonFlagArgs = cmd.argv.filter((a) => !a.startsWith("-"));
+      if (!hasAssignments && nonFlagArgs.length === 0) {
+        // export / export -p / declare -px / typeset -p / readonly / local -> dumps env/vars
         effects.push({
           tag: "read_secret",
           layer: cmd.depth,
           target: bin,
-          detail: "env_dump_or_secret_read",
+          detail: "env_dump",
         });
       } else {
+        // Assignments themselves are evaluated via layerResult.assignments
         effects.push({ tag: "read", layer: cmd.depth, target: bin });
       }
+      continue;
+    }
+
+    if (bin === "compgen" && isCompgenEnvDump(cmd.argv)) {
+      effects.push({
+        tag: "read_secret",
+        layer: cmd.depth,
+        target: "compgen",
+        detail: "env_dump",
+      });
+      continue;
+    }
+
+    if (bin === "ps" && isPsEnvDump(cmd.argv)) {
+      effects.push({
+        tag: "read_secret",
+        layer: cmd.depth,
+        target: "ps",
+        detail: "ps_env_dump",
+      });
       continue;
     }
 
@@ -412,7 +687,8 @@ export async function analyzeActionEffects(
     if (bin === "curl" || bin === "wget") {
       const url = extractUrlFromArgv(cmd.argv);
       const trusted = url ? isUrlTrusted(url, trustedDomains) : false;
-      const egress = bin === "curl" ? isCurlEgress(cmd.argv) : cmd.argv.some((a) => a.startsWith("--post"));
+      const egress =
+        bin === "curl" ? isCurlEgress(cmd.argv) : cmd.argv.some((a) => a.startsWith("--post"));
       if (egress) {
         effects.push({
           tag: "net_egress",
@@ -429,13 +705,26 @@ export async function analyzeActionEffects(
           detail: trusted ? "trusted_domain" : "untrusted_domain",
         });
       }
-      // Also sweep curl/wget file arguments (@file, -o, -O, -d @file)
       for (const arg of cmd.argv) {
         const candidate = arg.startsWith("@") ? arg.slice(1) : arg;
-        if (candidate && candidate !== "-" && !candidate.startsWith("-") && !/^https?:\/\//i.test(candidate)) {
+        if (
+          candidate &&
+          candidate !== "-" &&
+          !candidate.startsWith("-") &&
+          !/^https?:\/\//i.test(candidate)
+        ) {
+          if (cmd.cwdChanged && isRelativePath(candidate)) {
+            effects.push({
+              tag: "opaque",
+              layer: cmd.depth,
+              target: candidate,
+              detail: "relative_path_after_cwd_change",
+            });
+            opaqueReasons.push("relative_path_after_cwd_change");
+            continue;
+          }
           const p = classifyPosixPath(candidate, options.pathCtx);
           if (p.isSensitive) {
-            touchedSecret = true;
             effects.push({ tag: "read_secret", layer: cmd.depth, target: p.realPath });
           }
         }
@@ -445,18 +734,18 @@ export async function analyzeActionEffects(
 
     if (bin === "git") {
       const sub = cmd.argv.find((a) => !a.startsWith("-"));
-      if (sub === "push" || sub === "fetch" || sub === "pull" || sub === "remote") {
-        if (sub === "push") {
-          const isForce = cmd.argv.some((a) => a === "-f" || a === "--force" || a === "--force-with-lease");
-          effects.push({
-            tag: "vcs_remote",
-            layer: cmd.depth,
-            target: cmd.rawText,
-            reversibility: isForce ? "irreversible" : "reversible",
-            detail: isForce ? "git_push_force" : "git_push",
-          });
-          continue;
-        }
+      if (sub === "push") {
+        const isForce = cmd.argv.some(
+          (a) => a === "-f" || a === "--force" || a === "--force-with-lease",
+        );
+        effects.push({
+          tag: "vcs_remote",
+          layer: cmd.depth,
+          target: cmd.rawText,
+          reversibility: isForce ? "irreversible" : "reversible",
+          detail: isForce ? "git_push_force" : "git_push",
+        });
+        continue;
       }
     }
 
@@ -493,9 +782,23 @@ export async function analyzeActionEffects(
     if (match.matched && match.level) {
       let blockedByPathSweep = false;
 
+      if (cmd.cwdChanged) {
+        for (const swept of match.sweptPaths) {
+          if (isRelativePath(swept.raw)) {
+            blockedByPathSweep = true;
+            opaqueReasons.push("relative_path_after_cwd_change");
+            effects.push({
+              tag: "opaque",
+              layer: cmd.depth,
+              target: swept.raw,
+              detail: "relative_path_after_cwd_change",
+            });
+          }
+        }
+      }
+
       for (const swept of match.sweptPaths) {
         if (swept.isSensitive) {
-          touchedSecret = true;
           blockedByPathSweep = true;
           effects.push({
             tag: "read_secret",
@@ -536,9 +839,6 @@ export async function analyzeActionEffects(
             target: match.matchedRulePath.join(" "),
           });
         } else if (match.level === "ExecProject") {
-          // Targeted provenance check (ADR-0002):
-          // Only upgrade exec_project -> exec_inline when build/task entrypoints were modified
-          // (or when directly executing a modified script). Ordinary source edits do not trigger this.
           const hasModifiedEntrypoint = (options.session?.modifiedEntrypoints.size ?? 0) > 0;
           if (hasModifiedEntrypoint) {
             effects.push({
@@ -561,6 +861,16 @@ export async function analyzeActionEffects(
 
     // Check if directly executing a modified local script (e.g. ./scripts/deploy.sh)
     if (cmd.name.startsWith("./") || cmd.name.startsWith("/") || cmd.name.includes("/")) {
+      if (cmd.cwdChanged && isRelativePath(cmd.name)) {
+        opaqueReasons.push("relative_path_after_cwd_change");
+        effects.push({
+          tag: "opaque",
+          layer: cmd.depth,
+          target: cmd.name,
+          detail: "relative_path_after_cwd_change",
+        });
+        continue;
+      }
       const scriptPath = classifyPosixPath(cmd.name, options.pathCtx);
       if (options.session?.modifiedFiles.has(scriptPath.realPath)) {
         effects.push({
@@ -579,14 +889,7 @@ export async function analyzeActionEffects(
     effects.push({ tag: "opaque", layer: cmd.depth, target: bin, detail: reason });
   }
 
-  return {
-    effects,
-    opaqueReasons: Array.from(new Set(opaqueReasons)),
-    pipelines,
-    commands,
-    touchedSecret,
-    touchedUntrusted,
-  };
+  return finalizeResult(effects, opaqueReasons, pipelines, commands, touchedUntrusted);
 }
 
 export function hasNetReadPipedToInterpreter(pipelines: PipelineFact[]): boolean {

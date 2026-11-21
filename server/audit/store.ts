@@ -126,6 +126,9 @@ export class AuditStore {
     const hadResolutionFirst = Boolean(existing?.resolution && !existing.decision);
 
     const redactedAction = redactValue(input.action);
+    const redactedDecision = redactValue(input.decision);
+    const redactedWarnings =
+      input.warnings.length > 0 ? redactValue(input.warnings) : undefined;
     const merged: AuditRecord = {
       version: 1,
       pluginVersion: this.pluginVersion,
@@ -136,11 +139,11 @@ export class AuditStore {
       requestedAt: input.requestedAt,
       latencyMs: input.latencyMs,
       normalizedBy: input.normalizedBy,
-      warnings: input.warnings.length > 0 ? input.warnings : undefined,
+      warnings: redactedWarnings,
       action: redactedAction,
-      decision: input.decision,
+      decision: redactedDecision,
       resolution: existing?.resolution,
-      agreement: computeAgreement(input.decision, existing?.resolution),
+      agreement: computeAgreement(redactedDecision, existing?.resolution),
       ...(hadResolutionFirst || existing?.outOfOrder ? { outOfOrder: true } : {}),
     };
 

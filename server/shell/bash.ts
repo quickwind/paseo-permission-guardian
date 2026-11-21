@@ -1,16 +1,23 @@
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join } from "node:path";
-import { Language, Parser, type Node as SyntaxNode } from "web-tree-sitter";
-import type { CommandFact, PipelineFact, RedirectionFact } from "./types.js";
+import { dirname, join } from "node:path";
+import type { Language, Node as SyntaxNode, Parser } from "web-tree-sitter";
+import type { AssignmentFact, CommandFact, PipelineFact, RedirectionFact } from "./types.js";
 
 export interface BashParseOutput {
   commands: CommandFact[];
   pipelines: PipelineFact[];
   opaque: string[];
   envReads: string[];
+  assignments: AssignmentFact[];
 }
 
-function resolveModuleFile(specifier: string): string {
+interface WebTreeSitterModule {
+  Parser: typeof Parser;
+  Language: typeof Language;
+}
+
+function getBaseRequire(): NodeRequire {
   const candidates: Array<string | URL> = [];
   if (typeof import.meta !== "undefined" && typeof import.meta.url === "string" && import.meta.url.length > 0) {
     candidates.push(import.meta.url);
@@ -20,34 +27,45 @@ function resolveModuleFile(specifier: string): string {
   }
   candidates.push(join(process.cwd(), "package.json"));
 
-  let lastError: unknown;
   for (const base of candidates) {
     try {
-      const req = createRequire(base);
-      return req.resolve(specifier);
-    } catch (err) {
-      lastError = err;
+      return createRequire(base);
+    } catch {
+      // try next candidate
     }
   }
-  throw lastError instanceof Error
-    ? lastError
-    : new Error(`Unable to resolve module file: ${specifier}`);
+  return createRequire(join(process.cwd(), "package.json"));
 }
 
-let bashLanguagePromise: Promise<Language> | null = null;
+function resolveModuleFile(specifier: string): string {
+  const req = getBaseRequire();
+  return req.resolve(specifier);
+}
 
-async function getBashLanguage(): Promise<Language> {
-  if (!bashLanguagePromise) {
-    bashLanguagePromise = (async () => {
-      const runtimeWasm = resolveModuleFile("web-tree-sitter/web-tree-sitter.wasm");
-      await Parser.init({
-        locateFile: () => runtimeWasm,
+let treeSitterPromise: Promise<{ ParserCtor: typeof Parser; language: Language }> | null = null;
+
+async function getBashRuntime(): Promise<{ ParserCtor: typeof Parser; language: Language }> {
+  if (!treeSitterPromise) {
+    treeSitterPromise = (async () => {
+      const runtimeWasmPath = resolveModuleFile("web-tree-sitter/web-tree-sitter.wasm");
+      const cjsPath = join(dirname(runtimeWasmPath), "web-tree-sitter.cjs");
+      const req = getBaseRequire();
+      const wts = req(cjsPath) as WebTreeSitterModule;
+
+      const runtimeWasmBinary = readFileSync(runtimeWasmPath);
+      await wts.Parser.init({
+        wasmBinary: runtimeWasmBinary,
+        locateFile: () => runtimeWasmPath,
       });
+
       const bashWasmPath = resolveModuleFile("@vscode/tree-sitter-wasm/wasm/tree-sitter-bash.wasm");
-      return Language.load(bashWasmPath);
+      const bashWasmBinary = readFileSync(bashWasmPath);
+      const language = await wts.Language.load(bashWasmBinary);
+
+      return { ParserCtor: wts.Parser, language };
     })();
   }
-  return bashLanguagePromise;
+  return treeSitterPromise;
 }
 
 const DYNAMIC_NAME_NODE_TYPES = new Set([
@@ -92,15 +110,44 @@ function containsDynamicNode(node: SyntaxNode): boolean {
   return false;
 }
 
-function collectEnvReads(node: SyntaxNode, out: Set<string>): void {
-  if (node.type === "simple_expansion" || node.type === "expansion") {
+function collectArithmeticVariables(node: SyntaxNode, out: Set<string>): void {
+  if (node.type === "variable_name") {
+    out.add(node.text);
+  }
+  for (const child of node.namedChildren) {
+    collectArithmeticVariables(child, out);
+  }
+}
+
+function collectEnvReads(node: SyntaxNode, out: Set<string>, opaqueOut?: string[]): void {
+  // For variable_assignment, never treat the LHS variable name as a read; only inspect the value.
+  if (node.type === "variable_assignment") {
+    const valNode = node.childForFieldName("value");
+    if (valNode) {
+      collectEnvReads(valNode, out, opaqueOut);
+    }
+    return;
+  }
+
+  if (node.type === "simple_expansion") {
     const varNode = node.namedChildren.find((c) => c.type === "variable_name");
     if (varNode) {
       out.add(varNode.text);
     }
+  } else if (node.type === "expansion") {
+    if (node.text.startsWith("${!") && opaqueOut) {
+      opaqueOut.push("indirect_var_ref");
+    }
+    const varNode = node.namedChildren.find((c) => c.type === "variable_name");
+    if (varNode) {
+      out.add(varNode.text);
+    }
+  } else if (node.type === "arithmetic_expansion") {
+    collectArithmeticVariables(node, out);
   }
+
   for (const child of node.namedChildren) {
-    collectEnvReads(child, out);
+    collectEnvReads(child, out, opaqueOut);
   }
 }
 
@@ -139,9 +186,10 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
   const commands: CommandFact[] = [];
   const pipelines: PipelineFact[] = [];
   const globalEnvReads = new Set<string>();
+  const allAssignments: AssignmentFact[] = [];
 
   if (!source.trim()) {
-    return { commands, pipelines, opaque, envReads: [] };
+    return { commands, pipelines, opaque, envReads: [], assignments: [] };
   }
 
   for (const obf of OBFUSCATION_PATTERNS) {
@@ -150,9 +198,9 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
     }
   }
 
-  const lang = await getBashLanguage();
-  const parser = new Parser();
-  parser.setLanguage(lang);
+  const { ParserCtor, language } = await getBashRuntime();
+  const parser = new ParserCtor();
+  parser.setLanguage(language);
 
   let tree;
   try {
@@ -162,7 +210,7 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
   }
 
   if (!tree) {
-    return { commands, pipelines, opaque: ["parse_null_tree"], envReads: [] };
+    return { commands, pipelines, opaque: ["parse_null_tree"], envReads: [], assignments: [] };
   }
 
   const root = tree.rootNode;
@@ -170,7 +218,36 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
     opaque.push("parse_error");
   }
 
+  // Root-level env-read scan covers heredocs, [[ ... ]], $((...)), case, for, and standalone assignments.
+  collectEnvReads(root, globalEnvReads, opaque);
+
   let nextPipelineId = 1;
+
+  function recordAssignmentNode(
+    assignNode: SyntaxNode,
+    standalone: boolean,
+    assignSource: AssignmentFact["source"],
+    targetMap?: Record<string, string>,
+  ): void {
+    const varName = assignNode.childForFieldName("name")?.text;
+    const varValNode = assignNode.childForFieldName("value");
+    if (varName) {
+      const value = varValNode ? stripQuotes(varValNode) : "";
+      if (targetMap) {
+        targetMap[varName] = value;
+      }
+      allAssignments.push({
+        name: varName,
+        value,
+        standalone,
+        depth,
+        source: assignSource,
+      });
+    }
+    if (varValNode) {
+      walkNestedSubstitutions(varValNode);
+    }
+  }
 
   function extractCommand(
     cmdNode: SyntaxNode,
@@ -185,7 +262,6 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
 
     const envReads = new Set<string>();
     collectEnvReads(cmdNode, envReads);
-    for (const v of envReads) globalEnvReads.add(v);
 
     if (containsDynamicNode(nameNode)) {
       opaque.push(`dynamic_command_name:${nameNode.text}`);
@@ -200,11 +276,7 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
       if (child.id === nameNode.id) continue;
 
       if (child.type === "variable_assignment") {
-        const varName = child.childForFieldName("name")?.text;
-        const varVal = child.childForFieldName("value");
-        if (varName) {
-          assignments[varName] = varVal ? stripQuotes(varVal) : "";
-        }
+        recordAssignmentNode(child, false, "prefix", assignments);
         continue;
       }
 
@@ -236,9 +308,59 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
     commands.push(fact);
 
     for (const child of cmdNode.namedChildren) {
+      if (child.type !== "variable_assignment") {
+        walkNestedSubstitutions(child);
+      }
+    }
+
+    return fact;
+  }
+
+  function extractDeclarationCommand(
+    declNode: SyntaxNode,
+    extraRedirections: RedirectionFact[],
+    pipelineId?: number,
+    pipelineIndex?: number,
+  ): CommandFact {
+    const keywordNode = declNode.children[0];
+    const keyword = keywordNode ? keywordNode.text : "export";
+    const argv: string[] = [];
+    const assignments: Record<string, string> = {};
+    const redirections: RedirectionFact[] = [...extraRedirections];
+    const envReads = new Set<string>();
+    collectEnvReads(declNode, envReads);
+
+    for (const child of declNode.namedChildren) {
+      if (child.type === "variable_assignment") {
+        recordAssignmentNode(child, true, "declaration", assignments);
+        continue;
+      }
+      if (child.type === "variable_name") {
+        argv.push(child.text);
+        continue;
+      }
+      if (child.type === "file_redirect") {
+        const redir = extractRedirection(child);
+        if (redir) redirections.push(redir);
+        continue;
+      }
+      argv.push(stripQuotes(child));
       walkNestedSubstitutions(child);
     }
 
+    const fact: CommandFact = {
+      name: keyword,
+      argv,
+      rawText: declNode.text,
+      redirections,
+      assignments,
+      envReads: Array.from(envReads),
+      pipelineId,
+      pipelineIndex,
+      depth,
+      layer: "bash",
+    };
+    commands.push(fact);
     return fact;
   }
 
@@ -254,6 +376,20 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
     }
   }
 
+  function walkHeredocRedirect(heredocNode: SyntaxNode): void {
+    for (const hc of heredocNode.namedChildren) {
+      if (hc.type === "heredoc_start" || hc.type === "heredoc_end") {
+        continue;
+      }
+      if (hc.type === "heredoc_body") {
+        walkNestedSubstitutions(hc);
+      } else {
+        // Commands/pipelines trailing `<<EOF` on the same line (e.g. `cat <<EOF | curl ...`)
+        walk(hc);
+      }
+    }
+  }
+
   function walk(node: SyntaxNode, pendingRedirects: RedirectionFact[] = []): void {
     if (node.type === "pipeline") {
       const pipelineId = nextPipelineId++;
@@ -264,6 +400,9 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
         if (child.type === "command") {
           const fact = extractCommand(child, [], pipelineId, index++);
           if (fact) pipeCmdNames.push(fact.name);
+        } else if (child.type === "declaration_command") {
+          const fact = extractDeclarationCommand(child, [], pipelineId, index++);
+          pipeCmdNames.push(fact.name);
         } else if (child.type === "redirected_statement") {
           const body = child.childForFieldName("body");
           const redirects: RedirectionFact[] = [];
@@ -271,11 +410,16 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
             if (rc.type === "file_redirect") {
               const r = extractRedirection(rc);
               if (r) redirects.push(r);
+            } else if (rc.type === "heredoc_redirect") {
+              walkHeredocRedirect(rc);
             }
           }
           if (body?.type === "command") {
             const fact = extractCommand(body, redirects, pipelineId, index++);
             if (fact) pipeCmdNames.push(fact.name);
+          } else if (body?.type === "declaration_command") {
+            const fact = extractDeclarationCommand(body, redirects, pipelineId, index++);
+            pipeCmdNames.push(fact.name);
           } else if (body) {
             walk(body, redirects);
           }
@@ -298,7 +442,7 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
           const r = extractRedirection(child);
           if (r) redirects.push(r);
         } else if (child.type === "heredoc_redirect") {
-          walkNestedSubstitutions(child);
+          walkHeredocRedirect(child);
         }
       }
       if (body) {
@@ -312,9 +456,13 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
       return;
     }
 
+    if (node.type === "declaration_command") {
+      extractDeclarationCommand(node, pendingRedirects);
+      return;
+    }
+
     if (node.type === "variable_assignment") {
-      collectEnvReads(node, globalEnvReads);
-      walkNestedSubstitutions(node);
+      recordAssignmentNode(node, true, "standalone");
       return;
     }
 
@@ -331,5 +479,6 @@ export async function parseBash(source: string, depth = 0): Promise<BashParseOut
     pipelines,
     opaque: Array.from(new Set(opaque)),
     envReads: Array.from(globalEnvReads),
+    assignments: allAssignments,
   };
 }

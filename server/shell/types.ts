@@ -7,6 +7,14 @@ export interface RedirectionFact {
   isRead: boolean;
 }
 
+export interface AssignmentFact {
+  name: string;
+  value: string;
+  standalone: boolean;
+  depth: number;
+  source: "prefix" | "standalone" | "declaration" | "wrapper";
+}
+
 export interface CommandFact {
   name: string;
   argv: string[];
@@ -18,6 +26,7 @@ export interface CommandFact {
   pipelineIndex?: number;
   depth: number;
   layer: Shell;
+  cwdChanged?: boolean;
 }
 
 export interface PipelineFact {
@@ -39,4 +48,7 @@ export interface LayerResult {
   pipelines: PipelineFact[];
   effects: EffectTag[];
   opaque: string[];
+  assignments: AssignmentFact[];
+  envReads: string[];
+  cwdChanged: boolean;
 }

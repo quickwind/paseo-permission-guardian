@@ -329,4 +329,19 @@ level = "SafeRead"
   level = "ExecProject"
   bare = true
   tolerate_unknown_flags = true
+
+[[commands]]
+name = "read"
+level = "Inert"
+bare = true
+bare_flags = ["-r", "-s", "-e"]
+valued = ["-a", "-d", "-i", "-n", "-N", "-p", "-t", "-u"]
+
+[[commands]]
+name = "make"
+level = "ExecProject"
+bare = true
+bare_flags = ["-s", "-n", "--dry-run", "-k", "-B"]
+valued = ["-j", "-C", "-f"]
+deny = ["-e", "--eval"]
 `;

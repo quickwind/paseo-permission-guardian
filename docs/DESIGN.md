@@ -177,6 +177,7 @@ paseo-permission-guardian/
       windows-builtins.ts  # del, rd, reg, sc, schtasks, robocopy, icacls, …
       handlers/            # JS ports for commands needing code (curl, …)
     paths/                 # normalization, ancestor realpath, WSL mapping, sensitive/protected catalogs
+    secrets/               # stateless credential literal patterns & env var classifiers (ADR-0005)
     context/               # incremental timeline sync, taint, secretTaint, provenance, scope grants
     effects.ts             # effect vocabulary + combination rules
     policy/                # layered YAML loading, schema, project sha256 pinning
@@ -372,7 +373,7 @@ plugin's own policy, settings, and data files.
 | Tag | Meaning |
 | --- | --- |
 | `read` | Reads ordinary files / metadata |
-| `read_secret` | Reads a sensitive path, credential store, or sensitive env vars (`env`, `printenv`, `$env:*_KEY/*_TOKEN/*_SECRET`) |
+| `read_secret` | Reads a sensitive path, credential store, or sensitive env vars / full env dumps / literal credentials ([ADR-0005](./adr/0005-env-classification-and-bash-ast-hardening.md)) |
 | `write_worktree` | Creates/modifies files inside the worktree |
 | `write_outside` | Writes outside the worktree (excluding temp) |
 | `write_protected` | Writes a protected path |
@@ -548,8 +549,8 @@ notifications. Timeout ⇒ normal human flow. The plugin detects and prefers it 
 - Each record (keyed by `requestId` for `before`/`after` reconciliation): normalized action
   (secrets redacted), layers, effects, reasons, decision, mode, actor attribution, final
   resolution, latency, plugin and data versions.
-- Redaction: known token formats, `Authorization` headers, values of `*_KEY`/`*_TOKEN`/`*_SECRET`
-  env assignments, PEM blocks. Raw commands can be excluded entirely by policy.
+- Redaction: known token formats, `Authorization` headers, URL credentials, values of sensitive
+  env assignments, PEM blocks — applied to `action`, `decision`, and `warnings` ([ADR-0005](./adr/0005-env-classification-and-bash-ast-hardening.md)). Raw commands can be excluded entirely by policy.
 
 ### 13.2 Metrics
 

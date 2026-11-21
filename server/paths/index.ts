@@ -235,6 +235,10 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
         matchedRules.push(`sensitive:system:${sysPath}`);
       }
     }
+    if (/^\/proc\/(?:self|thread-self|\d+)\/environ$/.test(candidate)) {
+      isSensitive = true;
+      matchedRules.push("sensitive:system:proc_environ");
+    }
   }
 
   for (const rx of SENSITIVE_BASENAME_PATTERNS) {
