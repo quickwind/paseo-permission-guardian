@@ -39,6 +39,7 @@ export class PermissionGuardianService {
 
   private settings: GuardianSettings;
   private settingsInvalid = false;
+  private settingsInvalidReason: string | null = null;
 
   constructor(options: GuardianServiceOptions) {
     this.auditStore = options.auditStore;
@@ -52,6 +53,7 @@ export class PermissionGuardianService {
   updateSettings(next: GuardianSettings): void {
     this.settings = next;
     this.settingsInvalid = false;
+    this.settingsInvalidReason = null;
   }
 
   getSettings(): GuardianSettings {
@@ -62,8 +64,13 @@ export class PermissionGuardianService {
     return this.sessionStore;
   }
 
-  markSettingsInvalid(_reason: string): void {
+  markSettingsInvalid(reason: string): void {
     this.settingsInvalid = true;
+    this.settingsInvalidReason = reason;
+  }
+
+  getSettingsInvalidReason(): string | null {
+    return this.settingsInvalid ? this.settingsInvalidReason : null;
   }
 
   getEffectiveBaseMode(): "off" | "shadow" | "act" {

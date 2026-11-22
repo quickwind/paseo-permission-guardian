@@ -91,12 +91,38 @@ describe("P2a context and settings fail-safes", () => {
     expect(state.untrustedTaint).toBe(false);
   });
 
+  it("completed non-web search and non-sensitive read do not taint", async () => {
+    const store = new SessionContextStore();
+    const { state } = await store.syncFromTimeline("a", ctx, async () => [
+      {
+        type: "tool_call",
+        callId: "s1",
+        name: "Grep",
+        status: "completed",
+        error: null,
+        detail: { type: "search", query: "foo", toolName: "grep" },
+      } as never,
+      {
+        type: "tool_call",
+        callId: "r1",
+        name: "Read",
+        status: "completed",
+        error: null,
+        detail: { type: "read", filePath: "/repo/project/README.md" },
+      } as never,
+    ]);
+    expect(state.untrustedTaint).toBe(false);
+    expect(state.secretTaint).toBe(false);
+  });
+
   it("invalid settings force effective shadow", async () => {
     const { service } = await makeService("act");
     service.markSettingsInvalid("bad");
     expect(service.getStatus().effectiveMode).toBe("shadow");
     expect(service.getEffectiveBaseMode()).toBe("shadow");
+    expect(service.getSettingsInvalidReason()).toBe("bad");
     service.updateSettings({ ...DEFAULT_GUARDIAN_SETTINGS, mode: "act" } as never);
     expect(service.getEffectiveBaseMode()).toBe("act");
+    expect(service.getSettingsInvalidReason()).toBeNull();
   });
 });

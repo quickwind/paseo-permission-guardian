@@ -153,7 +153,7 @@ export class SessionContextStore {
         if (SENSITIVE_SHELL_SECRET_REGEX.test(detail.command)) {
           this.markSecretTaint(agentId);
         }
-      } else {
+      } else if (detail.type === "unknown") {
         // Unknown tool-call types may have consumed untrusted content (fail safe).
         this.markUntrustedTaint(agentId);
       }
