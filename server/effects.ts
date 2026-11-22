@@ -160,6 +160,56 @@ const LOLBIN_COMMANDS = new Set([
 const WINDOWS_PRIVILEGE_TOOLS = new Set(["sc", "schtasks", "net", "icacls", "takeown", "assoc", "ftype"]);
 const WINDOWS_PKG_INSTALL_TOOLS = new Set(["winget", "choco", "msiexec"]);
 
+export const PASEO_READONLY_MCP_TOOLS: ReadonlySet<string> = new Set([
+  "list_agents",
+  "get_agent_status",
+  "get_agent_activity",
+  "read_agent_conversation",
+  "list_workspaces",
+  "list_terminals",
+  "list_providers",
+  "list_models",
+  "list_hosts",
+  "list_pending_permissions",
+  "list_schedules",
+  "list_events",
+  "get_run",
+  "list_runs",
+  "inspect_provider",
+  "inspect_schedule",
+  "schedule_logs",
+  "list_gates",
+  "list_subscriptions",
+  "get_analytics",
+  "capture_terminal",
+  "list_workspace_scripts",
+]);
+
+const PASEO_CONTROL_SUBCOMMANDS = new Set([
+  "plugin",
+  "permit",
+  "permission",
+  "agent",
+  "settings",
+  "config",
+  "daemon",
+  "schedule",
+  "workspace",
+  "run",
+]);
+const PASEO_VALUE_FLAGS = new Set(["--home", "--host", "--json", "--server"]);
+
+function isPaseoControlCommand(bin: string, argv: string[]): boolean {
+  if (bin !== "paseo") return false;
+  // argv may or may not include the command name itself.
+  let i = argv[0] !== undefined && normalizeBin(argv[0]) === "paseo" ? 1 : 0;
+  while (i < argv.length && argv[i].startsWith("--")) {
+    const flag = argv[i];
+    i += !flag.includes("=") && PASEO_VALUE_FLAGS.has(flag) ? 2 : 1;
+  }
+  return i < argv.length && PASEO_CONTROL_SUBCOMMANDS.has(argv[i].toLowerCase());
+}
+
 function normalizeBin(name: string): string {
   const base = (name.split(/[\\/]/).pop() ?? name).toLowerCase();
   return base.replace(/\.(?:exe|cmd|bat|ps1|com)$/, "");
@@ -1607,6 +1657,9 @@ export async function analyzeActionEffects(
   let pipelines: PipelineFact[] = [];
   let commands: CommandFact[] = [];
   let touchedUntrusted = false;
+  if (action.sandboxBypass) {
+    effects.push({ tag: "privilege", layer: 0, detail: "sandbox_bypass" });
+  }
 
   const basePathCtx: WindowsPathContext = {
     ...options.pathCtx,
@@ -1718,6 +1771,17 @@ export async function analyzeActionEffects(
   }
 
   if (action.kind === "mcp") {
+    if (
+      action.mcp?.server.toLowerCase() === "paseo" &&
+      !PASEO_READONLY_MCP_TOOLS.has(action.mcp.tool)
+    ) {
+      effects.push({
+        tag: "infra_mutate",
+        layer: 0,
+        target: `paseo:${action.mcp.tool}`,
+        detail: "paseo_control",
+      });
+    }
     effects.push({
       tag: "opaque",
       layer: 0,
@@ -1897,6 +1961,15 @@ export async function analyzeActionEffects(
     }
 
     evaluateCliSecretFlags(cmd, bin, effects, opaqueReasons);
+
+    if (isPaseoControlCommand(bin, cmd.argv)) {
+      effects.push({
+        tag: "infra_mutate",
+        layer: cmd.depth,
+        target: "paseo",
+        detail: "paseo_control",
+      });
+    }
 
     // Explicit Windows credential dump signatures -> L3 system_destructive
     if (isExplicitCredentialDumpSignature(cmd, bin)) {

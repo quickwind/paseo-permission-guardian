@@ -102,6 +102,7 @@ export interface Action {
   paths?: string[];
   url?: ActionUrl;
   mcp?: ActionMcp;
+  sandboxBypass?: boolean;
   raw?: unknown;
 }
 
