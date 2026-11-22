@@ -1620,7 +1620,8 @@ export async function analyzeActionEffects(
       }
     }
     if ((action.paths ?? []).length === 0) {
-      effects.push({ tag: "read", layer: 0 });
+      effects.push({ tag: "opaque", layer: 0, detail: "read_without_path" });
+      opaqueReasons.push("read_without_path");
     }
     return finalizeResult(effects, opaqueReasons, pipelines, commands, touchedUntrusted);
   }

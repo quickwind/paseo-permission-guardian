@@ -29,6 +29,9 @@ export interface PathContext {
   extraSensitivePatterns?: string[];
   extraProtectedPatterns?: string[];
   skipHostRealpath?: boolean;
+  /** Extra plugin-self roots (already resolved); see resolvePaseoSelfRoots. */
+  paseoRoots?: string[];
+  envSnapshot?: Record<string, string | undefined>;
 }
 
 export interface PathClassification {
@@ -113,7 +116,51 @@ const ENTRYPOINT_BASENAMES = new Set([
   "justfile",
   "taskfile.yml",
   "taskfile.yaml",
+  "build.rs",
+  "conftest.py",
+  "noxfile.py",
+  "tox.ini",
+  "build.gradle",
+  "build.gradle.kts",
+  "settings.gradle",
+  "settings.gradle.kts",
+  "pom.xml",
+  "cmakelists.txt",
+  "meson.build",
+  "rakefile",
+  "gemfile",
+  "composer.json",
+  "deno.json",
+  "deno.jsonc",
+  "bunfig.toml",
+  "directory.build.props",
+  "directory.build.targets",
 ]);
+
+/**
+ * Roots whose contents belong to Paseo or this plugin (plugin-self). Only defined,
+ * absolute values are returned.
+ */
+export function resolvePaseoSelfRoots(
+  env: Record<string, string | undefined>,
+  home: string,
+  pluginDataDir?: string,
+): string[] {
+  const candidates = [
+    joinAware(home, ".paseo"),
+    env.PASEO_HOME,
+    env.PASEO_PLUGIN_DIR,
+    env.PASEO_GUARDIAN_DATA_DIR,
+    pluginDataDir,
+  ];
+  const roots: string[] = [];
+  for (const c of candidates) {
+    if (!c) continue;
+    const t = c.trim();
+    if (t && (posix.isAbsolute(t) || isAbsolute(t))) roots.push(t);
+  }
+  return Array.from(new Set(roots));
+}
 
 function toPosixSlash(value: string): string {
   return value.replaceAll("\\", "/");
@@ -235,6 +282,9 @@ export function isBuildOrScriptEntrypoint(filePath: string, worktreeRoot?: strin
     }
   }
   const relLower = rel.toLowerCase();
+  if (base.endsWith(".csproj") || relLower === ".cargo/config.toml" || relLower.endsWith("/.cargo/config.toml")) {
+    return true;
+  }
   if (relLower.startsWith("scripts/") || relLower.includes("/scripts/")) {
     return true;
   }
@@ -248,7 +298,14 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
   const resolveReal = (p: string): string => (ctx.skipHostRealpath ? p : resolveAncestorRealPath(p));
   const home = ctx.home ?? homedir();
   const realHome = resolveReal(home);
-  const normalized = expandPosixPath(rawPath, ctx.cwd, home);
+  const paseoRoots = ctx.paseoRoots ?? resolvePaseoSelfRoots(ctx.envSnapshot ?? {}, home, ctx.pluginDataDir);
+  let pathInput = rawPath;
+  const paseoHomeEnv = ctx.envSnapshot?.PASEO_HOME;
+  if (paseoHomeEnv) {
+    const m = /^\$(?:\{PASEO_HOME\}|PASEO_HOME)(?=\/|$)/.exec(rawPath.trim());
+    if (m) pathInput = paseoHomeEnv + rawPath.trim().slice(m[0].length);
+  }
+  const normalized = expandPosixPath(pathInput, ctx.cwd, home);
   const realPath = resolveReal(normalized);
 
   const worktreeBase = ctx.worktreeRoot ?? ctx.cwd;
@@ -312,6 +369,21 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
     isProtected = true;
     isPluginSelf = true;
     matchedRules.push("protected:plugin_self");
+  }
+
+  for (const root of paseoRoots) {
+    const realRoot = resolveReal(root);
+    if (
+      candidates.some((c) => isPathUnder(c, root) || isPathUnder(c, realRoot))
+    ) {
+      isProtected = true;
+      isPluginSelf = true;
+      matchedRules.push("protected:plugin_self");
+      if (base === "config.json" || base === "settings.json") {
+        isSensitive = true;
+        matchedRules.push(`sensitive:paseo_self:${base}`);
+      }
+    }
   }
 
   for (const candidate of candidates) {

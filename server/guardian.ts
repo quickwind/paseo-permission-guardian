@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import type { PluginHookEvents } from "@getpaseo/plugin/server";
 import { DEFAULT_GUARDIAN_SETTINGS, type GuardianSettings } from "../shared/settings.js";
 import type {
@@ -8,6 +9,7 @@ import type {
 import { AuditStore } from "./audit/store.js";
 import { SessionContextStore, type TimelineFetcher } from "./context/session.js";
 import { decideAction } from "./decide.js";
+import { resolvePaseoSelfRoots } from "./paths/index.js";
 import { detectHostOs, normalizePermissionRequest } from "./normalize/index.js";
 
 export interface PluginAnsweredEntry {
@@ -106,6 +108,7 @@ export class PermissionGuardianService {
         cwd: normalized.action.cwd,
         worktreeRoot: normalized.action.worktreeRoot ?? payload.agent.cwd,
         pluginDataDir: this.auditStore.getDataDir(),
+        paseoRoots: resolvePaseoSelfRoots(process.env, homedir(), this.auditStore.getDataDir()),
       };
 
       // Incremental same-turn timeline sync for context-sensitive calls (ADR-0002)

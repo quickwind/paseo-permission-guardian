@@ -94,6 +94,7 @@ export function collectPathsFromObject(input: Record<string, unknown> | undefine
     "file_path",
     "filePath",
     "path",
+    "Path",
     "target_file",
     "targetFile",
     "TargetFile",
