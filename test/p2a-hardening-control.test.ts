@@ -66,6 +66,7 @@ describe("p2a control surface hardening", () => {
     "paseo --home /h permit allow a r",
     "paseo agent send a hi",
     "paseo settings set k v",
+    "paseo --json agent send a hi",
   ])("paseo CLI control `%s` is L2", async (src) =>
     expect((await decideAction(bashExec(src), opts)).decision.level).toBe("L2"));
   it("sandbox bypass flag raises a benign command to L2", async () => {

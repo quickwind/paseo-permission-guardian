@@ -197,7 +197,7 @@ const PASEO_CONTROL_SUBCOMMANDS = new Set([
   "workspace",
   "run",
 ]);
-const PASEO_VALUE_FLAGS = new Set(["--home", "--host", "--json", "--server"]);
+const PASEO_VALUE_FLAGS = new Set(["--home", "--host", "--server"]);
 
 function isPaseoControlCommand(bin: string, argv: string[]): boolean {
   if (bin !== "paseo") return false;
