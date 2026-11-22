@@ -95,3 +95,58 @@ describe("B: entry display helpers", () => {
     expect((messages.resources.zh as any).act.entries.choice.denyOnce).toBe("拒绝一次");
   });
 });
+
+import { canOpenChat, entryCountRows, entryKindCounts, integrityText, openEntryChat } from "../client/gate-view.js";
+import { messages } from "../client/i18n.js";
+
+function translator(locale: "en" | "zh") {
+  const res = messages.resources[locale] as Record<string, unknown>;
+  return (key: string): string => {
+    let cur: unknown = res;
+    for (const part of key.split(".")) cur = (cur as Record<string, unknown>)?.[part];
+    if (typeof cur !== "string") throw new Error(`missing i18n key ${key}`);
+    return cur;
+  };
+}
+
+describe("entry UX helpers", () => {
+  const ok = emptyGateStatus();
+  it("counts non-zero kinds only", () => {
+    const entries = [e("orphan_deny"), e("orphan_deny"), e("corrupt_line"), e("false_allow")];
+    expect(entryKindCounts(entries)).toEqual({ orphan_deny: 2, unevaluable_deny: 0, corrupt_line: 1 });
+    expect(entryCountRows(entries).map((r) => [r.kind, r.count])).toEqual([
+      ["orphan_deny", 2],
+      ["corrupt_line", 1],
+    ]);
+    expect(entryCountRows([])).toEqual([]);
+  });
+  it("integrity text: en singular/plural/combined/none", () => {
+    const t = translator("en");
+    expect(integrityText({ ...ok, entries: [e("orphan_deny")] }, t)).toBe("1 unmatched denial needs review");
+    expect(integrityText({ ...ok, entries: [e("orphan_deny"), e("orphan_deny")] }, t)).toBe("2 unmatched denials need review");
+    expect(integrityText({ ...ok, entries: [e("orphan_deny"), e("corrupt_line")] }, t)).toBe(
+      "1 unmatched denial needs review; 1 audit problem needs review",
+    );
+    expect(integrityText(ok, t)).toBe("Normal");
+    expect(integrityText({ ...ok, state: "unavailable" }, t)).toBe("The gate is unavailable");
+  });
+  it("integrity text: zh", () => {
+    const t = translator("zh");
+    expect(integrityText({ ...ok, entries: [e("orphan_deny")] }, t)).toBe("1 条未匹配的拒绝待处理");
+    expect(integrityText({ ...ok, entries: [e("orphan_deny"), e("unevaluable_deny")] }, t)).toBe(
+      "1 条未匹配的拒绝待处理；1 条拒绝无法重新评估",
+    );
+    expect(integrityText(ok, t)).toBe("正常");
+  });
+  it("open chat calls navigation.openAgent with the entry agentId, hidden without navigation", () => {
+    const calls: unknown[] = [];
+    const nav = { openAgent: (i: unknown) => void calls.push(i) };
+    const withAgent = { ...e("orphan_deny"), agentId: "agent-1" };
+    expect(canOpenChat(withAgent, nav)).toBe(true);
+    expect(openEntryChat(withAgent, nav)).toBe(true);
+    expect(calls).toEqual([{ agentId: "agent-1" }]);
+    expect(canOpenChat(withAgent, undefined)).toBe(false);
+    expect(openEntryChat(withAgent, undefined)).toBe(false);
+    expect(canOpenChat(e("orphan_deny"), nav)).toBe(false);
+  });
+});

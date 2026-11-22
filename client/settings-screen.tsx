@@ -25,13 +25,16 @@ import type {
   GuardianStatusSnapshot,
 } from "../shared/types.js";
 import {
+  canOpenChat,
   choiceLabelKey,
+  entryCountRows,
+  integrityText,
+  openEntryChat,
   effectiveModeLabelKey,
   entryActionLabelKey,
   entryAgentLabel,
   entryContentView,
   entryTime,
-  hasIntegrityProblem,
 } from "./gate-view.js";
 import { messages } from "./i18n.js";
 
@@ -82,7 +85,11 @@ function NumberField(props: {
   );
 }
 
-export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
+export function GuardianSettingsScreen({
+  theme,
+  layout,
+  navigation,
+}: PluginSurfaceProps) {
   const { t } = useTranslation(messages);
   const settings = useSettings(guardianSettings);
   const fetchStatus = useRpc(getGuardianStatus);
@@ -242,10 +249,14 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     const view = entryContentView(entry);
     const time = entryTime(entry);
     if (time) lines.push(`${t("act.entries.time")}: ${time}`);
-    if (entry.provider) lines.push(`${t("act.entries.provider")}: ${entry.provider}`);
+    if (entry.provider)
+      lines.push(`${t("act.entries.provider")}: ${entry.provider}`);
     const agent = entryAgentLabel(entry);
     if (agent) lines.push(`${t("act.entries.agent")}: ${agent}`);
-    if ((view.source === "request" || view.source === "recovered") && view.toolName) {
+    if (
+      (view.source === "request" || view.source === "recovered") &&
+      view.toolName
+    ) {
       lines.push(`${t("act.entries.tool")}: ${view.toolName}`);
     }
     if (view.source === "recovered") lines.push(t("act.entries.recovered"));
@@ -253,7 +264,9 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
       lines.push(`${t("act.entries.effects")}: ${entry.effects.join(", ")}`);
     }
     if (entry.resolution) {
-      lines.push(`${t("act.entries.yourChoice")}: ${t(choiceLabelKey(entry.resolution))}`);
+      lines.push(
+        `${t("act.entries.yourChoice")}: ${t(choiceLabelKey(entry.resolution))}`,
+      );
       if (entry.resolution.message) {
         lines.push(`${t("act.entries.message")}: ${entry.resolution.message}`);
       }
@@ -527,11 +540,14 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
                   {String(gate.unconfirmedCount)}
                 </Text>
               </SettingsRow>
+              {entryCountRows(gate.entries).map((row) => (
+                <SettingsRow key={row.kind} label={t(row.labelKey)}>
+                  <Text style={styles.metricValue}>{String(row.count)}</Text>
+                </SettingsRow>
+              ))}
               <SettingsRow label={t("act.integrity")}>
                 <Text style={styles.metricValue}>
-                  {hasIntegrityProblem(gate)
-                    ? t("act.integrityBad")
-                    : t("act.integrityOk")}
+                  {integrityText(gate, (key) => t(key))}
                 </Text>
               </SettingsRow>
               <SettingsRow label={t("act.status.lastReplay")}>
@@ -544,24 +560,37 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
                   {gate.fingerprint.slice(0, 8)}
                 </Text>
               </SettingsRow>
+              {gate.entries.length > 0 ? (
+                <Text style={styles.notice}>{t("act.entries.gateHint")}</Text>
+              ) : null}
               {gate.entries.map((entry) => {
                 const details = entryDetails(entry);
                 return (
-                  <SettingsAction
-                    key={entry.key}
-                    label={`${entryKindLabel(entry)}: ${entryHeadline(entry)}`}
-                    hint={details.length > 0 ? details : undefined}
-                    actionLabel={t(entryActionLabelKey(entry))}
-                    disabled={gateBusy}
-                    onPress={() =>
-                      runGateAction(() =>
-                        annotateGate({
-                          key: entry.key,
-                          annotation: "not_safety",
-                        }),
-                      )
-                    }
-                  />
+                  <View key={entry.key}>
+                    {canOpenChat(entry, navigation) ? (
+                      <SettingsAction
+                        label={t("act.entries.openChat")}
+                        actionLabel={t("act.entries.openChat")}
+                        onPress={() => {
+                          openEntryChat(entry, navigation);
+                        }}
+                      />
+                    ) : null}
+                    <SettingsAction
+                      label={`${entryKindLabel(entry)}: ${entryHeadline(entry)}`}
+                      hint={details.length > 0 ? details : undefined}
+                      actionLabel={t(entryActionLabelKey(entry))}
+                      disabled={gateBusy}
+                      onPress={() =>
+                        runGateAction(() =>
+                          annotateGate({
+                            key: entry.key,
+                            annotation: "not_safety",
+                          }),
+                        )
+                      }
+                    />
+                  </View>
                 );
               })}
             </>

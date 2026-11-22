@@ -167,6 +167,17 @@ export class AuditStore {
    * not notify merge listeners, so it never changes gate state. Ignored once the record has a
    * decision (no longer an orphan).
    */
+  /** Display-only agent title resolved after the fact (redacted); never overwrites an existing one. */
+  setAgentTitle(requestId: string, title: string): void {
+    const existing = this.records.get(requestId);
+    const clean = redactTitle(title);
+    if (!existing || existing.agentTitle || !clean) return;
+    const next: AuditRecord = { ...existing, agentTitle: clean };
+    this.records.set(requestId, next);
+    this.touched?.add(requestId);
+    void this.enqueueAppend({ event: "update", record: next }).catch(() => {});
+  }
+
   setOrphanContext(requestId: string, context: OrphanContext): void {
     const existing = this.records.get(requestId);
     if (!existing || existing.decision) return;

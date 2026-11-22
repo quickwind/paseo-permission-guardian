@@ -122,6 +122,8 @@ export const messages = defineTranslations({
           title: "Entries needing review",
           annotate: "Not a safety issue",
           acknowledge: "Acknowledge",
+          openChat: "Open chat",
+          gateHint: "The gate stays unavailable until each entry below is marked.",
           kind: {
             false_allow: "False allow",
             orphan_deny: "Unmatched denial",
@@ -157,6 +159,28 @@ export const messages = defineTranslations({
         integrity: "Audit integrity",
         integrityOk: "No integrity problems",
         integrityBad: "Problems found",
+        integrityNormal: "Normal",
+        integritySep: "; ",
+        integrityUnavailable: "The gate is unavailable",
+        integrityDetail: {
+          orphan_deny: {
+            one: "unmatched denial needs review",
+            other: "unmatched denials need review",
+          },
+          unevaluable_deny: {
+            one: "denial could not be re-evaluated",
+            other: "denials could not be re-evaluated",
+          },
+          corrupt_line: {
+            one: "audit problem needs review",
+            other: "audit problems need review",
+          },
+        },
+        counts: {
+          orphan_deny: "Unmatched denials",
+          unevaluable_deny: "Unevaluable denials",
+          corrupt_line: "Corrupt audit lines",
+        },
         replay: "Re-run replay",
         replayHint: "Re-evaluate the audit log against current rules.",
         replayAction: "Replay",
@@ -288,6 +312,8 @@ export const messages = defineTranslations({
           title: "待处理条目",
           annotate: "不是安全问题",
           acknowledge: "确认",
+          openChat: "打开对话",
+          gateHint: "在下列每个条目都被标记之前，门控将保持不可用。",
           kind: {
             false_allow: "误放行",
             orphan_deny: "未匹配的拒绝",
@@ -321,6 +347,28 @@ export const messages = defineTranslations({
         integrity: "审计完整性",
         integrityOk: "没有完整性问题",
         integrityBad: "发现问题",
+        integrityNormal: "正常",
+        integritySep: "；",
+        integrityUnavailable: "门控不可用",
+        integrityDetail: {
+          orphan_deny: {
+            one: "条未匹配的拒绝待处理",
+            other: "条未匹配的拒绝待处理",
+          },
+          unevaluable_deny: {
+            one: "条拒绝无法重新评估",
+            other: "条拒绝无法重新评估",
+          },
+          corrupt_line: {
+            one: "个审计问题待处理",
+            other: "个审计问题待处理",
+          },
+        },
+        counts: {
+          orphan_deny: "未匹配的拒绝数",
+          unevaluable_deny: "无法评估的拒绝数",
+          corrupt_line: "损坏的审计行数",
+        },
         replay: "重新运行重放",
         replayHint: "按当前规则重新评估审计日志。",
         replayAction: "重放",

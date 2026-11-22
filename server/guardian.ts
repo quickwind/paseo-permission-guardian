@@ -96,6 +96,8 @@ export class PermissionGuardianService {
   private readonly backfillAttempted = new Set<string>();
   /** Ids stored as `{ unavailable: true }` that backfill already retried once (this process). */
   private readonly unavailableRetried = new Set<string>();
+  /** agentId -> resolved title, or null when already attempted and unresolvable. */
+  private readonly agentTitles = new Map<string, string | null>();
   private readonly pendingEnrichments = new Set<Promise<void>>();
 
   private settings: GuardianSettings;
@@ -397,6 +399,37 @@ export class PermissionGuardianService {
       this.trackEnrichment(this.enrichOrphan(id, record.agentId, fetcher, signal ? { signal } : {}), id);
     }
     await this.whenEnrichmentsIdle();
+  }
+
+  /**
+   * Best-effort, bounded resolution of missing agent titles (display only). Each agent id is
+   * looked up at most once per process (successes and failures are both remembered); at most
+   * 5 new lookups per call.
+   */
+  async backfillAgentTitles(
+    requestIds: string[],
+    resolver: (agentId: string) => Promise<string | undefined>,
+  ): Promise<void> {
+    let started = 0;
+    for (const id of requestIds) {
+      if (!id) continue;
+      const record = this.auditStore.getRecord(id);
+      if (!record || record.agentTitle || !record.agentId) continue;
+      const agentId = record.agentId;
+      let title = this.agentTitles.get(agentId);
+      if (title === undefined) {
+        if (started >= MAX_BACKFILL_PER_CALL) continue;
+        started += 1;
+        if (this.agentTitles.size >= MAX_BACKFILL_TRACKED) this.agentTitles.clear();
+        try {
+          title = (await resolver(agentId))?.trim() || null;
+        } catch {
+          title = null;
+        }
+        this.agentTitles.set(agentId, title);
+      }
+      if (title) this.auditStore.setAgentTitle(id, title);
+    }
   }
 
   /** Resolves once every background orphan enrichment started so far has settled. */

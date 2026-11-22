@@ -45,6 +45,17 @@ function timelineEntriesFetcher(paseo: PaseoApi): TimelineEntriesFetcher {
   };
 }
 
+/** Agent title from the Paseo API (cached snapshot first, then one refresh). */
+function agentTitleResolver(paseo: PaseoApi): (agentId: string) => Promise<string | undefined> {
+  return async (agentId) => {
+    const ref = paseo.agents.ref(agentId);
+    const cached = ref.current()?.title;
+    if (cached) return cached;
+    await ref.refresh();
+    return ref.current()?.title ?? undefined;
+  };
+}
+
 export default function contribute(server: PluginServerContext) {
   const settingsHandle = server.registerSettings(guardianSettings);
   const dataDir = resolveAuditDataDir();
@@ -162,6 +173,13 @@ export default function contribute(server: PluginServerContext) {
       void storeReady
         .then(() => guardian.backfillOrphanContexts(orphanIds, timelineEntriesFetcher(context.paseo)))
         .catch((error) => console.error("[paseo-permission-guardian] orphan backfill failed:", error));
+    }
+    // Same for missing agent titles (resolved once per agent; never blocks the response).
+    const untitled = status.gate.entries.filter((e) => e.agentId && !e.agentTitle && e.requestId).map((e) => e.requestId);
+    if (untitled.length > 0) {
+      void storeReady
+        .then(() => guardian.backfillAgentTitles(untitled, agentTitleResolver(context.paseo)))
+        .catch((error) => console.error("[paseo-permission-guardian] agent title backfill failed:", error));
     }
     return status;
   });

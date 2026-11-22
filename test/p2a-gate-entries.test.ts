@@ -415,3 +415,55 @@ describe("Fix round 2: stale orphanContext and enrichment signal", () => {
     await store.flush();
   });
 });
+
+describe("agent title resolution (entry UX)", () => {
+  const agent = { id: "agent-9", workspaceId: "w", parentAgentId: null, provider: "agy", cwd: "/repo", title: "", background: false, metadata: {} };
+  async function setup() {
+    const dataDir = await tmp();
+    const clock = { now: T0 + 60_000 };
+    const store = new AuditStore({ dataDir, pluginVersion: "0", now: () => new Date(clock.now) });
+    const service = new PermissionGuardianService({
+      auditStore: store,
+      pluginVersion: "0",
+      initialSettings: DEFAULT_GUARDIAN_SETTINGS,
+      now: () => clock.now,
+      gitStateProvider: async () => ({}),
+    });
+    return { store, service };
+  }
+
+  it("resolves a missing agentTitle once per agent, caches it, and redacts it", async () => {
+    const { store, service } = await setup();
+    await service.handlePermissionAfter({ agent, requestId: "a", resolution: { behavior: "deny" } });
+    await service.handlePermissionAfter({ agent, requestId: "b", resolution: { behavior: "deny" } });
+    expect(store.getRecord("a")?.agentTitle).toBeUndefined();
+    let calls = 0;
+    const resolver = async (id: string) => {
+      calls += 1;
+      return id === "agent-9" ? "Fix the build" : undefined;
+    };
+    await service.backfillAgentTitles(["a", "b"], resolver);
+    await service.backfillAgentTitles(["a", "b"], resolver);
+    expect(calls).toBe(1);
+    expect(store.getRecord("a")?.agentTitle).toBe("Fix the build");
+    expect(store.getRecord("b")?.agentTitle).toBe("Fix the build");
+    await store.flush();
+  });
+
+  it("does not retry an unresolvable agent and never overwrites an existing title", async () => {
+    const { store, service } = await setup();
+    await service.handlePermissionAfter({ agent, requestId: "a", resolution: { behavior: "deny" } });
+    await service.handlePermissionAfter({ agent: { ...agent, id: "agent-1", title: "Kept" }, requestId: "k", resolution: { behavior: "deny" } });
+    let calls = 0;
+    const resolver = async () => {
+      calls += 1;
+      return undefined;
+    };
+    await service.backfillAgentTitles(["a", "k"], resolver);
+    await service.backfillAgentTitles(["a"], resolver);
+    expect(calls).toBe(1);
+    expect(store.getRecord("a")?.agentTitle).toBeUndefined();
+    expect(store.getRecord("k")?.agentTitle).toBe("Kept");
+    await store.flush();
+  });
+});

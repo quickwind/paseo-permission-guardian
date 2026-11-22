@@ -15,6 +15,76 @@ export function hasIntegrityProblem(gate: Pick<GateStatus, "state" | "entries">)
   return gate.state === "unavailable" || gate.entries.some((e) => e.kind !== "false_allow");
 }
 
+export type CountedKind = "orphan_deny" | "unevaluable_deny" | "corrupt_line";
+export const COUNTED_KINDS: readonly CountedKind[] = ["orphan_deny", "unevaluable_deny", "corrupt_line"];
+
+/** Per-kind entry counts for the summary rows (false_allow is shown from the gate's own counter). */
+export function entryKindCounts(entries: readonly Pick<GateEntry, "kind">[]): Record<CountedKind, number> {
+  const out: Record<CountedKind, number> = { orphan_deny: 0, unevaluable_deny: 0, corrupt_line: 0 };
+  for (const e of entries) if (e.kind !== "false_allow") out[e.kind] += 1;
+  return out;
+}
+
+/** Summary rows to show: only kinds with at least one entry, with their label key. */
+export function entryCountRows(
+  entries: readonly Pick<GateEntry, "kind">[],
+): { kind: CountedKind; count: number; labelKey: `act.counts.${CountedKind}` }[] {
+  const counts = entryKindCounts(entries);
+  return COUNTED_KINDS.filter((k) => counts[k] > 0).map((kind) => ({
+    kind,
+    count: counts[kind],
+    labelKey: `act.counts.${kind}` as const,
+  }));
+}
+
+export type IntegrityKey =
+  | "act.integrityNormal"
+  | "act.integritySep"
+  | "act.integrityUnavailable"
+  | `act.integrityDetail.${CountedKind}.${"one" | "other"}`;
+
+/**
+ * Words describing what is wrong, e.g. "1 unmatched denial needs review" / "1 条未匹配的拒绝待处理";
+ * kinds are joined; "Normal" when nothing is wrong. Takes a translator so it stays locale-agnostic.
+ */
+export function integrityText(
+  gate: Pick<GateStatus, "state" | "entries">,
+  t: (key: IntegrityKey) => string,
+): string {
+  const counts = entryKindCounts(gate.entries);
+  const parts = COUNTED_KINDS.filter((k) => counts[k] > 0).map((k) => {
+    const n = counts[k];
+    const word = t(`act.integrityDetail.${k}.${n === 1 ? "one" : "other"}`);
+    return `${n} ${word}`;
+  });
+  if (gate.state === "unavailable" && parts.length === 0) return t("act.integrityUnavailable");
+  if (parts.length === 0) return t("act.integrityNormal");
+  return parts.join(t("act.integritySep"));
+}
+
+/** Navigation subset used by the settings screen (undefined on older hosts). */
+export interface OpenAgentNavigation {
+  readonly openAgent: (input: { readonly agentId: string; readonly serverId?: string }) => void;
+}
+
+/** The open-chat action is available only with navigation and an agent id. */
+export function canOpenChat(
+  entry: Pick<GateEntry, "agentId">,
+  navigation: Partial<OpenAgentNavigation> | undefined,
+): boolean {
+  return Boolean(entry.agentId) && typeof navigation?.openAgent === "function";
+}
+
+/** Opens the entry's agent chat; returns whether it was opened. */
+export function openEntryChat(
+  entry: Pick<GateEntry, "agentId">,
+  navigation: Partial<OpenAgentNavigation> | undefined,
+): boolean {
+  if (!canOpenChat(entry, navigation) || !entry.agentId) return false;
+  navigation!.openAgent!({ agentId: entry.agentId });
+  return true;
+}
+
 export function entryActionLabelKey(
   entry: Pick<GateEntry, "kind">,
 ): "act.entries.acknowledge" | "act.entries.annotate" {
