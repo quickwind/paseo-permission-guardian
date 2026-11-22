@@ -24,7 +24,15 @@ import type {
   GateStatus,
   GuardianStatusSnapshot,
 } from "../shared/types.js";
-import { effectiveModeLabelKey, entryActionLabelKey, hasIntegrityProblem } from "./gate-view.js";
+import {
+  choiceLabelKey,
+  effectiveModeLabelKey,
+  entryActionLabelKey,
+  entryAgentLabel,
+  entryContentView,
+  entryTime,
+  hasIntegrityProblem,
+} from "./gate-view.js";
 import { messages } from "./i18n.js";
 
 function NumberField(props: {
@@ -219,6 +227,39 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     update({ actGate: { ...values.actGate, ...patch } });
   const entryKindLabel = (entry: GateEntry) =>
     t(`act.entries.kind.${entry.kind}`);
+  /** Headline: what the entry was about (request summary, recovered summary, or a notice). */
+  const entryHeadline = (entry: GateEntry): string => {
+    const view = entryContentView(entry);
+    if (view.source === "request" || view.source === "recovered") {
+      return view.summary ?? view.toolName ?? entry.requestId;
+    }
+    if (view.source === "missing") return t("act.entries.missing");
+    return entry.key;
+  };
+  /** Detail lines: time, provider, agent, tool, effects, the human's choice and message. */
+  const entryDetails = (entry: GateEntry): string => {
+    const lines: string[] = [];
+    const view = entryContentView(entry);
+    const time = entryTime(entry);
+    if (time) lines.push(`${t("act.entries.time")}: ${time}`);
+    if (entry.provider) lines.push(`${t("act.entries.provider")}: ${entry.provider}`);
+    const agent = entryAgentLabel(entry);
+    if (agent) lines.push(`${t("act.entries.agent")}: ${agent}`);
+    if ((view.source === "request" || view.source === "recovered") && view.toolName) {
+      lines.push(`${t("act.entries.tool")}: ${view.toolName}`);
+    }
+    if (view.source === "recovered") lines.push(t("act.entries.recovered"));
+    if (entry.effects.length > 0) {
+      lines.push(`${t("act.entries.effects")}: ${entry.effects.join(", ")}`);
+    }
+    if (entry.resolution) {
+      lines.push(`${t("act.entries.yourChoice")}: ${t(choiceLabelKey(entry.resolution))}`);
+      if (entry.resolution.message) {
+        lines.push(`${t("act.entries.message")}: ${entry.resolution.message}`);
+      }
+    }
+    return lines.join("\n");
+  };
   const overrideStatusLabel = !values.actOverride.accepted
     ? t("act.override.inactive")
     : gate && !gate.override.valid
@@ -503,27 +544,26 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
                   {gate.fingerprint.slice(0, 8)}
                 </Text>
               </SettingsRow>
-              {gate.entries.map((entry) => (
-                <SettingsAction
-                  key={entry.key}
-                  label={`${entryKindLabel(entry)}: ${entry.command ?? entry.requestId}`}
-                  hint={
-                    entry.effects.length > 0
-                      ? entry.effects.join(", ")
-                      : undefined
-                  }
-                  actionLabel={t(entryActionLabelKey(entry))}
-                  disabled={gateBusy}
-                  onPress={() =>
-                    runGateAction(() =>
-                      annotateGate({
-                        key: entry.key,
-                        annotation: "not_safety",
-                      }),
-                    )
-                  }
-                />
-              ))}
+              {gate.entries.map((entry) => {
+                const details = entryDetails(entry);
+                return (
+                  <SettingsAction
+                    key={entry.key}
+                    label={`${entryKindLabel(entry)}: ${entryHeadline(entry)}`}
+                    hint={details.length > 0 ? details : undefined}
+                    actionLabel={t(entryActionLabelKey(entry))}
+                    disabled={gateBusy}
+                    onPress={() =>
+                      runGateAction(() =>
+                        annotateGate({
+                          key: entry.key,
+                          annotation: "not_safety",
+                        }),
+                      )
+                    }
+                  />
+                );
+              })}
             </>
           ) : (
             <SettingsRow label={t("act.status.title")}>
