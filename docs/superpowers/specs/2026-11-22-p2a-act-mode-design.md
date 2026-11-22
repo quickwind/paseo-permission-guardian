@@ -440,3 +440,14 @@ would remove the edit→test loop that `act` exists to automate).
   "count until confirmed" choice from costing weeks), unified `autoFallbackOnFalseAllow` semantics,
   gate updates at the merge point in every mode, memory-first `recordBefore`, 15 s attribution
   window and unconfirmed pause, false-deny by level, mandatory raise-only MCP/sandbox rules.
+
+## Errata (implementation)
+
+Added 2026-11-22; earlier sections are unchanged.
+
+- **R7 (persistence-option pattern).** §3.8's literal `/always|session|remember|forever|all|persist/i`
+  also matches agy's own `allow` (it contains `all`). The implemented pattern treats `all` as a
+  standalone word only; the other terms keep substring matching.
+- **R10 (replay samples).** Replay never counts a human-attributed allow whose `actOutcome` is
+  `unconfirmed` or `lost_race` as a sample (the outcome of the plugin's own answer is unclear, so the record is not trusted
+  as human evidence).
