@@ -312,3 +312,39 @@ describe("fix round 1", () => {
     expect(w.corruptLines).toHaveLength(1);
   });
 });
+
+describe("F6 field-wise merge across lines", () => {
+  it("an after line written after in-memory eviction does not erase before-line fields", async () => {
+    const dir = await tmp();
+    const s = new AuditStore({ dataDir: dir, pluginVersion: "0", maxInMemoryRecords: 1, now: () => new Date(T) });
+    await s.recordBefore(before("e1"));
+    s.setActOutcome("e1", "answered");
+    await s.recordBefore(before("e2")); // evicts e1 from memory
+    expect(s.getRecord("e1")).toBeUndefined();
+    await s.recordAfter({
+      requestId: "e1", agentId: "a", provider: "claude", mode: "act",
+      resolution: { behavior: "allow", resolvedAt: T, actor: "human" },
+    });
+    await s.flush();
+    const w = await readAuditWindow(dir, Date.parse("2026-11-20T00:00:00.000Z"));
+    const r = w.records.find((x) => x.requestId === "e1")!;
+    expect(r.action?.kind).toBe("exec");
+    expect(r.decision?.verdict).toBe("allow");
+    expect(r.offeredActions).toEqual([{ id: "allow_once", behavior: "allow" }]);
+    expect(r.contextSnapshot?.secretTaint).toBe(false);
+    expect(r.requestedAt).toBe(T);
+    expect(r.actOutcome).toBe("answered");
+    expect(r.resolution?.behavior).toBe("allow");
+    expect(r.agreement).toBe("agree");
+  });
+  it("a later line's defined values win", async () => {
+    const dir = await tmp();
+    const s = new AuditStore({ dataDir: dir, pluginVersion: "0", now: () => new Date(T) });
+    await s.recordBefore(before("e3"));
+    s.setActOutcome("e3", "unconfirmed");
+    s.setActOutcome("e3", "answered");
+    await s.flush();
+    const w = await readAuditWindow(dir, Date.parse("2026-11-20T00:00:00.000Z"));
+    expect(w.records[0]!.actOutcome).toBe("answered");
+  });
+});

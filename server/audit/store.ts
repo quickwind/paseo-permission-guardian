@@ -12,7 +12,10 @@ import type {
   GuardianDecision,
   GuardianMode,
 } from "../../shared/types.js";
+import { computeAgreement } from "./agreement.js";
 import { readAuditDir } from "./reader.js";
+
+export { computeAgreement };
 import { redactValue } from "./redact.js";
 
 export interface AuditStoreOptions {
@@ -53,35 +56,6 @@ export interface RecordAfterInput {
 const PERSIST_FAILURE_FILE = "persist-failure.json";
 const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024; // 10 MiB
 const DEFAULT_MAX_IN_MEMORY_RECORDS = 5_000;
-
-export function computeAgreement(
-  decision: GuardianDecision | undefined,
-  resolution: AuditResolution | undefined,
-): AgreementOutcome {
-  if (!decision || !resolution) {
-    return "pending";
-  }
-
-  if (resolution.actor === "plugin") {
-    return "agree";
-  }
-
-  if (decision.verdict === "allow") {
-    return resolution.behavior === "allow" ? "agree" : "false_allow";
-  }
-
-  if (decision.verdict === "deny") {
-    return resolution.behavior === "deny" ? "agree" : "false_deny";
-  }
-
-  if (decision.verdict === "ask") {
-    return resolution.behavior === "allow"
-      ? "plugin_ask_human_allow"
-      : "plugin_ask_human_deny";
-  }
-
-  return "unknown";
-}
 
 function emptyMetrics(): AuditMetricsSummary {
   return {

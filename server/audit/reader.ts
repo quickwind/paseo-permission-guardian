@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AuditRecord } from "../../shared/types.js";
+import { computeAgreement } from "./agreement.js";
 
 export interface AuditWindow {
   records: AuditRecord[];
@@ -90,8 +91,29 @@ export async function readAuditDir(
           });
           continue;
         }
+        // Field-wise merge: a later line that lacks a field (e.g. an `after` line written after
+        // the in-memory record was evicted) must not erase it; later defined values win.
+        const prev = records.get(rec.requestId);
+        const merged: Record<string, unknown> = { ...(prev ?? {}) };
+        for (const [k, v] of Object.entries(rec as Record<string, unknown>)) {
+          if (v !== undefined) merged[k] = v;
+        }
+        const out = merged as unknown as AuditRecord;
+        if (prev) {
+          const line = rec as AuditRecord;
+          if ((line.decision === undefined && out.decision) || (line.resolution === undefined && out.resolution)) {
+            out.agreement = computeAgreement(out.decision, out.resolution);
+          }
+          if (prev.outOfOrder || (rec as AuditRecord).outOfOrder) {
+            // An after line synthesised without the evicted decision claims out-of-order; the
+            // disk already had the before line, so it is in order.
+            const inOrderAfter = ev === "after" && Boolean(prev.decision) && !prev.resolution && !prev.outOfOrder;
+            if (inOrderAfter) delete out.outOfOrder;
+            else out.outOfOrder = true;
+          }
+        }
         records.delete(rec.requestId);
-        records.set(rec.requestId, rec as AuditRecord);
+        records.set(rec.requestId, out);
       } else if (ev === "annotation" && typeof parsed.key === "string") {
         if (parsed.annotation === "not_safety") annotations.set(parsed.key, "not_safety");
         else if (parsed.annotation === null) annotations.delete(parsed.key);
