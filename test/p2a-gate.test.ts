@@ -875,3 +875,42 @@ describe("GateController — fix round 1", () => {
     expect(g.effectiveMode()).toBe("act");
   });
 });
+
+describe("GateController — fix round 2 (M4 ordering)", () => {
+  it("shadow while the persist-failure marker removal is pending", async () => {
+    const g = await latchedGate();
+    const key = await makePersistFailure();
+    let release!: () => void;
+    const hold = new Promise<void>((r) => {
+      release = r;
+    });
+    // Mirror AuditStore.clearPersistFailure: null the failure synchronously, then await the rm.
+    const spy = vi.spyOn(store, "clearPersistFailure").mockImplementation(async () => {
+      (store as unknown as { persistFailure: unknown }).persistFailure = null;
+      await hold;
+    });
+    const pa = g.annotate(key, "not_safety");
+    expect(store.getPersistFailure()).toBeNull();
+    expect(g.effectiveMode()).toBe("shadow");
+    expect(g.canAutoDeny()).toBe(false);
+    release();
+    const s = await pa;
+    spy.mockRestore();
+    expect(s.state).toBe("latched");
+    expect(g.effectiveMode()).toBe("act");
+  });
+
+  it("rejecting clearPersistFailure leaves the gate in shadow and propagates", async () => {
+    const g = await latchedGate();
+    const key = await makePersistFailure();
+    const spy = vi.spyOn(store, "clearPersistFailure").mockImplementation(async () => {
+      (store as unknown as { persistFailure: unknown }).persistFailure = null;
+      throw new Error("EPERM");
+    });
+    await expect(g.annotate(key, "not_safety")).rejects.toThrow("EPERM");
+    spy.mockRestore();
+    expect(g.effectiveMode()).toBe("shadow");
+    expect(g.canAutoDeny()).toBe(false);
+    expect(g.status().state).toBe("replaying");
+  });
+});

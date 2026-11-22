@@ -301,9 +301,12 @@ export class GateController {
     this.annotationGen += 1;
     const pf = this.store.getPersistFailure();
     if (annotation === "not_safety" && pf && key === `persist_failure#${pf.firstAt}`) {
-      await this.store.clearPersistFailure();
-      // History may be incomplete: hold shadow until a fresh replay completes.
+      // History may be incomplete: drop the result BEFORE clearing (the store nulls the failure
+      // synchronously, then awaits the marker removal) so shadow holds until a fresh replay
+      // completes. The generation bump above discards any in-flight replay. If clearing rejects,
+      // `completed` stays null (shadow) and the error propagates.
       this.completed = null;
+      await this.store.clearPersistFailure();
     }
     if (annotation === null) {
       // Un-annotating can re-introduce a false-allow: no result counts until the next replay.
