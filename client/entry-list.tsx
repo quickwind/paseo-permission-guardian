@@ -16,11 +16,10 @@ export function GateEntryList(props: {
   onAnnotate: (entry: GateEntry) => void;
 }) {
   const { t } = useTranslation(messages);
-  const translate = t as unknown as (key: string) => string;
   return (
     <>
       {props.entries.map((entry) => {
-        const vm = entryViewModel(entry, translate, props.navigation);
+        const vm = entryViewModel(entry, (key) => t(key as never), props.navigation);
         return (
           <View key={entry.key}>
             <SettingsAction

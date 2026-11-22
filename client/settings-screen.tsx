@@ -508,9 +508,6 @@ export function GuardianSettingsScreen({
                 </Text>
               </SettingsRow>
               {gate.entries.length > 0 ? (
-                <Text style={styles.notice}>{t("act.entries.gateHint")}</Text>
-              ) : null}
-              {gate.entries.length > 0 ? (
                 <>
                   <Text style={styles.notice}>{t("act.entries.gateHint")}</Text>
                   <Text style={styles.notice}>{t("review.settingsHint")}</Text>

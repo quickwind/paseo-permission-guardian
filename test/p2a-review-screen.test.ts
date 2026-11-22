@@ -87,20 +87,20 @@ describe("entryViewModel", () => {
   });
 });
 
+function leafKeys(obj: Record<string, unknown>, prefix = ""): string[] {
+  return Object.entries(obj)
+    .flatMap(([k, v]) =>
+      typeof v === "string" ? [prefix + k] : leafKeys(v as Record<string, unknown>, `${prefix}${k}.`),
+    )
+    .sort();
+}
+
 describe("new i18n keys", () => {
-  it("exist in both locales", () => {
-    for (const l of ["en", "zh"] as const) {
-      const t = translator(l);
-      for (const k of [
-        "review.title",
-        "review.sidebarTitle",
-        "review.settingsHint",
-        "review.empty",
-        "act.entries.recovered",
-        "act.entries.missing",
-      ]) {
-        expect(t(k).length).toBeGreaterThan(0);
-      }
+  it("en and zh have identical key sets including review.*", () => {
+    const en = leafKeys(messages.resources.en as Record<string, unknown>);
+    expect(leafKeys(messages.resources.zh as Record<string, unknown>)).toEqual(en);
+    for (const k of ["review.title", "review.sidebarTitle", "review.settingsHint", "review.empty", "review.summary", "review.entries"]) {
+      expect(en).toContain(k);
     }
     expect(translator("zh")("review.settingsHint")).toBe("要打开对应对话，请在侧边栏“权限守卫”中查看。");
     expect(translator("en")("review.settingsHint")).toBe(
