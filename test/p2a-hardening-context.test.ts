@@ -59,6 +59,18 @@ describe("P2a context and settings fail-safes", () => {
     );
     await service.flush();
     expect(store.getRecord("r1")?.decision?.reasons).toContain("opaque:context_unavailable");
+    // M5: the snapshot records that context was unavailable.
+    expect(store.getRecord("r1")?.contextSnapshot?.contextUnavailable).toBe(true);
+  });
+
+  it("M5: snapshot has contextUnavailable false when the timeline synced", async () => {
+    const { service, store } = await makeService();
+    await service.handlePermissionBefore(
+      { agent, request: { id: "r2", provider: "claude", name: "Bash", kind: "tool", input: { command: "ls" } } },
+      async () => [],
+    );
+    await service.flush();
+    expect(store.getRecord("r2")?.contextSnapshot?.contextUnavailable).toBe(false);
   });
 
   it("completed unknown-type tool calls set untrusted taint", async () => {

@@ -51,9 +51,10 @@ export interface PermissionBeforeContext {
 const SNAPSHOT_MAX_MODIFIED_FILES = 200;
 
 /** Spec §3.7: session state as seen by the decision (taken before this request's own updates). */
-export function buildContextSnapshot(session: SessionState): ContextSnapshot {
+export function buildContextSnapshot(session: SessionState, contextUnavailable = false): ContextSnapshot {
   const files = [...session.modifiedFiles];
   return {
+    contextUnavailable,
     secretTaint: session.secretTaint,
     untrustedTaint: session.untrustedTaint,
     modifiedEntrypoints: [...session.modifiedEntrypoints],
@@ -228,7 +229,7 @@ export class PermissionGuardianService {
       }
 
       // Spec §3.7: snapshot before decideAction and before this request's own taint updates.
-      const contextSnapshot = buildContextSnapshot(session);
+      const contextSnapshot = buildContextSnapshot(session, contextUnavailable);
 
       const evaluated = await decideAction(
         normalized.action,

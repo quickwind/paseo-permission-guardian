@@ -422,6 +422,7 @@ describe("context snapshot (§3.7)", () => {
     };
     await before(edit);
     expect(store.getRecord("r-edit")?.contextSnapshot).toEqual({
+      contextUnavailable: false,
       secretTaint: false,
       untrustedTaint: false,
       modifiedEntrypoints: [],

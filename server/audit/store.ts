@@ -87,6 +87,7 @@ function redactSnapshot(snap: ContextSnapshot): ContextSnapshot {
     modifiedEntrypoints: redactValue([...snap.modifiedEntrypoints]),
     modifiedFiles: redactValue([...snap.modifiedFiles]),
     modifiedFilesTruncated: snap.modifiedFilesTruncated === true,
+    ...(snap.contextUnavailable !== undefined ? { contextUnavailable: snap.contextUnavailable === true } : {}),
   };
 }
 

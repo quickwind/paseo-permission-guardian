@@ -161,6 +161,15 @@ describe("replayWindow — samples", () => {
     expect(r.samples).toBe(1);
   });
 
+  it("M5: a snapshot taken with context unavailable is treated as no snapshot", async () => {
+    const a = rec("1", { recorded: "ask" });
+    a.contextSnapshot = { ...a.contextSnapshot!, contextUnavailable: true };
+    const b = rec("2", { recorded: "allow" });
+    b.contextSnapshot = { ...b.contextSnapshot!, contextUnavailable: true };
+    const r = await replayWindow(win([a, b]), fake({}), NO_SIGS);
+    expect(r.samples).toBe(1);
+  });
+
   it("plugin-actor records are ignored entirely", async () => {
     const r = await replayWindow(
       win([

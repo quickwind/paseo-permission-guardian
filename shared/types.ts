@@ -192,6 +192,12 @@ export interface ContextSnapshot {
   modifiedEntrypoints: string[];
   modifiedFiles: string[];
   modifiedFilesTruncated: boolean;
+  /**
+   * True when the timeline could not be synced for this decision (context unavailable). Always
+   * written by the live path; absent on records written before it existed. Replay treats such a
+   * snapshot as no snapshot.
+   */
+  contextUnavailable?: boolean;
 }
 
 export interface GateEntry {

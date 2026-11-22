@@ -173,7 +173,8 @@ export async function replayWindow(
     if (replayed.level === "L3") falseDenyCount += 1;
     if (replayed.verdict === "allow") {
       const snapshot = record.contextSnapshot;
-      const hasUsableSnapshot = snapshot !== undefined && !snapshot.modifiedFilesTruncated;
+      const hasUsableSnapshot =
+        snapshot !== undefined && !snapshot.modifiedFilesTruncated && snapshot.contextUnavailable !== true;
       if (hasUsableSnapshot || record.decision.verdict === "allow") samples += 1;
     }
   }
