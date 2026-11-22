@@ -34,7 +34,11 @@ engine. Git state changes over time, so replay cannot ask git again and still be
    `GIT_LITERAL_PATHSPECS=1`, `-c core.fsmonitor=false -c core.untrackedCache=false`, a shared
    1500 ms budget per request, and the hook's `AbortSignal`. Git judges the entry `rm` removes:
    only the parent directory is realpath-resolved and the final component is kept, so a symlink is
-   checked as the link itself (an untracked or retargeted link is not clean even if its target is). It is injectable (`gitStateProvider` on the decide
+   checked as the link itself (an untracked or retargeted link is not clean even if its target is).
+   A raw delete path (as written in the command or provider payload) containing a `..` segment is
+   never clean and git is not asked: the path model collapses `..` lexically while the kernel
+   resolves it after following symlinks, so the checked and the removed file could differ. This
+   holds on POSIX and Windows paths and in replay. It is injectable (`gitStateProvider` on the decide
    options / guardian options) so tests do not shell out. `decideAction` never spawns git by
    itself: without a provider every target is not clean.
 3. The live decision records the per-target result in the audit record as

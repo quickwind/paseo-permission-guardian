@@ -51,16 +51,20 @@ export interface DecideResult {
 }
 
 /** Non-recursive `delete_worktree` targets that need the git-clean check (ADR-0009). */
-function deleteTargetsNeedingGitCheck(effects: EffectTag[]): string[] {
+function deleteTargetsNeedingGitCheck(effects: EffectTag[]): { targets: string[]; forcedDirty: Set<string> } {
   const targets = new Set<string>();
+  const forcedDirty = new Set<string>();
   for (const e of effects) {
     if (e.tag !== "delete_worktree" || e.recursive) continue;
     // Keyed by the lexical path: replay (skipHostRealpath) reproduces it exactly, and the git
     // check must look at the path `rm` removes (a symlink itself, not its target).
     const key = e.lexicalTarget ?? e.target;
-    if (typeof key === "string") targets.add(key);
+    if (typeof key !== "string") continue;
+    targets.add(key);
+    // A raw `..` segment: the kernel may resolve it through a symlink to another file (fail to human).
+    if (e.rawDotDot) forcedDirty.add(key);
   }
-  return [...targets];
+  return { targets: [...targets], forcedDirty };
 }
 
 async function resolveDeleteTargetsClean(
@@ -207,9 +211,13 @@ export async function decideAction(
   let maxLevel: RiskLevel = "L0";
   const reasons: string[] = [];
 
-  const deleteTargets = deleteTargetsNeedingGitCheck(effects);
-  const deleteTargetsClean =
-    deleteTargets.length > 0 ? await resolveDeleteTargetsClean(deleteTargets, options) : undefined;
+  const deleteCheck = deleteTargetsNeedingGitCheck(effects);
+  const gitTargets = deleteCheck.targets.filter((t) => !deleteCheck.forcedDirty.has(t));
+  let deleteTargetsClean: Record<string, boolean> | undefined;
+  if (deleteCheck.targets.length > 0) {
+    deleteTargetsClean = gitTargets.length > 0 ? await resolveDeleteTargetsClean(gitTargets, options) : {};
+    for (const t of deleteCheck.forcedDirty) deleteTargetsClean[t] = false;
+  }
 
   if (effects.length === 0) {
     maxLevel = "L1";
@@ -304,7 +312,7 @@ export async function decideAction(
 
   const redactedReasons = Array.from(new Set(reasons.map((r) => redactString(r))));
   const redactedOpaqueReasons = Array.from(new Set(opaqueReasons.map((r) => redactString(r))));
-  const redactedEffects = effects.map(({ lexicalTarget: _lexical, ...e }) => ({
+  const redactedEffects = effects.map(({ lexicalTarget: _lexical, rawDotDot: _dotDot, ...e }) => ({
     ...e,
     ...(e.target !== undefined ? { target: redactString(e.target) } : {}),
     ...(e.detail !== undefined ? { detail: redactString(e.detail) } : {}),

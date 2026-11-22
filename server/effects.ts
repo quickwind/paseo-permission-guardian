@@ -676,6 +676,14 @@ function isDynamicOrUnexpandedPath(
   return false;
 }
 
+/**
+ * ADR-0009: a `..` segment in the raw delete path is resolved lexically by the path model but by
+ * the kernel after following symlinks, so the git-clean check could look at a different file.
+ */
+function hasDotDotSegment(rawPath: string): boolean {
+  return /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rawPath);
+}
+
 function classifyDeleteTargets(
   rawTargets: Array<string | { value: string; dynamic?: boolean }>,
   recursive: boolean,
@@ -758,6 +766,7 @@ function classifyDeleteTargets(
           layer: cmd.depth,
           target: p.realPath,
           lexicalTarget: p.normalized,
+          ...(hasDotDotSegment(target) ? { rawDotDot: true } : {}),
           recursive,
           reversibility: "irreversible",
         });
@@ -1760,7 +1769,13 @@ export async function analyzeActionEffects(
           pluginSelf: p.isPluginSelf,
         });
       } else if (p.inWorktree || p.isTemp) {
-        effects.push({ tag: "delete_worktree", layer: 0, target: p.realPath, lexicalTarget: p.normalized });
+        effects.push({
+          tag: "delete_worktree",
+          layer: 0,
+          target: p.realPath,
+          lexicalTarget: p.normalized,
+          ...(hasDotDotSegment(rawPath) ? { rawDotDot: true } : {}),
+        });
       } else {
         effects.push({ tag: "delete_outside", layer: 0, target: p.realPath });
       }

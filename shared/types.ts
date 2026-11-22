@@ -67,6 +67,8 @@ export interface EffectTag {
    * reproducible by replay. Stripped from recorded decisions.
    */
   lexicalTarget?: string;
+  /** Engine-internal (ADR-0009): the raw delete path had a `..` segment ⇒ never git-clean. */
+  rawDotDot?: boolean;
 }
 
 export interface ActionHost {

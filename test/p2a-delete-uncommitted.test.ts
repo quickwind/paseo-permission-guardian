@@ -523,3 +523,54 @@ describe("Fix round 1: symlinks, reproducible keys, env isolation", () => {
     expect(res.falseAllows.map((e) => e.requestId)).toEqual(["q1"]);
   }, 20_000);
 });
+
+describe("Fix round 2: raw `..` segments are never git-clean (R3)", () => {
+  const allClean: GitStateProvider = async (req) => Object.fromEntries(req.targets.map((t) => [t, true]));
+
+  it("bash rm sub/../a.txt ⇒ L1 even when a.txt is tracked clean; rm a.txt unaffected", async () => {
+    const seen: string[][] = [];
+    const spy: GitStateProvider = async (req) => {
+      seen.push(req.targets);
+      return allClean(req);
+    };
+    const dotdot = await decideAction(bash("rm sub/../a.txt"), opts({ gitStateProvider: spy }));
+    expect(dotdot.decision.level).toBe("L1");
+    expect(dotdot.decision.reasons).toContain("delete_uncommitted:/repo/a.txt");
+    expect(dotdot.deleteTargetsClean).toEqual({ "/repo/a.txt": false });
+    expect(seen).toEqual([]);
+    const mixed = await decideAction(bash("rm a.txt sub/../a.txt"), opts({ gitStateProvider: allClean }));
+    expect(mixed.decision.level).toBe("L1");
+    const plain = await decideAction(bash("rm a.txt"), opts({ gitStateProvider: allClean }));
+    expect(plain.decision.level).toBe("L0");
+    // Replay: even a recorded `true` cannot clear a raw `..` target.
+    const replayed = await decideAction(bash("rm sub/../a.txt"), opts({ recordedDeleteTargetsClean: { "/repo/a.txt": true } }));
+    expect(replayed.decision.level).toBe("L1");
+    expect(JSON.stringify(dotdot.decision.effects)).not.toContain("rawDotDot");
+  });
+
+  it("provider delete kind and cmd del with `..` ⇒ L1", async () => {
+    const action: Action = { ...bash(""), kind: "delete", toolName: "Delete", exec: undefined, paths: ["/repo/sub/../a.txt"] };
+    expect((await decideAction(action, opts({ gitStateProvider: allClean }))).decision.level).toBe("L1");
+    const winCtx = {
+      os: "windows" as const,
+      cwd: "C:\\repo",
+      worktreeRoot: "C:\\repo",
+      home: "C:\\Users\\alice",
+      pluginDataDir: "C:\\Users\\alice\\.paseo\\permission-guardian",
+      envSnapshot: { PATH: "C:\\Windows\\System32" },
+    };
+    const cmd = (source: string): Action => ({
+      ...bash(source),
+      toolName: "cmd",
+      host: { os: "windows" },
+      cwd: "C:\\repo",
+      worktreeRoot: "C:\\repo",
+      exec: { shell: "cmd", source },
+    });
+    const bad = await decideAction(cmd("del sub\\..\\a.txt"), { pathCtx: winCtx, denyAsAsk: false, gitStateProvider: allClean });
+    expect(bad.decision.level).toBe("L1");
+    expect(bad.decision.reasons.some((r) => r.startsWith("delete_uncommitted:"))).toBe(true);
+    const ok = await decideAction(cmd("del a.txt"), { pathCtx: winCtx, denyAsAsk: false, gitStateProvider: allClean });
+    expect(ok.decision.level).toBe("L0");
+  });
+});
