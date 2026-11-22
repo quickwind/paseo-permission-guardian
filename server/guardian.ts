@@ -12,6 +12,7 @@ import type {
 } from "../shared/types.js";
 import type { ActResponder, PermissionAnswerer } from "./act/responder.js";
 import { AuditStore } from "./audit/store.js";
+import { createGitStateProvider, type GitStateProvider } from "./context/git-state.js";
 import { SessionContextStore, type SessionState, type TimelineFetcher } from "./context/session.js";
 import { decideAction } from "./decide.js";
 import { buildDecideContext, buildDecidePathCtx } from "./decide-context.js";
@@ -41,6 +42,8 @@ export interface GuardianServiceOptions {
    * first real settings read have completed (F7). Default false (configure immediately).
    */
   deferGateConfigure?: boolean;
+  /** Git-clean lookup for non-recursive worktree deletes (ADR-0009). Default: the `git` binary. */
+  gitStateProvider?: GitStateProvider;
 }
 
 export interface PermissionBeforeContext {
@@ -75,6 +78,7 @@ export class PermissionGuardianService {
   private readonly answeredByPlugin = new Map<string, PluginAnsweredEntry>();
   private readonly gate: GateController | undefined;
   private readonly responder: ActResponder | undefined;
+  private readonly gitStateProvider: GitStateProvider;
 
   private settings: GuardianSettings;
   private settingsInvalid = false;
@@ -90,6 +94,7 @@ export class PermissionGuardianService {
     this.settings = options.initialSettings ?? DEFAULT_GUARDIAN_SETTINGS;
     this.gate = options.gate;
     this.responder = options.responder;
+    this.gitStateProvider = options.gitStateProvider ?? createGitStateProvider();
     this.gateActive = options.deferGateConfigure !== true;
     this.configureGate();
   }
@@ -234,8 +239,17 @@ export class PermissionGuardianService {
 
       const evaluated = await decideAction(
         normalized.action,
-        buildDecideContext({ ...ctxInput, session, contextUnavailable }),
+        buildDecideContext({
+          ...ctxInput,
+          session,
+          contextUnavailable,
+          gitStateProvider: this.gitStateProvider,
+          ...(ctx?.signal ? { signal: ctx.signal } : {}),
+        }),
       );
+      if (evaluated.deleteTargetsClean) {
+        contextSnapshot.deleteTargetsClean = { ...evaluated.deleteTargetsClean };
+      }
 
       // Update live session context from this request's effects
       if (evaluated.touchedSecret) {

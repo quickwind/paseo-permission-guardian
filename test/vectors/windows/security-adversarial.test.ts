@@ -11,6 +11,9 @@ import {
 import { evaluateGuardianDryRun } from "../../../shared/rpc.js";
 import type { Action, RiskLevel } from "../../../shared/types.js";
 
+/** ADR-0009: these baselines test cwd tracking, so every delete target is reported tracked+clean. */
+const allCleanGit = async (req: { targets: string[] }) => Object.fromEntries(req.targets.map((t) => [t, true]));
+
 afterAll(async () => {
   await disposeSharedPwshHost();
 });
@@ -913,6 +916,7 @@ describe("ADR-0006 Round-2 security adversarial vectors (pure Node: C1/C2/H1/H2/
       const res = await decideAction(linuxBashAction(safePwd), {
         pathCtx: linuxPathCtx,
         denyAsAsk: false,
+        gitStateProvider: allCleanGit,
       });
       expect(res.decision.level, `expected L0 for safe PWD baseline: ${safePwd}`).toBe("L0");
     }
@@ -935,6 +939,7 @@ describe("ADR-0006 Round-2 security adversarial vectors (pure Node: C1/C2/H1/H2/
       const res = await decideAction(linuxBashAction(quotedBrace), {
         pathCtx: linuxPathCtx,
         denyAsAsk: false,
+        gitStateProvider: allCleanGit,
       });
       expect(res.decision.level, `expected L0 for quoted brace literal: ${quotedBrace}`).toBe("L0");
     }
@@ -1068,6 +1073,7 @@ describe("ADR-0006 Round-2 security adversarial vectors (pure Node: C1/C2/H1/H2/
       const res = await decideAction(linuxBashAction(safeCmd), {
         pathCtx: linuxPathCtx,
         denyAsAsk: false,
+        gitStateProvider: allCleanGit,
       });
       expect(res.decision.level, `expected L0 for safe PWD baseline: ${safeCmd}`).toBe("L0");
     }
@@ -1168,6 +1174,7 @@ describe("ADR-0006 Round-2 security adversarial vectors (pure Node: C1/C2/H1/H2/
       const res = await decideAction(linuxBashAction(safeCmd), {
         pathCtx: linuxPathCtx,
         denyAsAsk: false,
+        gitStateProvider: allCleanGit,
       });
       expect(res.decision.level, `expected L0 for Round-7 safe baseline: ${safeCmd}`).toBe("L0");
     }

@@ -192,6 +192,14 @@ export async function replayWindow(
   return { samples, falseAllows, falseDenyCount, integrity, skippedAllow, unavailableReason };
 }
 
+function recordedDeleteTargetsClean(record: AuditRecord): Record<string, boolean> {
+  const map = record.contextSnapshot?.deleteTargetsClean;
+  const out: Record<string, boolean> = {};
+  if (!map || typeof map !== "object") return out;
+  for (const [k, v] of Object.entries(map)) out[k] = v === true;
+  return out;
+}
+
 function sessionFromRecord(record: AuditRecord): SessionState {
   const snap = record.contextSnapshot;
   return {
@@ -249,6 +257,8 @@ export function createReplayDecide(opts: {
           denyAsAsk: false,
           skipHostRealpath: true,
           pwshHostProvider: provider,
+          // ADR-0009: never call git in replay; a missing record ⇒ not clean (L1).
+          recordedDeleteTargetsClean: recordedDeleteTargetsClean(record),
         }),
       );
       const d = result.decision;

@@ -3,6 +3,7 @@ import type { SessionState } from "./context/session.js";
 import type { DecideOptions } from "./decide.js";
 import { resolvePaseoHomeRoots, resolvePaseoSelfRoots, type WindowsPathContext } from "./paths/index.js";
 import type { PwshHostProvider } from "./shell/pwsh-host.js";
+import type { GitStateProvider } from "./context/git-state.js";
 
 /**
  * Single source of truth for the `decideAction` options used by BOTH the live permission path and
@@ -24,6 +25,11 @@ export interface DecideContextInput {
   skipHostRealpath?: boolean;
   pwshHostProvider?: PwshHostProvider;
   contextUnavailable?: boolean;
+  /** Live only: git-clean lookup for non-recursive worktree deletes (ADR-0009). */
+  gitStateProvider?: GitStateProvider;
+  /** Replay only: the live results recorded in the audit snapshot; replay never calls git. */
+  recordedDeleteTargetsClean?: Record<string, boolean>;
+  signal?: AbortSignal;
 }
 
 export type DecidePathCtxInput = Pick<
@@ -53,5 +59,11 @@ export function buildDecideContext(input: DecideContextInput): DecideOptions {
   if (input.session) options.session = input.session;
   if (input.contextUnavailable !== undefined) options.contextUnavailable = input.contextUnavailable;
   if (input.pwshHostProvider) options.pwshHostProvider = input.pwshHostProvider;
+  if (input.recordedDeleteTargetsClean) {
+    options.recordedDeleteTargetsClean = input.recordedDeleteTargetsClean;
+  } else if (input.gitStateProvider) {
+    options.gitStateProvider = input.gitStateProvider;
+  }
+  if (input.signal) options.signal = input.signal;
   return options;
 }

@@ -6,6 +6,7 @@ import type {
   RiskLevel,
 } from "../shared/types.js";
 import type { SessionState } from "./context/session.js";
+import type { GitStateProvider } from "./context/git-state.js";
 import { redactString } from "./audit/redact.js";
 import {
   analyzeActionEffects,
@@ -24,12 +25,72 @@ const NEVER_AUTO_ANSWER_KINDS = new Set<Action["kind"]>(["question", "plan", "mo
 
 export interface DecideOptions extends EffectAnalysisOptions {
   denyAsAsk?: boolean;
+  /**
+   * Live only (ADR-0009): looks up whether non-recursive worktree delete targets are tracked and
+   * clean in git. Absent ⇒ every such target is treated as not clean (L1).
+   */
+  gitStateProvider?: GitStateProvider;
+  /**
+   * Replay only (ADR-0009): per-target results recorded by the live decision, keyed by the
+   * redacted effect target. When set, the provider is never called; a missing key ⇒ not clean.
+   */
+  recordedDeleteTargetsClean?: Record<string, boolean>;
+  /** Propagated to the git lookup. */
+  signal?: AbortSignal;
 }
 
 export interface DecideResult {
   decision: GuardianDecision;
   touchedSecret: boolean;
   touchedUntrusted: boolean;
+  /**
+   * Per non-recursive worktree delete target (raw effect target ⇒ tracked and clean). Absent when
+   * the action has no such target. The live path records it in the audit context snapshot.
+   */
+  deleteTargetsClean?: Record<string, boolean>;
+}
+
+/** Non-recursive `delete_worktree` targets that need the git-clean check (ADR-0009). */
+function deleteTargetsNeedingGitCheck(effects: EffectTag[]): string[] {
+  const targets = new Set<string>();
+  for (const e of effects) {
+    if (e.tag === "delete_worktree" && !e.recursive && typeof e.target === "string") {
+      targets.add(e.target);
+    }
+  }
+  return [...targets];
+}
+
+async function resolveDeleteTargetsClean(
+  targets: string[],
+  options: DecideOptions,
+): Promise<Record<string, boolean>> {
+  const out: Record<string, boolean> = {};
+  if (options.recordedDeleteTargetsClean) {
+    const recorded = options.recordedDeleteTargetsClean;
+    for (const t of targets) {
+      const key = redactString(t);
+      out[t] = Object.prototype.hasOwnProperty.call(recorded, key) && recorded[key] === true;
+    }
+    return out;
+  }
+  let looked: Record<string, boolean> = {};
+  if (options.gitStateProvider) {
+    try {
+      const worktreeRoot = options.pathCtx.worktreeRoot ?? options.pathCtx.cwd;
+      looked = await options.gitStateProvider({
+        worktreeRoot,
+        targets,
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+    } catch {
+      looked = {};
+    }
+  }
+  for (const t of targets) {
+    out[t] = looked !== null && typeof looked === "object" && looked[t] === true;
+  }
+  return out;
 }
 
 function elevateLevel(current: RiskLevel, candidate: RiskLevel): RiskLevel {
@@ -62,6 +123,7 @@ function baseLevelForEffect(effect: EffectTag): { level: RiskLevel; reason?: str
         : { level: "L1", reason: `untrusted_net_read:${effect.target ?? ""}` };
 
     case "delete_worktree":
+      // Non-recursive: L0 here; the git-clean check in decideAction raises it (ADR-0009).
       return effect.recursive
         ? { level: "L1", reason: `recursive_delete_worktree:${effect.target ?? ""}` }
         : { level: "L0" };
@@ -143,6 +205,10 @@ export async function decideAction(
   let maxLevel: RiskLevel = "L0";
   const reasons: string[] = [];
 
+  const deleteTargets = deleteTargetsNeedingGitCheck(effects);
+  const deleteTargetsClean =
+    deleteTargets.length > 0 ? await resolveDeleteTargetsClean(deleteTargets, options) : undefined;
+
   if (effects.length === 0) {
     maxLevel = "L1";
     reasons.push("no_effects_extracted");
@@ -168,6 +234,15 @@ export async function decideAction(
     maxLevel = elevateLevel(maxLevel, effectLevel);
     if (base.reason) {
       reasons.push(base.reason);
+    }
+  }
+
+  // ADR-0009: a non-recursive worktree delete is L0 only for tracked files without uncommitted changes.
+  if (deleteTargetsClean) {
+    for (const [target, clean] of Object.entries(deleteTargetsClean)) {
+      if (clean) continue;
+      maxLevel = elevateLevel(maxLevel, "L1");
+      reasons.push(`delete_uncommitted:${target}`);
     }
   }
 
@@ -243,5 +318,6 @@ export async function decideAction(
     },
     touchedSecret: analysis.touchedSecret,
     touchedUntrusted: analysis.touchedUntrusted,
+    ...(deleteTargetsClean ? { deleteTargetsClean } : {}),
   };
 }

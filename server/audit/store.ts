@@ -16,7 +16,7 @@ import { computeAgreement } from "./agreement.js";
 import { readAuditDir } from "./reader.js";
 
 export { computeAgreement };
-import { redactValue } from "./redact.js";
+import { redactString, redactValue } from "./redact.js";
 
 export interface AuditStoreOptions {
   dataDir: string;
@@ -88,7 +88,19 @@ function redactSnapshot(snap: ContextSnapshot): ContextSnapshot {
     modifiedFiles: redactValue([...snap.modifiedFiles]),
     modifiedFilesTruncated: snap.modifiedFilesTruncated === true,
     ...(snap.contextUnavailable !== undefined ? { contextUnavailable: snap.contextUnavailable === true } : {}),
+    ...(snap.deleteTargetsClean ? { deleteTargetsClean: redactDeleteTargets(snap.deleteTargetsClean) } : {}),
   };
+}
+
+/** Keys are redacted like other paths; values stay booleans. A key collision keeps `false`. */
+function redactDeleteTargets(map: Record<string, boolean>): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  for (const [key, value] of Object.entries(map)) {
+    const redacted = redactString(key);
+    const clean = value === true;
+    out[redacted] = Object.prototype.hasOwnProperty.call(out, redacted) ? out[redacted] === true && clean : clean;
+  }
+  return out;
 }
 
 export class AuditStore {

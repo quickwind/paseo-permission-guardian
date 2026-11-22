@@ -198,6 +198,12 @@ export interface ContextSnapshot {
    * snapshot as no snapshot.
    */
   contextUnavailable?: boolean;
+  /**
+   * ADR-0009: per non-recursive worktree delete target (redacted effect target) ⇒ tracked in git
+   * with no uncommitted changes at decision time. Replay uses it instead of calling git; a missing
+   * key ⇒ not clean.
+   */
+  deleteTargetsClean?: Record<string, boolean>;
 }
 
 export interface GateEntry {

@@ -23,8 +23,8 @@ const base = {
 };
 
 describe("computeFingerprint", () => {
-  it("exposes ENGINE_DATA_VERSION = 1", () => {
-    expect(ENGINE_DATA_VERSION).toBe(1);
+  it("exposes ENGINE_DATA_VERSION = 2 (ADR-0009)", () => {
+    expect(ENGINE_DATA_VERSION).toBe(2);
   });
 
   it("is a 64-char lowercase sha256 hex digest", () => {

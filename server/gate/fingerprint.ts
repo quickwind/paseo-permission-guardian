@@ -7,7 +7,8 @@ import { resolvePaseoHomeRoots, resolvePaseoSelfRoots } from "../paths/index.js"
  * well as on any change to the shape of stored gate data, so a latch never outlives the engine
  * that earned it.
  */
-export const ENGINE_DATA_VERSION = 1;
+/** 2: non-recursive worktree deletes require a tracked, clean git file (ADR-0009). */
+export const ENGINE_DATA_VERSION = 2;
 
 export interface FingerprintInput {
   pluginVersion: string;
