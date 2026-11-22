@@ -12,7 +12,7 @@ export function registerGateRpcs(
 ): void {
   server.handle(gateReplay, async () => {
     await deps.storeReady;
-    return deps.gate.replay();
+    return deps.gate.replay({ manual: true });
   });
   server.handle(gateAnnotate, async (input) => {
     await deps.storeReady;

@@ -476,7 +476,7 @@ describe("GateController — settings, responder, auto-deny", () => {
     expect(g.status().reason).toBe("settings_invalid:parse_error");
   });
 
-  it("3 consecutive unconfirmed ⇒ shadow (responder_unconfirmed) until next replay", async () => {
+  it("3 consecutive unconfirmed ⇒ shadow (responder_unconfirmed) until a manual replay (R12)", async () => {
     const g = await latchedGate();
     g.noteActOutcome("unconfirmed");
     g.noteActOutcome("unconfirmed");
@@ -491,7 +491,44 @@ describe("GateController — settings, responder, auto-deny", () => {
     g.noteActOutcome("answered");
     expect(g.effectiveMode()).toBe("shadow");
     await g.replay();
+    expect(g.effectiveMode()).toBe("shadow");
+    await g.replay({ manual: true });
     expect(g.effectiveMode()).toBe("act");
+    expect(g.status().unconfirmedCount).toBe(0);
+  });
+
+  it("F4: a reconciliation-triggered replay does not unpause", async () => {
+    await seedSamples(200);
+    const g = makeGate({ debounceMs: 1 });
+    configure(g);
+    await g.replay();
+    for (let i = 0; i < 3; i += 1) g.noteActOutcome("unconfirmed");
+    expect(g.status().reason).toBe("responder_unconfirmed");
+    await seed("late", "allow", "allow"); // schedules a debounced replay
+    await new Promise((r) => setTimeout(r, 30));
+    await g.replay(); // let the scheduled replay settle
+    expect(g.effectiveMode()).toBe("shadow");
+    expect(g.status().reason).toBe("responder_unconfirmed");
+  });
+
+  it("F4: a manual replay that is unavailable does not unpause", async () => {
+    const g = await latchedGate();
+    for (let i = 0; i < 3; i += 1) g.noteActOutcome("unconfirmed");
+    await writeFile(join(dir, "audit-2099-01-01.jsonl"), "{not json\n");
+    clock = Date.parse("2099-01-01T12:00:00.000Z") - 1000;
+    await g.replay({ manual: true });
+    expect(g.status().state).toBe("unavailable");
+    expect(g.effectiveMode()).toBe("shadow");
+    expect(g.status().unconfirmedCount).toBe(3);
+  });
+
+  it("F4: lost_race with matching behavior counts toward the unconfirmed streak", async () => {
+    const g = await latchedGate();
+    g.noteActOutcome("lost_race");
+    g.noteActOutcome("unconfirmed");
+    g.noteActOutcome("lost_race");
+    expect(g.effectiveMode()).toBe("shadow");
+    expect(g.status().reason).toBe("responder_unconfirmed");
   });
 
   it("canAutoDeny false when any false-deny; true when act and none", async () => {

@@ -490,6 +490,17 @@ describe("ActResponder.attribute (§3.6)", () => {
     expect(store.getRecord("r-sel")?.actOutcome).toBe("lost_race");
   });
 
+  it("F4: lost_race with the sent behavior counts toward the unconfirmed streak; other behavior does not", async () => {
+    await setup();
+    await before(L0("r-sb"));
+    expect(responder.attribute("r-sb", { behavior: "allow" })).toBe("human");
+    expect(store.getRecord("r-sb")?.actOutcome).toBe("lost_race");
+    expect(gate.status().unconfirmedCount).toBe(1);
+    await before(L0("r-ob"));
+    expect(responder.attribute("r-ob", { behavior: "deny", selectedActionId: "deny" })).toBe("human");
+    expect(gate.status().unconfirmedCount).toBe(1);
+  });
+
   it("attribution is one-shot (second identical after ⇒ human)", async () => {
     await setup();
     await before(L0("r-once"));

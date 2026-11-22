@@ -465,3 +465,8 @@ Added 2026-11-22; earlier sections are unchanged.
   file: a crash-truncated line may be a human denial, so every unparsable line in the window is a
   corrupt line and the gate is `unavailable` until it is acknowledged. The store still writes a
   newline before appending to a file that does not end in one.
+- **R12 (responder pause).** The responder pause (3 consecutive unconfirmed) clears only on daemon
+  start (a new gate controller) or a manual replay requested through `guardian.gate.replay` that
+  completes available. Automatic replays (reconciliation, configuration, annotation) and replays
+  that throw or are unavailable never unpause. A `lost_race` whose human behavior equals the
+  behavior the plugin sent (e.g. no `selectedActionId` echo) counts toward the unconfirmed streak.

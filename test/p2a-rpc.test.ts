@@ -79,6 +79,15 @@ describe("gate RPCs", () => {
     expect(text).toContain('"key":"k1"');
   });
 
+  it("replay handler requests a manual replay (R12)", async () => {
+    const server = fakeServer();
+    const calls: unknown[] = [];
+    const spy = { replay: async (o?: unknown) => { calls.push(o); return {}; }, annotate: async () => ({}) };
+    registerGateRpcs(server as never, { gate: spy as never, storeReady: Promise.resolve() });
+    await server.handlers.get(gateReplay.name)!({});
+    expect(calls).toEqual([{ manual: true }]);
+  });
+
   it("errors propagate to the caller", async () => {
     const server = fakeServer();
     const failing = { replay: async () => { throw new Error("nope"); }, annotate: async () => { throw new Error("nope2"); } };

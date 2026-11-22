@@ -126,6 +126,8 @@ export class GateController {
 
   private consecutiveUnconfirmed = 0;
   private paused = false;
+  /** A manual replay was requested and has not yet been consumed by a run. */
+  private pendingManual = false;
   private observedOverrideKey = "none";
 
   constructor(opts: {
@@ -240,7 +242,9 @@ export class GateController {
       this.consecutiveUnconfirmed = 0;
       return;
     }
-    if (outcome === "unconfirmed") {
+    // `lost_race` is only reported by the responder when the human's behavior matched what the
+    // plugin sent (e.g. a missing selectedActionId echo): the plugin's frame may not have landed.
+    if (outcome === "unconfirmed" || outcome === "lost_race") {
       this.consecutiveUnconfirmed += 1;
       if (this.consecutiveUnconfirmed >= UNCONFIRMED_PAUSE_THRESHOLD && !this.paused) {
         this.paused = true;
@@ -316,8 +320,13 @@ export class GateController {
     return this.replay();
   }
 
-  /** Runs a replay (≤1 concurrent; concurrent callers coalesce onto one queued run). */
-  replay(): Promise<GateStatus> {
+  /**
+   * Runs a replay (≤1 concurrent; concurrent callers coalesce onto one queued run). Only a
+   * `manual` replay (the `guardian.gate.replay` RPC) that completes available clears a responder
+   * pause (ruling R12); automatic replays never do.
+   */
+  replay(opts: { manual?: boolean } = {}): Promise<GateStatus> {
+    if (opts.manual) this.pendingManual = true;
     if (this.queuedReplay) return this.queuedReplay;
     const run = this.replayChain.then(async () => {
       this.queuedReplay = null;
@@ -358,6 +367,8 @@ export class GateController {
     const startSeq = this.seq;
     const startGen = this.annotationGen;
     const at = this.now();
+    const manual = this.pendingManual;
+    this.pendingManual = false;
 
     let completed: CompletedReplay;
     try {
@@ -392,16 +403,33 @@ export class GateController {
     }
 
     // Stale: engine identity or window changed while replaying; a newer replay is queued.
-    if (this.fingerprint !== fingerprint || this.settings?.actGate.windowDays !== windowDays) return;
     // Stale: an annotation changed after this replay read the window; annotate() queues a new one.
-    if (this.annotationGen !== startGen) return;
+    // A stale manual request carries over to that newer run.
+    if (
+      this.fingerprint !== fingerprint ||
+      this.settings?.actGate.windowDays !== windowDays ||
+      this.annotationGen !== startGen
+    ) {
+      if (manual) this.pendingManual = true;
+      return;
+    }
 
     const modeBefore = this.safeCompute().mode;
     this.completed = completed;
     for (const [id, c] of this.candidates) if (c.seq <= startSeq) this.candidates.delete(id);
     for (const [id, seq] of this.falseDenyCandidates) if (seq <= startSeq) this.falseDenyCandidates.delete(id);
-    this.consecutiveUnconfirmed = 0;
-    this.paused = false;
+    if (
+      manual &&
+      completed.unavailableReason === null &&
+      !this.store.getPersistFailure() &&
+      !this.stateWriteFailed
+    ) {
+      // R12: the pause clears only on daemon start (new controller) or a manual replay that
+      // completed available.
+      if (this.paused) this.emit("unpaused", { reason: "manual_replay" });
+      this.consecutiveUnconfirmed = 0;
+      this.paused = false;
+    }
 
     this.applyTransitions(true, modeBefore);
     if (this.file) {

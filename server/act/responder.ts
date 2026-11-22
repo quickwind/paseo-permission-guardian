@@ -156,6 +156,9 @@ export class ActResponder {
         resolution.behavior === mark.behavior && resolution.selectedActionId === mark.selectedActionId;
       if (!matches) {
         this.store.setActOutcome(requestId, "lost_race");
+        // Same behavior but a different/missing selectedActionId: the plugin's frame may have been
+        // the one applied without an echo, so it counts toward the unconfirmed streak (F4).
+        if (resolution.behavior === mark.behavior && !mark.unconfirmed) this.gate.noteActOutcome("lost_race");
         return "human";
       }
       const inWindow = this.now() - mark.sentAt <= this.windowMs;
