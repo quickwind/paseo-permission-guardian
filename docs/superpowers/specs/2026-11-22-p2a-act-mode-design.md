@@ -1,48 +1,55 @@
 # P2a: `act` Mode with Evidence Gate — Design
 
 - **Date**: 2026-11-22
-- **Status**: Draft (builder check done; pending independent review by neon)
+- **Status**: Draft v2 — builder check done; independent review (neon) incorporated; pending user approval
 - **Milestone**: P2a (safety core). P2b (shadow dashboard screen, timeline rows, prompt guidance,
   mode policy) is a separate design.
-- **Related**: [DESIGN.md](../../DESIGN.md) §10.4, §12, §13, §16;
+- **Related**: [DESIGN.md](../../DESIGN.md) §10.4, §12, §13, §14, §16;
   [ADR-0002](../../adr/0002-session-context-taint-and-cache-invalidation.md),
-  [ADR-0003](../../adr/0003-paseo-integration-and-config-source-of-truth.md). A new ADR-0008 records
-  the decisions marked **[ADR]** below.
+  [ADR-0003](../../adr/0003-paseo-integration-and-config-source-of-truth.md),
+  [ADR-0008](../../adr/0008-act-mode-evidence-gate.md) (records the decisions marked **[ADR]**).
 
 ## 1. Intent
 
 Until now the plugin only classifies and records (`shadow`). P2a makes it actually answer routine
 permission prompts for the user (`act`), but only after the user's own history shows that the
 plugin's "would allow" judgement has never disagreed with a human denial. The point is to remove
-prompt fatigue for clearly routine actions without ever becoming the reason a risky action ran.
+prompt fatigue for clearly routine actions without the plugin becoming the reason a risky action ran.
 
 ### Goals
 
 1. `act` mode that auto-answers **L0 → allow-once** and, only when `denyAsAsk` is off,
-   **L3 → deny with a message**. Everything else stays with the human.
+   **L3 → deny-once with a message**. Everything else stays with the human.
 2. An **evidence gate** that keeps the effective mode at `shadow` until enough human-resolved
    evidence exists, with a visible reason.
 3. **Replay**: re-evaluate recorded history with the current engine so the gate reflects the code
-   and policy actually running, not the version that produced the history.
+   and configuration actually running.
 4. **Explicit override** ("I accept the risk") that skips only the sample-count requirement, is
-   audited, and stays visible.
-5. Settings-screen section for gate parameters and live gate status.
+   bound to the current engine, audited, and always visible.
+5. Settings-screen section for gate parameters, live gate status, and false-allow annotation.
+6. **Prerequisite hardening** (§3.9): close existing classification gaps that are harmless in
+   `shadow` but would become wrong auto-allows in `act`.
 
 ### Non-goals (P2a)
 
 - Full shadow dashboard screen, disagreement browser, timeline rows (P2b).
 - `agent.open.before` prompt guidance and `agent.create.before` mode policy (P2b).
 - LLM judge for L1 (P3). L1 is always `ask` in P2a.
-- Layered YAML policy loading (not implemented yet; see §9).
+- Layered YAML policy loading (not implemented yet; see §10).
 - Selecting "always allow"/persistent permission options. Never.
+- **Being a security boundary.** The plugin is a prompt reducer (DESIGN §14). In `act`, an agent can
+  edit ordinary source/test files (L0) and then run a project command (L0) that executes them; this
+  is accepted (decision §2) and documented. Isolation belongs to OS/provider sandboxes.
 
 ### Anti-goals (failure even if it "works")
 
 - Any path where an internal error, unknown provider payload, or ambiguous option leads to an
   automatic **allow** or **deny**.
-- Misattributing a human answer to the plugin, which would hide false-allows from the gate.
-- The agent being able to lower the gate (edit settings/state files) and then benefit from it.
-- Gate state silently surviving an engine/policy change that would have changed decisions.
+- Misattributing a human answer to the plugin, or a human denial to "cancelled", in a way that hides
+  false-allows from the gate.
+- The agent being able to lower the gate (edit settings/state/audit files, change env) through a
+  request the plugin auto-answers, and then benefit from it.
+- Gate state or an override silently surviving an engine/configuration change.
 
 ## 2. Decisions taken with the user
 
@@ -50,184 +57,189 @@ prompt fatigue for clearly routine actions without ever becoming the reason a ri
 | --- | --- |
 | Packaging | Split P2 into P2a (this doc) and P2b |
 | Gate style | Hard gate + explicit override |
-| Sample definition | Human-resolved requests the **current engine** judges `allow` |
-| Minimum samples | 200 (user-configurable, floor 20, max 5000) |
+| Unit of counting | One permission request (one prompt card); its level is the max over its parsed sub-commands |
+| Gate scope | **Global**: one sample pool and one gate for all providers and command kinds. It measures whether the engine's L0 judgement agrees with this user; it is not a per-command allow-list. New, never-seen L0 requests are auto-answered once the gate is open |
+| Sample definition | Human-resolved requests the current engine judges `allow` (any mix of read/write/exec; **no coverage requirement**) |
+| Minimum samples | 200 (configurable, floor 20, max 5000) |
 | Window | 30 days (configurable 1–365) |
-| False-allow | Must be 0 in window; on any false-allow, fall back to `shadow` — **also when overridden** (configurable, default on) |
+| False-allow | Must be 0 in window; on any false-allow fall back to `shadow` — also when overridden (configurable, default on) |
+| Human denials of L0 | Count as false-allow; the user can **annotate** an individual one as "not a safety issue" (audited) to exclude it |
+| Denials without a clicked option | **Count as false-allow (annotatable) until Paseo's cancellation payload is confirmed**; afterwards only payloads matching the confirmed cancellation signature are excluded automatically |
 | Override | Allowed (configurable, default on); skips only the sample-count requirement |
+| Edit code then run project command | Stays L0; documented as outside the plugin's guarantees; gate files integrity-checked; **entrypoint list extended to more ecosystems** (§3.9) |
 | Configuration | All gate parameters editable in the plugin settings screen |
-| Unit of counting | One permission request (one prompt card), not individual sub-commands; the request's level is the max over its parsed sub-commands |
-| Gate scope | **Global**: one sample pool and one gate for all providers and all command kinds. The gate measures whether the engine's L0 judgement agrees with this user; it is not a per-command allow-list. New, never-seen L0 requests are auto-answered once the gate is open |
-| Human denials of L0 | Count as false-allow by default; the user can **annotate** an individual denial as "not a safety issue" in the settings screen (audited); annotated denials are excluded |
-| Not answered / redirected | A prompt the user never answered (e.g. they sent a new prompt instead) is never a false-allow (§3.3) |
 
 ## 3. Behaviour
 
-### 3.1 Effective mode
+### 3.1 Engine fingerprint **[ADR]**
 
-```
-settings.mode = off     -> effective off
-settings.mode = shadow  -> effective shadow
-settings.mode = act     -> effective act    iff gate.state == "passed"
-                                            or (override.accepted && gate.falseAllowCount == 0)
-                           effective shadow otherwise, with gate.reason
-```
+`fingerprint = sha256(pluginVersion, ENGINE_DATA_VERSION, policyHash ?? "builtin", denyAsAsk,
+windowsDefaultShell)`. `ENGINE_DATA_VERSION` is a constant bumped whenever rules, registry data, or
+classification code can change a decision. Anything that can change a live decision must be in the
+fingerprint.
 
-`falseAllowCount` here is computed over the window by replay (§3.3). The override never applies
-while the gate is `replaying` or `unavailable` (false-allow count unknown ⇒ `shadow`). With
-`autoFallbackOnFalseAllow = false` an override keeps `act` even with false-allows; this is the only
-way to run `act` with a known false-allow and is shown as a persistent warning.
-
-`getStatus()` returns `effectiveMode: "off" | "shadow" | "act"` plus a `gate` object (state, reason,
-samples x/N, false-allow count, last replay time, engine fingerprint, override info).
-
-### 3.2 Gate states
+### 3.2 Gate states and effective mode **[ADR]**
 
 | State | Meaning |
 | --- | --- |
-| `collecting` | `samples < minSamples`, no false-allow |
-| `passed` | `samples >= minSamples` and `falseAllow == 0` |
-| `failed_false_allow` | at least one false-allow in window (lists up to 5 request ids) |
-| `replaying` | a replay for the current engine fingerprint has not finished; effective mode is `shadow` until it finishes |
-| `unavailable` | audit history unreadable or replay error; effective mode `shadow` (fail to human) |
+| `replaying` | No completed replay for the current fingerprint yet |
+| `unavailable` | Replay failed, history unreadable, truncated, or a human-denied record could not be re-evaluated (§3.4) |
+| `failed_false_allow` | ≥1 unannotated false-allow in window |
+| `collecting` | No false-allow, `samples < minSamples`, not latched |
+| `passed` | No false-allow, `samples >= minSamples` (entry condition met) |
+| `latched` | Entered `act` under the current fingerprint; stays while false-allow = 0 |
 
-**[ADR] Latch.** Once in `act`, the plugin answers L0 itself, so new human-resolved allow samples
-stop arriving and the 30-day window would eventually drain below 200. Therefore:
+```
+if settings invalid or mode == off            -> effective off/shadow (invalid ⇒ shadow)
+if mode == shadow                              -> shadow
+if mode == act:
+  state in {replaying, unavailable}            -> shadow                (override never applies)
+  state == failed_false_allow:
+       autoFallbackOnFalseAllow                -> shadow                (override does not help)
+       !autoFallback && overrideValid          -> act  + persistent warning
+       otherwise                               -> shadow
+  state in {passed, latched}                   -> act   (passed ⇒ write latch)
+  state == collecting && overrideValid         -> act   (override; no latch written)
+  otherwise                                    -> shadow
+overrideValid = allowOverride && actOverride.accepted && actOverride.fingerprint == fingerprint
+```
 
-- **Entering** `act` requires the full condition (samples ≥ N, false-allow = 0).
-- **Staying** in `act` requires only false-allow = 0 over the window, re-checked on every
-  reconciliation and every replay. The latch is stored in `gate-state.json` (§5.4) together with the
-  engine fingerprint it was earned under.
-- An **engine fingerprint change** (plugin version, engine data version, policy hash) clears the
-  latch: a replay over the window must pass the full entry condition again. If, after an upgrade, the
-  window has fewer than N human samples because the plugin had been answering, the user sees
-  `collecting` and can use the override; this is intentional — a new engine has not earned trust on
-  this user's data.
+- **Latch.** In `act` the plugin answers L0 itself, so new human allow samples stop arriving and the
+  window would drain below N. Entering needs the full condition; staying needs only
+  false-allow = 0 (re-checked on every reconciliation and replay). The latch (`gate-state.json`) is
+  bound to the fingerprint.
+- **Fingerprint change** clears the latch **and invalidates the override**. A replay must pass the
+  entry condition again, or the user must re-accept the override for the new fingerprint.
+- **Auto-deny gate.** L3 auto-deny additionally requires false-deny = 0 in window (a human allowed a
+  request the current engine would deny); otherwise L3 is left to the human even in `act`.
 
-### 3.3 Samples and false-allows (replay)
+`guardian.status` returns `effectiveMode: "off" | "shadow" | "act"` and a `gate` object (state,
+reason, samples x/N, false-allow and false-deny counts, unannotated false-allow entries (≤5),
+unclassified-deny count, last replay time, fingerprint short hash, override info).
 
-Input set: audit records whose `requestedAt` is within the window, that have both a decision and a
-resolution, and whose resolution actor is `human` (not `plugin`, not `unknown`).
+### 3.3 Human vs. cancelled resolutions **[ADR]**
 
-**Human vs. cancelled resolutions** *(builder-review call)*. Paseo cancels pending permissions in
-bulk when a turn is interrupted, the user sends a new prompt, the agent is closed, or the ACP
-transport exits (`acp-internal/connection.js` resolves them as `cancelled`). Such a resolution is not
-a judgement about safety. Rule:
+Paseo cancels pending permissions in bulk when a turn is interrupted, the user sends a new prompt,
+the agent closes, or the ACP transport exits (`acp-internal/connection.js` resolves them as
+`cancelled`). The exact shape that reaches `agent.permission.after` is **not yet confirmed**.
 
-- `allow` resolutions: human if not plugin-attributed (§3.6).
-- `deny` resolutions count as a **human denial** only if `selectedActionId` is present and equals a
-  deny action offered by that request (as recorded in the raw request). Otherwise the record is
-  `actor = "unknown"`, category `unclassified_deny`: never a sample, never a false-allow, never
-  triggers fallback, but listed (count + up to 5 ids) in the status card so it is not hidden.
+- `recordBefore` stores `offeredActions: [{ id, behavior }]` from the request **independently of
+  `includeRawInAudit`** (ids/behaviors only, no labels needed).
+- `allow` resolution not attributed to the plugin (§3.6) → human allow.
+- `deny` resolution not attributed to the plugin → **human denial**, unless it matches a
+  **confirmed cancellation signature**. The signature list starts **empty**; it is filled only from
+  captured real payloads (fixture + test). Until then every such denial counts (and is annotatable).
 - A request with no `after` event stays pending and is ignored.
-- The exact Paseo payload for "user sent a new prompt while a permission was pending" must be
-  confirmed during implementation and captured as a fixture.
 
-**Annotations.** `guardian.gate.annotate({ requestId, annotation: "not_safety" | null })` stores an
-annotation as an audit `event: "annotation"` line (latest wins). Annotated human denials are removed
-from the false-allow count (they are not samples either). Annotations are made only from the
-settings UI; the RPC is not exposed as an agent tool.
+### 3.4 Replay, samples and false-allows **[ADR]**
 
-For each record the replay computes `replayVerdict` with the current engine:
+Input: records with `requestedAt` in the window, a decision, a resolution, actor `human`.
 
-- **Sample** ⇔ `replayVerdict == "allow"` and `resolution.behavior == "allow"` .
-- **False-allow** ⇔ `replayVerdict == "allow"` and `resolution.behavior == "deny"`.
-- Records whose action cannot be re-evaluated (missing `action`, unknown kind, decide error) are
-  skipped and counted in `replaySkipped`; they never count as samples.
+For each record compute `replayVerdict` with the current engine, using the stored
+`contextSnapshot` (§3.7) when present:
 
-**[ADR] Context fidelity.** Decisions depend on session context (secret/untrusted taint, modified
-entrypoints). From P2a on, `recordBefore` stores a `contextSnapshot`
-`{ secretTaint, untrustedTaint, modifiedEntrypoints[] }` (paths redacted like other paths) and replay
-feeds it to `decideAction`. For older records without a snapshot, replay uses
-`max(recordedLevel, replayLevel)` so that missing context can only make a record *less* likely to be
-a sample, never more.
+- **False-allow** ⇔ `replayVerdict == "allow"` ∧ human denial ∧ not annotated `not_safety`.
+  Judged on the **replay verdict alone** (a regression that newly allows a previously denied request
+  must surface).
+- **Sample** ⇔ human allow ∧ `replayVerdict == "allow"` ∧ (record has a context snapshot, or the
+  recorded verdict was also `allow`). Legacy records without a snapshot can only *lose* sample
+  status from missing context, never gain it.
+- **False-deny** ⇔ `replayVerdict == "deny"` ∧ human allow.
+- **Skipped**: action missing/unknown kind/decide error. A skipped **human-denied** record makes the
+  gate `unavailable` (it might be a false-allow); skipped allows are just not samples.
+- **Truncation**: replay is bounded (default 20 000 records in window). If the bound is hit the gate is
+  `unavailable` — no partial result is used.
+- **Isolation**: replay uses its own PowerShell host instances (separate queue and circuit breaker)
+  so it can neither starve nor be starved by live requests. A pwsh timeout during replay yields the
+  normal `opaque` result for that record; if that record is a human denial the gate is `unavailable`
+  until it can be evaluated.
+- **Filesystem drift**: replay should not depend on the current state of paths that may no longer
+  exist (deleted worktrees). The builder decides how (e.g. `skipHostRealpath` with stored resolved
+  paths); the result must be deterministic for a given record and fingerprint.
+- **When**: on daemon start, on fingerprint change, on gate-parameter change, on annotation change,
+  and on demand (`guardian.gate.replay`). New reconciliations update counters incrementally.
+- **Not a decision cache**: replay results feed only gate metrics, never a live answer.
 
-**Redaction.** Replay runs on redacted actions. Redaction replaces secret values with placeholders;
-the classifier works on structure (commands, paths, hosts), so this is acceptable, but any record
-whose replay verdict differs from its recorded verdict *only* because of redaction cannot be
-detected. This is accepted and documented; it errs toward fewer samples in the known cases
-(placeholders are unknown tokens → opaque → not allow).
+### 3.5 Answering a request in `act`
 
-**When replay runs.** On daemon start, on engine-fingerprint change, and on settings change to the
-gate parameters. Reconciliation of a new record updates the counters incrementally (the live
-decision was produced by the current engine, so no re-evaluation is needed). Replay runs in the
-background, yields between records, uses the same PowerShell host pool with its normal timeouts,
-and is bounded (default 20 000 records; beyond that the oldest are ignored and `replayTruncated` is
-reported).
+In `handlePermissionBefore`, after normalization, context snapshot, `decideAction`, `recordBefore`:
 
-**Not a decision cache.** Replay results are used only for gate metrics and are never consulted
-when answering a live request. Live requests are always evaluated fresh (DESIGN §10.4 invariant).
+1. Effective mode must be `act`; otherwise stop.
+2. If the audit record for this `requestId` already has a resolution (the `after` event arrived
+   first), stop and evaluate it for false-allow immediately.
+3. Stop if `decision.neverAutoAnswer` or kind ∈ {question, plan, mode}.
+4. Map verdict: `allow` (L0) → allow-once action (§3.8); `deny` (L3, `denyAsAsk = false`, auto-deny
+   gate open) → deny-once action + message (reasons, redacted, ≤500 chars, no `interrupt`); `ask` →
+   stop. If no action resolves, stop.
+5. Re-check effective mode and `context.signal` immediately before sending.
+6. `markAnsweredByPlugin(requestId, { behavior, selectedActionId, sentAt })`.
+7. `context.paseo.agents.ref(agentId).respondToPermission({ requestId, response })`.
+   **This call is fire-and-forget** (the daemon client only sends a frame; it does not report "already
+   resolved"). Success or loss is determined only by the `after` event (§3.6). A thrown error (e.g.
+   disconnected client) unmarks the request and records `actOutcome: "error"`.
 
-### 3.4 Answering a request in `act`
+Latency stays well inside Paseo's 30 s hook timeout. Audit writes before step 7 must not block on
+slow disk beyond the existing write queue; the step 2 check uses the in-memory record.
 
-In `handlePermissionBefore`, after `decideAction` and `recordBefore`:
+### 3.6 Attribution
 
-1. If effective mode is not `act`, stop (shadow behaviour).
-2. If `decision.neverAutoAnswer`, or kind ∈ {question, plan, mode}, stop.
-3. Map the verdict:
-   - `allow` (L0 only) → resolve an **allow-once action** (§3.5). If none can be resolved, stop.
-   - `deny` (L3 with `denyAsAsk = false`) → resolve a **deny-once action**; response
-     `{ behavior: "deny", selectedActionId?, message }` where `message` is a short, redacted
-     explanation the agent can act on (reasons joined, max 500 chars). `interrupt` is not set.
-   - `ask` → stop.
-4. Check `context.signal`; if aborted, stop.
-5. `markAnsweredByPlugin(requestId, { verdict, selectedActionId, behavior })` **before** calling
-   Paseo, so an `after` event that arrives first is attributed correctly.
-6. Call `context.paseo.agents.ref(agentId).respondToPermission({ requestId, response })`.
-7. On error (already resolved by a human, agent gone, network): `unmarkAnsweredByPlugin`, log at
-   debug level, record `actOutcome: "lost_race" | "error"` in the audit record. Never retry.
+- `actor = "plugin"` only if the request is marked **and** the resolution matches what the plugin
+  sent (`behavior` equal and `selectedActionId` equal).
+- Marked but different resolution → `actor = "human"`, `actOutcome = "lost_race"`; a human denial
+  here is a false-allow candidate and triggers fallback immediately.
+- Marked but no `after` within the TTL (10 min) → `actOutcome = "unconfirmed"`, shown in status.
+- Residual: a human clicking the *same* option at the same instant is attributed to the plugin; both
+  chose the same answer, so no false-allow is hidden.
 
-Latency budget: the whole path must stay well inside Paseo's 30 s hook timeout; the existing warm
-pwsh timeout (1.5 s) and cold timeouts (10 s / 20 s on 5.1) apply. A cold-start timeout yields
-`opaque` → L1 → ask, as today.
+### 3.7 Context snapshot
 
-### 3.5 Allow-once / deny-once resolution **[ADR]**
+Taken **before** `decideAction` (so it reflects the state the decision saw, not effects of this
+request): `{ secretTaint, untrustedTaint, modifiedEntrypoints[], modifiedFiles[] }`, paths redacted,
+`modifiedFiles` capped at 200 entries (cap reached ⇒ flag `modifiedFilesTruncated`, and replay
+treats the record as having no snapshot).
 
-Per-provider explicit mapping; anything not matched ⇒ do not answer.
+### 3.8 Allow-once / deny-once resolution **[ADR]**
 
-| Provider (observed) | Allow-once | Deny-once |
-| --- | --- | --- |
-| `agy` | action `id == "allow"`, `behavior == "allow"`, and no other allow action exists | `id == "deny"` |
-| `devin` (ACP) | candidate `id == "allow_once"` (seen only as a resolution, no raw request yet) | candidate `id == "reject_once"` |
-| `claude` | candidate `id == "accept"` (seen only as a resolution, no raw request yet) | — |
+Mapping by **action id** (labels may be localized and are only an extra guard).
 
-*(builder-review call)* Fixtures come from the user's local shadow audit (`includeRawInAudit`
-defaults to on). At design time only `agy` has raw request payloads (16 records, actions
-`[allow, deny]`). **P2a enables auto-answering for `agy` only.** `devin` and `claude` stay
-shadow-only until real raw payloads are captured into fixtures; enabling them is a follow-up change
-that adds fixtures plus the mapping row.
+| Provider | Allow-once | Deny-once | Enabled in P2a |
+| --- | --- | --- | --- |
+| `agy` | `id == "allow"`, `behavior == "allow"`, exactly one allow action offered | `id == "deny"`, exactly one deny action offered | **Yes** (16 real raw payloads in local audit, actions `[allow, deny]`) |
+| `devin` (ACP) | candidate `allow_once` | candidate `reject_once` | No — resolution ids seen, no raw request yet |
+| `claude` | candidate `accept` | — | No — resolution id seen, no raw request yet |
 
-Generic rules applied to every provider:
+Rules for every provider: never select an id/label matching
+`/always|session|remember|forever|all|persist/i`; never answer if more than one candidate remains;
+**never answer without a `selectedActionId`** (no bare `{behavior}` responses); never send
+`updatedInput` or `updatedPermissions`. Enabling another provider = adding real fixtures + a mapping
+row + tests.
 
-- Never select an action whose id or label matches `/always|session|remember|forever|all|persist/i`.
-- If more than one candidate allow action remains, do not answer.
-- Never send `updatedInput` or `updatedPermissions`.
-- The mapping lives in one module (`server/act/actions.ts`) with fixtures from real payloads for each
-  provider; a provider without fixtures is not auto-answered.
+### 3.9 Prerequisite hardening (must land before `act` can be effective)
 
-### 3.6 Attribution and the race with humans
+Verified gaps that are harmless in `shadow` but would be wrong auto-allows in `act`:
 
-`agent.permission.before` is a notification; the human sees the prompt at the same time. Paseo's
-`after` event has no actor. Attribution rule:
-
-- `actor = "plugin"` only if `answeredByPlugin` has the request **and** the resolution matches what
-  the plugin sent (`behavior` equal and, if the plugin sent one, `selectedActionId` equal).
-- If the plugin marked the request but the resolution differs → `actor = "human"`,
-  `actOutcome = "lost_race"`. This keeps human denials visible to the gate.
-- If `respondToPermission` rejects, the mark is removed (step 7) and the `after` event is attributed
-  to the human.
-
-Residual risk: a human clicking the *same* allow-once option in the same instant as the plugin is
-attributed to the plugin. Both chose allow, so no false-allow is hidden.
-
-### 3.7 False-allow while in `act`
-
-A false-allow can only be observed from human-resolved records. While in `act`, L0 requests are
-answered by the plugin, so new false-allows mostly surface via (a) lost races where the human denied,
-(b) replay after an engine change, (c) humans resolving requests the plugin chose not to answer
-(e.g. option not resolvable) that the engine judges allow. On any false-allow with
-`autoFallbackOnFalseAllow = true`, the effective mode drops to `shadow` immediately (in-memory
-first, then persisted), and the latch is cleared.
+1. **Read with no recognised path ⇒ L0** (`server/effects.ts` adds a bare `read` when `paths` is
+   empty). Change to `opaque` (L1). Add `Path` (agy's key, verified in local audit) to path keys.
+2. **Timeline sync failure** in `syncFromTimeline` is swallowed and returns un-tainted state.
+   For context-sensitive kinds, a failed sync must add `opaque:context_unavailable`.
+3. **Invalid settings** are ignored by the subscription, so the plugin keeps the previous mode
+   (possibly `act`). Invalid ⇒ effective `shadow` with reason.
+4. **Plugin-self paths**: add `~/.paseo/**`, `$PASEO_HOME/**`, `$PASEO_PLUGIN_DIR/**`, and the
+   resolved `PASEO_GUARDIAN_DATA_DIR` to the Path Model as `pluginSelf` (writes L3, reads
+   `read_secret` for config files). Assignments to `PASEO_HOME`, `PASEO_PLUGIN_DIR`,
+   `PASEO_GUARDIAN_DATA_DIR` in any shell are L2.
+5. **Paseo control surface**: `paseo` CLI subcommands that write settings, manage plugins, or respond
+   to permissions, and Paseo MCP tools with those effects (e.g. `respond_to_permission`, settings,
+   plugin management, `send_agent_prompt` to other agents) are L2. MCP name parsing accepts the
+   provider spellings actually observed; the single-underscore form (`mcp_<server>_<tool>`) is
+   **to be confirmed** from real payloads and added with fixtures if it exists.
+6. **Sandbox-bypass flags**: if a provider payload carries a sandbox-bypass flag (reported for agy as
+   `BypassSandbox`; not seen in local audit — **to be confirmed**), `true` ⇒ L2.
+7. **Entrypoints**: extend `isBuildOrScriptEntrypoint` with `build.rs`, `conftest.py`, `setup.py`,
+   `setup.cfg`, `noxfile.py`, `tox.ini`, `Taskfile.yml`/`Taskfile.yaml`, `justfile`, `build.gradle`,
+   `build.gradle.kts`, `settings.gradle(.kts)`, `pom.xml`, `CMakeLists.txt`, `meson.build`,
+   `Rakefile`, `Gemfile`, `composer.json`, `deno.json(c)`, `bunfig.toml`, `.cargo/config.toml`,
+   `Directory.Build.props`, `*.csproj`, and `.husky/**`/`.git/hooks/**` (already protected).
 
 ## 4. Settings (Paseo Settings, host scope)
 
@@ -243,116 +255,131 @@ actGate: z.object({
 actOverride: z.object({
   accepted: z.boolean().default(false),
   acceptedAt: z.string().nullable().default(null),
+  fingerprint: z.string().nullable().default(null),
 }).default({}),
 ```
 
-- Setting `actOverride.accepted = true` is ignored unless `actGate.allowOverride` is true and
-  `acceptedAt` is set; the plugin writes an audit `gate_event` when it observes the change.
-- Settings are edited only through the Paseo settings UI. The agent must not be able to change them
-  through a request the plugin auto-allows *(builder-review call)*:
-  - Path Model: the plugin data dir (audit, `gate-state.json`) and Paseo's settings storage
-    location for this plugin are `write_protected` (L2). The builder locates the real settings file
-    path for host-scope settings and adds it; `PASEO_GUARDIAN_DATA_DIR` overrides must be covered.
-  - Command/MCP: `paseo` CLI invocations that write settings, reload/disable/remove plugins, or
-    respond to permissions, and Paseo MCP tools with the same effects (e.g. `respond_to_permission`,
-    settings/plugin management), are classified L2.
-  - Vector tests assert all of the above are never L0.
+The settings UI fills `fingerprint` from `guardian.status` when the user accepts. The plugin writes
+an audit `gate` event when it observes override acceptance/revocation.
 
-## 5. Components and contracts
+## 5. Gate integrity and tamper resistance
 
-### 5.1 New / changed modules (server)
+- `gate-state.json` (`{ version, latched, fingerprint, latchedAt, lastReplay }`) is schema-validated;
+  unreadable, unknown version, or fingerprint mismatch ⇒ not latched. It is written atomically.
+- Audit lines are parsed defensively; malformed lines are skipped and counted; a malformed line in a
+  file that also contains human-denied records ⇒ `unavailable`.
+- Annotations are audit `event: "annotation"` lines (latest wins) written only via
+  `guardian.gate.annotate`.
+- Plugin RPCs (`guardian.gate.annotate`, settings writes) are reachable by any local Paseo client,
+  not just the UI. An agent reaching them needs either a Paseo MCP tool (L2 per §3.9.5) or an inline
+  script/network client (`exec_inline`, L1), so neither is auto-answered. Same-user processes
+  running already-approved project code can still forge local files; this is within the documented
+  non-goal (§1).
+
+## 6. Components and contracts
+
+### 6.1 Server
 
 | Module | Responsibility |
 | --- | --- |
-| `server/act/actions.ts` | Provider allow-once / deny-once resolution (§3.5) |
-| `server/act/responder.ts` | Steps 1–7 of §3.4; owns `answeredByPlugin` matching data |
-| `server/gate/gate.ts` | Gate state machine, latch, effective-mode computation |
-| `server/gate/replay.ts` | Reads audit JSONL within window, re-evaluates, produces counts (samples, false-allows, unclassified denials, annotated, skipped) |
-| `server/gate/fingerprint.ts` | Engine fingerprint = hash(pluginVersion, engine data versions, policy hash or `"builtin"`) |
-| `server/audit/store.ts` | Add `contextSnapshot`, `actOutcome`, `gate_event` entries; add a streaming reader for replay; rebuild in-memory metrics from disk on start |
-| `server/guardian.ts` | Wire responder and gate; attribution rule §3.6 |
-| `index.server.ts` | Pass `context.paseo` / `context.signal` into the before-hook path |
+| `server/act/actions.ts` | Provider allow-once / deny-once resolution (§3.8) |
+| `server/act/responder.ts` | §3.5 steps; `answeredByPlugin` payloads; attribution (§3.6) |
+| `server/gate/gate.ts` | State machine, effective mode, latch, override validity (§3.2) |
+| `server/gate/replay.ts` | Streaming JSONL read within window, re-evaluation, counts (§3.4) |
+| `server/gate/fingerprint.ts` | §3.1 |
+| `server/audit/store.ts` | `offeredActions`, `contextSnapshot`, `actOutcome`, `gate`/`annotation` events; streaming reader; rebuild in-memory metrics on start |
+| `server/guardian.ts` | Wiring; snapshot before decide; invalid-settings handling |
+| `server/effects.ts`, `server/paths/*`, `server/normalize/*`, `server/context/session.ts` | §3.9 hardening |
+| `index.server.ts` | Pass `context.paseo` and `context.signal` into the before path; handle `invalid` settings state |
 
-### 5.2 Shared
+### 6.2 Shared
 
-- `shared/settings.ts`: fields in §4.
-- `shared/rpc.ts`: `guardian.status` output gains `effectiveMode: "off" | "shadow" | "act"` and
-  `gate`; new RPCs `guardian.gate.replay` (manual "re-run replay now") and `guardian.gate.annotate`.
-- `shared/types.ts`: `GateStatus`, `ActOutcome`, `ContextSnapshot`.
+- `shared/settings.ts`: §4.
+- `shared/rpc.ts`: `guardian.status` gains `effectiveMode: "off" | "shadow" | "act"` and `gate`;
+  new `guardian.gate.replay` and `guardian.gate.annotate({ requestId, annotation: "not_safety" | null })`.
+- `shared/types.ts`: `GateStatus`, `GateState`, `ActOutcome`, `ContextSnapshot`, `OfferedAction`.
 
-### 5.3 Client
+### 6.3 Client
 
-Settings screen gains an "Automatic answering" section: mode selector (existing), gate parameters,
-override checkbox with a confirmation dialog, and a read-only status card (state, reason, samples
-x/N, false-allows with up to 5 entries showing the command and per-sub-command effects and an
-"not a safety issue" annotate button, unclassified denials count, last replay, engine fingerprint
-short hash). React
-Native primitives only; strings in `client/i18n.ts` (en, zh-CN).
+Settings screen "Automatic answering" section: mode selector, gate parameters, override checkbox
+with confirmation dialog (shows what it skips and that it expires on upgrade), and a status card:
+state, reason, samples x/N, false-allow entries (command + per-sub-command effects + "not a safety
+issue" button), false-deny count, unclassified/unconfirmed counts, last replay, fingerprint short
+hash. React Native primitives only; strings in `client/i18n.ts` (en, zh-CN).
 
-### 5.4 Files
-
-- `gate-state.json` in the plugin data dir: `{ latched, fingerprint, latchedAt, lastReplay }`,
-  written atomically (tmp + rename). Unreadable/corrupt ⇒ treated as not latched.
-- Audit JSONL gains `event: "gate"` lines for: latch, unlatch (with reason), override accepted /
-  revoked, fallback on false-allow, replay summary.
-
-## 6. Error handling (fail to human)
+## 7. Error handling (fail to human)
 
 | Failure | Result |
 | --- | --- |
-| Replay error / audit unreadable | gate `unavailable`, effective `shadow` |
-| `gate-state.json` corrupt | not latched → full entry condition required |
-| Unknown provider / unresolvable action | do not answer |
-| `respondToPermission` throws | unmark, `actOutcome` recorded, human flow continues |
+| Replay error, truncation, unreadable history, skipped human denial | `unavailable` ⇒ `shadow` |
+| `gate-state.json` corrupt / fingerprint mismatch | not latched |
+| Settings invalid | `shadow` |
+| Unknown provider / unresolvable or ambiguous action | no answer |
+| `after` already present before answering | no answer; evaluate immediately |
+| `respondToPermission` throws | unmark, `actOutcome: "error"` |
 | Any exception in act path | caught; no answer; logged |
-| Settings invalid | defaults (effective `shadow` because `mode` default is `shadow`) |
+| Timeline sync failure (context-sensitive kinds) | `opaque` ⇒ L1 |
 
-## 7. Testing
+## 8. Testing
 
-- Unit: action resolution per provider with real fixtures (agy, devin, claude), including
-  "always"-style options and multiple-allow ambiguity → no answer.
-- Unit: gate state machine (collecting → passed → latched; false-allow → fallback; fingerprint
-  change → unlatch; override paths with fallback on/off).
-- Unit: replay counting, context snapshot use, `max(recorded, replay)` for legacy records,
-  skipped/truncated accounting.
-- Unit: attribution rule incl. lost race, after-before-before ordering, mismatched resolution.
-- Integration: `handlePermissionBefore` in `act` with a fake `paseo.agents.ref().respondToPermission`
-  — L0 answered once, L1/L2 untouched, L3 only with `denyAsAsk=false`, errors never answer.
-- Security vectors: writes to settings, gate-state, audit dir never L0.
-- Daemon smoke: extend `smoke:daemon` to assert `guardian.status` reports `effectiveMode: "shadow"`
-  and gate `collecting` with `mode: act` on an empty data dir.
+- Action resolution per provider with real agy fixtures; always/session options, multiple
+  candidates, missing ids, localized labels → no answer; devin/claude never answered.
+- Gate state machine: every row of §3.2 incl. override + fingerprint change, autoFallback on/off,
+  replaying/unavailable with override, auto-deny gate.
+- Replay: false-allow from replay verdict only; legacy sample rule; skipped human denial ⇒
+  unavailable; truncation ⇒ unavailable; annotations; isolated pwsh host.
+- Attribution: lost race (human deny), same-option race, after-before ordering, unconfirmed TTL,
+  thrown error.
+- Cancellation: unconfirmed signature ⇒ counted; a confirmed-signature fixture (once captured) ⇒
+  excluded.
+- §3.9 vectors: empty-path read ⇒ L1; `Path` key; timeline failure ⇒ opaque; invalid settings ⇒
+  shadow; plugin-self paths and env assignments; paseo CLI/MCP control surface; new entrypoints for
+  Go/Python/Rust/JVM/.NET/Ruby/PHP/Deno.
+- Integration: `handlePermissionBefore` in `act` with a fake `respondToPermission`.
+- Daemon smoke: `mode: act` on empty data dir ⇒ `effectiveMode: "shadow"`, state `collecting`.
 
-## 8. Exit criteria for P2a
+## 9. Exit criteria for P2a
 
-- All tests above pass on the CI matrix; typecheck and boundary checks pass.
-- With `mode: act` on a fresh install, effective mode is `shadow` and the settings screen shows
-  `collecting 0/200`.
-- With a synthetic audit history meeting the gate, L0 requests are answered allow-once on `agy`
-  fixtures and never on providers without fixtures; replaying a history containing one human-denied
-  L0 request shows `failed_false_allow` and no auto-answers; annotating it `not_safety` restores
-  `passed`; a cancelled (no `selectedActionId`) denial never changes the gate.
-- DESIGN.md (§10.4, §11, §12, §13, §16) and ADR-0008 updated.
+- All tests pass on the CI matrix; typecheck and boundary checks pass.
+- Fresh install with `mode: act` ⇒ effective `shadow`, status `collecting 0/200`.
+- Synthetic history meeting the gate ⇒ L0 answered allow-once on agy fixtures only; one human-denied
+  L0 in history ⇒ `failed_false_allow`, no auto-answers; annotating it ⇒ `passed`.
+- All §3.9 hardening items landed (items marked "to be confirmed" either confirmed with fixtures or
+  explicitly deferred with the conservative behaviour in place).
+- DESIGN.md (§10.4, §11, §12, §13, §14, §16) and ADR-0008 updated.
 
-## 9. Left to the builder
+## 10. Left to the builder
 
-- Exact streaming JSONL reader and how metrics are rebuilt on start (must handle rotated files and
-  out-of-order before/after pairs).
-- Concurrency control between replay and live reconciliation (single-writer queue is acceptable).
-- Engine data version source (e.g. a constant bumped when rules/registry change) — must change
-  whenever classification can change.
-- Policy hash: layered YAML policy is not loaded yet; use `"builtin"` until it is, and include the
-  hash once policy loading lands.
-- Confirming the `claude` provider's action shape from real raw payloads before enabling it.
+- Streaming JSONL reader, metrics rebuild on start, concurrency between replay and live
+  reconciliation (a single-writer queue is acceptable).
+- How replay avoids filesystem drift (§3.4) deterministically.
+- `ENGINE_DATA_VERSION` mechanics (must change whenever decisions can change).
+- Policy hash once YAML policy loading lands (`"builtin"` until then).
+- Locating Paseo's host-scope settings file path for this plugin and the exact `paseo` CLI / MCP tool
+  names for §3.9.5.
 
-## 10. Approaches considered
+## 11. Approaches considered
 
-1. **P2 as one project** — one design, one review; rejected because the act engine is the first
-   time the plugin decides on the user's behalf and deserves a focused review, and UI work would
-   delay collecting real samples.
+1. **P2 as one project** — rejected; the act engine is the first time the plugin decides on the
+   user's behalf and deserves a focused review; UI work would delay collecting real samples.
 2. **P2a safety core + P2b experience layer (chosen)**.
 3. **UI first** — rejected; a dashboard without gate/act does not move the P2 exit criterion.
 
-Gate variants considered: advisory only (rejected: easy to enable by mistake), hard gate without
-override (rejected: new or low-volume users could never enable it), **hard gate + explicit override
-(chosen)**. Gate on live recorded decisions only (rejected: every upgrade would reset the evidence)
-vs **replay with the current engine (chosen)**.
+Gate variants: advisory only (rejected: easy to enable by mistake); hard gate without override
+(rejected: low-volume users could never enable it); **hard gate + override bound to fingerprint
+(chosen)**. Evidence from live decisions only (rejected: upgrades would reset evidence) vs **replay
+with the current engine (chosen)**. Per-provider or per-category pools (rejected by user: would
+starve low-volume providers/categories; the engine is provider-independent and option mapping is
+gated by fixtures). Treating any code edit as making later project commands L1 (rejected by user:
+would remove the edit→test loop that `act` exists to automate).
+
+## 12. Review log
+
+- Builder check (2026-11-22): 6 questions; 2 answered by the user (annotation, global scope), 4
+  settled as design calls (cancellations, tamper scope, fixtures, override during replay).
+- Independent review by neon (`agy/gemini-4-neon`, 2026-11-22): 8 findings. Verified in code:
+  fire-and-forget `respondToPermission`; empty-path read ⇒ L0; `Path` key missing; invalid settings
+  ignored; `mcp__`-only parsing. Not yet verified: `BypassSandbox`, single-underscore MCP names,
+  cancellation payload shape (marked "to be confirmed"). All findings incorporated; #1 and #8
+  decided by the user (count unclear denials until confirmed; no coverage requirement); the
+  edit-then-run concern decided by the user (stay L0, document, extend entrypoints).
