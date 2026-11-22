@@ -144,6 +144,14 @@ export function choiceLabelKey(resolution: NonNullable<GateEntry["resolution"]>)
   return `act.entries.choice.${resolution.behavior}${scope}` as ChoiceLabelKey;
 }
 
+/** Sidebar item is shown unless settings are loaded and explicitly turn it off. */
+export function shouldShowSidebarItem(state: {
+  status: string;
+  values?: { showSidebarItem?: boolean };
+}): boolean {
+  return !(state.status === "ready" && state.values?.showSidebarItem === false);
+}
+
 export const REVIEW_SCREEN_ID = "guardian-review";
 
 /** Sidebar badge: how many gate entries (all kinds) need review; 0 when unknown. */

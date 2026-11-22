@@ -1,4 +1,4 @@
-import { type PluginScreenProps, useRpc, useTranslation } from "@getpaseo/plugin/client";
+import { type PluginScreenProps, useRpc, useSettings, useTranslation } from "@getpaseo/plugin/client";
 import {
   Loading,
   ScrollView,
@@ -10,6 +10,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Text } from "react-native";
 import { gateAnnotate, gateReplay, getGuardianStatus } from "../shared/rpc.js";
+import { guardianSettings } from "../shared/settings.js";
 import type { GateStatus, GuardianStatusSnapshot } from "../shared/types.js";
 import { GateEntryList } from "./entry-list.js";
 import { effectiveModeLabelKey, integrityText } from "./gate-view.js";
@@ -18,6 +19,7 @@ import { messages } from "./i18n.js";
 /** Plugin screen listing gate entries that need review, with open-chat and annotate actions. */
 export function GuardianReviewScreen({ theme, layout, navigation }: PluginScreenProps) {
   const { t } = useTranslation(messages);
+  const settings = useSettings(guardianSettings);
   const fetchStatus = useRpc(getGuardianStatus);
   const replayGate = useRpc(gateReplay);
   const annotateGate = useRpc(gateAnnotate);
@@ -93,6 +95,21 @@ export function GuardianReviewScreen({ theme, layout, navigation }: PluginScreen
               />
             </SettingsCard>
           </SettingsSection>
+          {settings.status === "ready" && settings.values.showSidebarItem ? (
+            <SettingsSection title={t("review.hide")}>
+              <SettingsCard>
+                <SettingsAction
+                  label={t("review.hide")}
+                  hint={t("review.hideHint")}
+                  actionLabel={t("review.hideAction")}
+                  disabled={settings.saving}
+                  onPress={() =>
+                    void settings.save({ ...settings.values, showSidebarItem: false }, settings.revision)
+                  }
+                />
+              </SettingsCard>
+            </SettingsSection>
+          ) : null}
           <SettingsSection title={t("review.entries")}>
             <SettingsCard>
               {gate.entries.length === 0 ? (

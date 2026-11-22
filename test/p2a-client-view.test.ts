@@ -6,6 +6,7 @@ import {
   entryAgentLabel,
   entryContentView,
   entryTime,
+  shouldShowSidebarItem,
 } from "../client/gate-view.js";
 import { emptyGateStatus, type GateEntry } from "../shared/types.js";
 
@@ -145,5 +146,15 @@ describe("entry UX helpers", () => {
     expect(canOpenChat(withAgent, undefined)).toBe(false);
     expect(openEntryChat(withAgent, undefined)).toBe(false);
     expect(canOpenChat(e("orphan_deny"), nav)).toBe(false);
+  });
+});
+
+describe("shouldShowSidebarItem", () => {
+  it("hides only when ready with showSidebarItem false", () => {
+    expect(shouldShowSidebarItem({ status: "ready", values: { showSidebarItem: true } })).toBe(true);
+    expect(shouldShowSidebarItem({ status: "ready", values: { showSidebarItem: false } })).toBe(false);
+    expect(shouldShowSidebarItem({ status: "loading" })).toBe(true);
+    expect(shouldShowSidebarItem({ status: "invalid" })).toBe(true);
+    expect(shouldShowSidebarItem({ status: "error" })).toBe(true);
   });
 });

@@ -17,6 +17,7 @@ const ActOverrideSchema = z.object({
 export const GuardianSettingsSchema = z.object({
   mode: z.enum(["off", "shadow", "act"]).default("shadow"),
   denyAsAsk: z.boolean().default(true),
+  showSidebarItem: z.boolean().default(true),
   timelineVerbosity: z.enum(["off", "notable", "all"]).default("notable"),
   includeRawInAudit: z.boolean().default(true),
   userPolicyPath: z.string().default("~/.paseo/permission-guardian/policy.yaml"),

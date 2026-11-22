@@ -31,6 +31,10 @@ export const messages = defineTranslations({
           act: "Act",
         },
       },
+      sidebar: {
+        label: "Show in sidebar",
+        hint: "Shows the Permission Guardian entry with the number of items to review.",
+      },
       denyAsAsk: {
         label: "Treat deny as ask",
         hint: "Convert deny verdicts into human prompts instead of automatically denying.",
@@ -190,6 +194,9 @@ export const messages = defineTranslations({
         empty: "Nothing needs review.",
         summary: "Gate summary",
         entries: "Entries",
+        hide: "Hide from sidebar",
+        hideAction: "Hide",
+        hideHint: "You can turn it back on in Settings → Permission Guardian.",
       },
       status: {
         errorLabel: "Status error",
@@ -231,6 +238,10 @@ export const messages = defineTranslations({
           off: "已关闭",
           act: "自动应答中",
         },
+      },
+      sidebar: {
+        label: "在侧边栏显示",
+        hint: "显示权限守卫入口和待处理数量。",
       },
       denyAsAsk: {
         label: "将拒绝转为人工询问",
@@ -384,6 +395,9 @@ export const messages = defineTranslations({
         empty: "没有待处理的记录。",
         summary: "门槛概览",
         entries: "记录",
+        hide: "从侧边栏隐藏",
+        hideAction: "隐藏",
+        hideHint: "可在“设置 → 权限守卫”中重新开启。",
       },
       status: {
         errorLabel: "状态错误",

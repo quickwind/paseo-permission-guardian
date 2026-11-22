@@ -1,9 +1,10 @@
-import { type PluginSidebarItemProps, useRpc, useTranslation } from "@getpaseo/plugin/client";
+import { type PluginSidebarItemProps, useRpc, useSettings, useTranslation } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { Text, View } from "react-native";
 import { getGuardianStatus } from "../shared/rpc.js";
-import { openReviewScreen, REVIEW_SCREEN_ID, reviewBadgeCount } from "./gate-view.js";
+import { guardianSettings } from "../shared/settings.js";
+import { openReviewScreen, REVIEW_SCREEN_ID, reviewBadgeCount, shouldShowSidebarItem } from "./gate-view.js";
 import { messages } from "./i18n.js";
 
 const POLL_MS = 30_000;
@@ -12,6 +13,7 @@ const POLL_MS = 30_000;
 export function GuardianSidebarItem({ theme, currentScreen, openScreen }: PluginSidebarItemProps) {
   const { t } = useTranslation(messages);
   const fetchStatus = useRpc(getGuardianStatus);
+  const settings = useSettings(guardianSettings);
   const [count, setCount] = useState(0);
 
   useEffect(() => {
@@ -28,6 +30,8 @@ export function GuardianSidebarItem({ theme, currentScreen, openScreen }: Plugin
       clearInterval(timer);
     };
   }, [fetchStatus]);
+
+  if (!shouldShowSidebarItem(settings)) return null;
 
   return (
     <SidebarRow

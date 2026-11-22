@@ -249,6 +249,13 @@ export function GuardianSettingsScreen({
             disabled={settings.saving}
             onValueChange={(denyAsAsk) => update({ denyAsAsk })}
           />
+          <SettingsSwitch
+            label={t("sidebar.label")}
+            hint={t("sidebar.hint")}
+            value={values.showSidebarItem}
+            disabled={settings.saving}
+            onValueChange={(showSidebarItem) => update({ showSidebarItem })}
+          />
           <SettingsSelect
             label={t("timeline.label")}
             hint={t("timeline.hint")}

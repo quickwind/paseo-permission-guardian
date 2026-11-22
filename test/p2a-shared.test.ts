@@ -23,6 +23,11 @@ describe("p2a shared settings", () => {
     expect(p({ windowDays: 366 })).toBe(false);
     expect(p({ windowDays: 365 })).toBe(true);
   });
+  it("showSidebarItem defaults to true and legacy settings parse", () => {
+    expect(GuardianSettingsSchema.parse({}).showSidebarItem).toBe(true);
+    expect(GuardianSettingsSchema.parse({ mode: "act" }).showSidebarItem).toBe(true);
+    expect(GuardianSettingsSchema.parse({ showSidebarItem: false }).showSidebarItem).toBe(false);
+  });
   it("legacy stored v1 settings still parse", () => {
     const s = GuardianSettingsSchema.parse({ mode: "act", denyAsAsk: false });
     expect(s.mode).toBe("act");
