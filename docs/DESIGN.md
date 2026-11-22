@@ -675,7 +675,9 @@ unavailable until acknowledged.
   are secret reads); `worktrees/**` is ordinary. `PASEO_PLUGIN_DIR`, `PASEO_GUARDIAN_DATA_DIR` and
   the plugin data dir are plugin-self as a whole. Act on Windows uses the same R11 set
   (`%USERPROFILE%\.paseo`, `%PASEO_HOME%`, `$env:PASEO_HOME`), including paths classified inside
-  PowerShell layers.
+  PowerShell layers. On both POSIX and Windows each root is also matched by its realpath, so the
+  target of a junctioned/symlinked root is protected the same way; `%PASEO_*%` in cmd expands
+  only when the variable is set in the env snapshot (otherwise the path stays opaque).
 - The PowerShell host is parse-only; it must never evaluate input. Inputs are passed as JSON
   data over UTF-8 stdin, never interpolated into scripts.
 - Event delivery is best-effort; the plugin is a prompt reducer, not an enforcement point.
