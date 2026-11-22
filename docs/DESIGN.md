@@ -544,17 +544,23 @@ PowerShell versions.
   snapshot, run the pipeline, record the request in memory first (disk append is asynchronous), and
   in `act` mode answer through the responder (`server/act/responder.ts`): stop if an `after` event
   already resolved the request, re-check the effective mode and `context.signal` immediately before
-  sending, mark `requestId` in the in-memory `answeredByPlugin` map, then call
+  sending, then the responder marks the request in its own in-memory mark table (behavior,
+  `selectedActionId`, send time) and records `actOutcome: "sent"`, then calls
   `respondToPermission` with the mapped allow-once/deny-once option. The call is fire-and-forget
   (the daemon client only sends a frame), so success is inferred from `after`, never from the call;
   a thrown error unmarks the request and records `actOutcome: "error"`. In `shadow` mode only record.
+  `PermissionGuardianService.markAnsweredByPlugin` and its `answeredByPlugin` map are legacy: they
+  are used for attribution only when no responder is configured, and are unused in the shipped
+  wiring (which always has a responder).
 - `agent.permission.after`: also awaits history load; reconcile by `requestId` (upsert/merge to
   handle out-of-order delivery). **Attribution window**: the actor is `plugin` only if the request
   was marked, `behavior` and `selectedActionId` equal what was sent, and the event arrives within
   15 s of sending; a matching event later than that is attributed to the human. A marked request
   with a different resolution is `human` with `actOutcome: "lost_race"`; no `after` in the window is
-  `unconfirmed`. Three consecutive `unconfirmed` outcomes pause answering (effective `shadow`,
-  reason `responder_unconfirmed`). Gate counters update at the audit merge point in every mode.
+  `unconfirmed`. Three consecutive `unconfirmed` outcomes (a `lost_race` whose behavior equals the
+  sent behavior also counts) pause answering (effective `shadow`, reason `responder_unconfirmed`).
+  The pause clears only on daemon start or a manual replay (`guardian.gate.replay`) that completes
+  available; automatic replays never clear it. Gate counters update at the audit merge point in every mode.
   Live decisions and replay share one decide context (`server/decide-context.ts`).
 - `agent.open.before` (optional, opt-in): append system-prompt guidance — one action per
   command, avoid chaining and inline scripts, prefer PowerShell over cmd on Windows, canonical
@@ -595,8 +601,11 @@ notifications. Timeout ⇒ normal human flow. The plugin detects and prefers it 
   (secrets redacted), layers, effects, reasons, decision, mode, actor attribution, final
   resolution, latency, plugin and data versions. P2a adds `offeredActions` (the provider's offered
   options), `contextSnapshot` (taint flags, modified entrypoints/files before the decision, paths
-  redacted, files capped at 200 with a truncation flag), and `actOutcome`
-  (`confirmed | unconfirmed | lost_race | error`).
+  redacted, files capped at 200 with a truncation flag, and `contextUnavailable` when the timeline
+  could not be synced), and `actOutcome` (`sent | answered | unconfirmed | lost_race | error`;
+  `skipped` exists in the type but is never written). Lines for the same `requestId` merge
+  field-wise: a later line's defined values win and missing fields never erase earlier ones.
+  Every unparsable line is a corrupt line, including a crash-truncated final line.
 - Besides `before`/`after`/`update` lines the file holds `gate` events (override accepted/revoked,
   latch changes) and `annotation` events (latest wins), written only via `guardian.gate.annotate`.
   Annotations are keyed by `key`: a request id, `file#sha256` (corrupt line), or
@@ -621,11 +630,14 @@ act-answer count, integrity issues, last replay time, short fingerprint, overrid
 is a human denial of such a request (any non-plugin `deny` counts unless it matches a confirmed
 cancellation signature, initially none); a false-deny is a human allow of a request the engine
 would deny at L3 (judged by level, independent of `denyAsAsk`). Metrics come from replaying the
-recorded history with the current engine; the engine fingerprint is `sha256(pluginVersion,
+recorded history with the current engine (at most 20 000 records in the window; more ⇒
+`replay_truncated` ⇒ `unavailable`); the engine fingerprint is `sha256(pluginVersion,
 ENGINE_DATA_VERSION, policy hash, denyAsAsk, windowsDefaultShell, env digest of the Paseo roots and
 whether CDPATH is set)`, and a fingerprint change clears the latch and invalidates the override.
-Replay never counts a human-attributed allow whose `actOutcome` is `unconfirmed`/`lost_race` as a
-sample. Truncation, a corrupt line, an orphan human denial, a human denial that cannot be
+Replay never counts a human-attributed allow whose `actOutcome` is `sent`/`unconfirmed`/`lost_race`
+as a sample, and treats a snapshot taken with `contextUnavailable` like a missing snapshot.
+A human denial that cannot be re-evaluated is listed as an `unevaluable_deny` entry so it can be
+acknowledged. Truncation, a corrupt line, an orphan human denial, a human denial that cannot be
 re-evaluated, an audit persist failure, or a failing gate-state write make the gate `unavailable`
 (effective `shadow`). A suspension (latched, then a false-allow) lifts only through a "not a
 safety issue" annotation of every suspending record; if a suspending record ages out of the window
@@ -653,7 +665,14 @@ unavailable until acknowledged.
 - Paseo plugins are trusted, unsandboxed code running with the daemon user's permissions. Keep
   dependencies minimal and pinned; publish provenance for npm releases.
 - The plugin never auto-allows writes to its own policy, settings, data, or pin files, nor to
-  agent config or `.git/`.
+  agent config or `.git/`. Paseo self paths (ruling R11): under `~/.paseo` and `$PASEO_HOME` only
+  the root itself, `config.json`, `settings.json`, `plugin-settings/**`, `plugins/**`,
+  `permission-guardian/**`, `state/**` and root-level `*.key`, `*.pem`, `daemon*.json` are
+  plugin-self (writes L3; reads of `config.json`, `settings.json` and `plugin-settings/**/*.json`
+  are secret reads); `worktrees/**` is ordinary. `PASEO_PLUGIN_DIR`, `PASEO_GUARDIAN_DATA_DIR` and
+  the plugin data dir are plugin-self as a whole. Act on Windows uses the same R11 set
+  (`%USERPROFILE%\.paseo`, `%PASEO_HOME%`, `$env:PASEO_HOME`), including paths classified inside
+  PowerShell layers.
 - The PowerShell host is parse-only; it must never evaluate input. Inputs are passed as JSON
   data over UTF-8 stdin, never interpolated into scripts.
 - Event delivery is best-effort; the plugin is a prompt reducer, not an enforcement point.
