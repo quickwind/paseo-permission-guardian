@@ -981,3 +981,39 @@ describe("GateController — fix round 2 (M4 ordering)", () => {
     expect(g.status().state).toBe("replaying");
   });
 });
+
+describe("GateController — N2 orphan human deny is an integrity problem", () => {
+  it("autoFallback off + latched: orphan deny ⇒ unavailable/orphan_human_deny, shadow immediately", async () => {
+    const g = await latchedGate();
+    configure(g, settings({ actGate: { autoFallbackOnFalseAllow: false } }));
+    expect(g.effectiveMode()).toBe("act");
+    await store.recordAfter({
+      requestId: "orphN2",
+      agentId: "a",
+      provider: "claude",
+      mode: "act",
+      resolution: { behavior: "deny", resolvedAt: new Date(clock).toISOString(), actor: "human" },
+    });
+    expect(g.effectiveMode()).toBe("shadow");
+    expect(g.status()).toMatchObject({ state: "unavailable", reason: "orphan_human_deny" });
+  });
+
+  it("autoFallback off + valid override: orphan deny ⇒ shadow", async () => {
+    const g = makeGate();
+    configure(
+      g,
+      settings({ actGate: { autoFallbackOnFalseAllow: false }, actOverride: { accepted: true, fingerprint: FP } }),
+    );
+    await g.replay();
+    expect(g.effectiveMode()).toBe("act");
+    await store.recordAfter({
+      requestId: "orphN2b",
+      agentId: "a",
+      provider: "claude",
+      mode: "act",
+      resolution: { behavior: "deny", resolvedAt: new Date(clock).toISOString(), actor: "human" },
+    });
+    expect(g.effectiveMode()).toBe("shadow");
+    expect(g.status().state).toBe("unavailable");
+  });
+});

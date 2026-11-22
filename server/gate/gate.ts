@@ -548,6 +548,11 @@ export class GateController {
     } else if (this.stateWriteFailed) {
       state = "unavailable";
       stateReason = "gate_state_write_failure";
+    } else if ([...this.candidates.values()].some((c) => c.entry.kind === "orphan_deny")) {
+      // N2 / spec §3.4: a human deny with no recorded decision is an integrity problem, not just a
+      // false-allow — the gate is unavailable (shadow) regardless of autoFallbackOnFalseAllow.
+      state = "unavailable";
+      stateReason = "orphan_human_deny";
     } else if (!replay) {
       state = "replaying";
       stateReason = "replaying";
