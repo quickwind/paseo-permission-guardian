@@ -17,9 +17,13 @@ import {
 } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Text, View } from "react-native";
-import { getGuardianStatus } from "../shared/rpc.js";
+import { gateAnnotate, gateReplay, getGuardianStatus } from "../shared/rpc.js";
 import { guardianSettings, type GuardianSettings } from "../shared/settings.js";
-import type { GuardianStatusSnapshot } from "../shared/types.js";
+import type {
+  GateEntry,
+  GateStatus,
+  GuardianStatusSnapshot,
+} from "../shared/types.js";
 import { messages } from "./i18n.js";
 
 export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
@@ -28,6 +32,10 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
   const fetchStatus = useRpc(getGuardianStatus);
   const [status, setStatus] = useState<GuardianStatusSnapshot | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [confirmingOverride, setConfirmingOverride] = useState(false);
+  const [gateBusy, setGateBusy] = useState(false);
+  const replayGate = useRpc(gateReplay);
+  const annotateGate = useRpc(gateAnnotate);
 
   const modeOptions = useMemo(
     () => [
@@ -61,13 +69,36 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     void fetchStatus({})
       .then((snapshot) => setStatus(snapshot))
       .catch((error) => {
-        setStatusError(error instanceof Error ? error.message : t("settings.loadStatusError"));
+        setStatusError(
+          error instanceof Error
+            ? error.message
+            : t("settings.loadStatusError"),
+        );
       });
   }, [fetchStatus, t]);
 
   useEffect(() => {
     refreshStatus();
+    const timer = setInterval(refreshStatus, 5000);
+    return () => clearInterval(timer);
   }, [refreshStatus]);
+
+  const runGateAction = (action: () => Promise<GateStatus>) => {
+    setGateBusy(true);
+    void action()
+      .then((gate) => setStatus((prev) => (prev ? { ...prev, gate } : prev)))
+      .catch((error) => {
+        setStatusError(
+          error instanceof Error
+            ? error.message
+            : t("settings.loadStatusError"),
+        );
+      })
+      .finally(() => {
+        setGateBusy(false);
+        refreshStatus();
+      });
+  };
 
   const styles = useMemo(
     () => ({
@@ -126,6 +157,27 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     });
   };
 
+  const gate = status?.gate ?? null;
+  const updateActGate = (patch: Partial<GuardianSettings["actGate"]>) =>
+    update({ actGate: { ...values.actGate, ...patch } });
+  const numberField = (
+    text: string,
+    min: number,
+    max: number,
+    apply: (n: number) => void,
+  ): void => {
+    const n = Number(text.trim());
+    if (text.trim() !== "" && Number.isInteger(n) && n >= min && n <= max)
+      apply(n);
+  };
+  const entryKindLabel = (entry: GateEntry) =>
+    t(`act.entries.kind.${entry.kind}`);
+  const overrideStatusLabel = !values.actOverride.accepted
+    ? t("act.override.inactive")
+    : gate && !gate.override.valid
+      ? t("act.override.expired")
+      : t("act.override.active");
+
   const effectiveModeLabel = status
     ? status.effectiveMode === "off"
       ? t("mode.effectiveValues.off")
@@ -177,7 +229,9 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
             value={values.windowsDefaultShell}
             options={windowsShellOptions}
             disabled={settings.saving}
-            onValueChange={(windowsDefaultShell) => update({ windowsDefaultShell })}
+            onValueChange={(windowsDefaultShell) =>
+              update({ windowsDefaultShell })
+            }
           />
           <SettingsInput
             label={t("policy.userPathLabel")}
@@ -209,7 +263,9 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
             <Text style={styles.metricValue}>{effectiveModeLabel}</Text>
           </SettingsRow>
           <SettingsRow label={t("status.totalRequestsLabel")}>
-            <Text style={styles.metricValue}>{String(status?.metrics.totalRequests ?? 0)}</Text>
+            <Text style={styles.metricValue}>
+              {String(status?.metrics.totalRequests ?? 0)}
+            </Text>
           </SettingsRow>
           <SettingsRow label={t("status.reconciledPendingLabel")}>
             <Text style={styles.metricValue}>
@@ -217,7 +273,9 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
             </Text>
           </SettingsRow>
           <SettingsRow label={t("status.falseAllowsLabel")}>
-            <Text style={styles.metricValue}>{String(status?.metrics.falseAllowCount ?? 0)}</Text>
+            <Text style={styles.metricValue}>
+              {String(status?.metrics.falseAllowCount ?? 0)}
+            </Text>
           </SettingsRow>
           <SettingsRow
             label={t("status.auditDirLabel")}
@@ -228,6 +286,196 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
             actionLabel={t("status.refreshAction")}
             onPress={refreshStatus}
           />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title={t("act.section.title")}>
+        <SettingsCard>
+          <SettingsInput
+            label={t("act.minSamples")}
+            hint={t("act.minSamplesHint")}
+            initialValue={String(values.actGate.minSamples)}
+            disabled={settings.saving}
+            onChangeText={(text) =>
+              numberField(text, 20, 5000, (minSamples) =>
+                updateActGate({ minSamples }),
+              )
+            }
+          />
+          <SettingsInput
+            label={t("act.windowDays")}
+            hint={t("act.windowDaysHint")}
+            initialValue={String(values.actGate.windowDays)}
+            disabled={settings.saving}
+            onChangeText={(text) =>
+              numberField(text, 1, 365, (windowDays) =>
+                updateActGate({ windowDays }),
+              )
+            }
+          />
+          <SettingsSwitch
+            label={t("act.autoFallback")}
+            hint={t("act.autoFallbackHint")}
+            value={values.actGate.autoFallbackOnFalseAllow}
+            disabled={settings.saving}
+            onValueChange={(autoFallbackOnFalseAllow) =>
+              updateActGate({ autoFallbackOnFalseAllow })
+            }
+          />
+          <SettingsSwitch
+            label={t("act.allowOverride")}
+            hint={t("act.allowOverrideHint")}
+            value={values.actGate.allowOverride}
+            disabled={settings.saving}
+            onValueChange={(allowOverride) => updateActGate({ allowOverride })}
+          />
+          {values.actGate.allowOverride ? (
+            <>
+              <SettingsRow label={t("act.override.status")}>
+                <Text style={styles.metricValue}>{overrideStatusLabel}</Text>
+              </SettingsRow>
+              {values.actOverride.accepted ? (
+                <SettingsAction
+                  label={t("act.override.revoke")}
+                  actionLabel={t("act.override.revoke")}
+                  disabled={settings.saving}
+                  onPress={() => {
+                    setConfirmingOverride(false);
+                    update({
+                      actOverride: {
+                        accepted: false,
+                        acceptedAt: null,
+                        fingerprint: null,
+                      },
+                    });
+                  }}
+                />
+              ) : confirmingOverride ? (
+                <>
+                  <Text style={styles.notice}>{t("act.override.confirm")}</Text>
+                  <SettingsAction
+                    label={t("act.override.accept")}
+                    actionLabel={t("act.override.confirmAction")}
+                    disabled={settings.saving || !gate}
+                    onPress={() => {
+                      if (!gate) return;
+                      setConfirmingOverride(false);
+                      update({
+                        actOverride: {
+                          accepted: true,
+                          acceptedAt: new Date().toISOString(),
+                          fingerprint: gate.fingerprint,
+                        },
+                      });
+                    }}
+                  />
+                  <SettingsAction
+                    label={t("act.override.cancel")}
+                    actionLabel={t("act.override.cancel")}
+                    onPress={() => setConfirmingOverride(false)}
+                  />
+                </>
+              ) : (
+                <SettingsAction
+                  label={t("act.override.accept")}
+                  hint={t("act.override.acceptHint")}
+                  actionLabel={t("act.override.accept")}
+                  disabled={settings.saving || !gate}
+                  onPress={() => setConfirmingOverride(true)}
+                />
+              )}
+            </>
+          ) : null}
+        </SettingsCard>
+        <SettingsCard>
+          {gate ? (
+            <>
+              <SettingsRow label={t("act.status.state")}>
+                <Text style={styles.metricValue}>
+                  {t(`act.state.${gate.state}`)}
+                </Text>
+              </SettingsRow>
+              {gate.reason ? (
+                <SettingsRow label={t("act.status.reason")}>
+                  <Text style={styles.notice}>{gate.reason}</Text>
+                </SettingsRow>
+              ) : null}
+              <SettingsRow label={t("act.status.samples")}>
+                <Text
+                  style={styles.metricValue}
+                >{`${gate.samples} / ${gate.minSamples}`}</Text>
+              </SettingsRow>
+              <SettingsRow label={t("act.status.falseAllows")}>
+                <Text style={styles.metricValue}>
+                  {String(gate.falseAllowCount)}
+                </Text>
+              </SettingsRow>
+              <SettingsRow label={t("act.status.falseDenies")}>
+                <Text style={styles.metricValue}>
+                  {String(gate.falseDenyCount)}
+                </Text>
+              </SettingsRow>
+              <SettingsRow label={t("act.unconfirmed")}>
+                <Text style={styles.metricValue}>
+                  {String(gate.unconfirmedCount)}
+                </Text>
+              </SettingsRow>
+              <SettingsRow label={t("act.integrity")}>
+                <Text style={styles.metricValue}>
+                  {gate.entries.some((e) => e.kind === "corrupt_line")
+                    ? t("act.integrityBad")
+                    : t("act.integrityOk")}
+                </Text>
+              </SettingsRow>
+              <SettingsRow label={t("act.status.lastReplay")}>
+                <Text style={styles.metricValue}>
+                  {gate.lastReplayAt ?? t("act.status.never")}
+                </Text>
+              </SettingsRow>
+              <SettingsRow label={t("act.status.fingerprint")}>
+                <Text style={styles.metricValue}>
+                  {gate.fingerprint.slice(0, 8)}
+                </Text>
+              </SettingsRow>
+              {gate.entries.map((entry) => (
+                <SettingsAction
+                  key={entry.key}
+                  label={`${entryKindLabel(entry)}: ${entry.command ?? entry.requestId}`}
+                  hint={
+                    entry.effects.length > 0
+                      ? entry.effects.join(", ")
+                      : undefined
+                  }
+                  actionLabel={
+                    entry.kind === "corrupt_line"
+                      ? t("act.entries.acknowledge")
+                      : t("act.entries.annotate")
+                  }
+                  disabled={gateBusy}
+                  onPress={() =>
+                    runGateAction(() =>
+                      annotateGate({
+                        key: entry.key,
+                        annotation: "not_safety",
+                      }),
+                    )
+                  }
+                />
+              ))}
+            </>
+          ) : (
+            <SettingsRow label={t("act.status.title")}>
+              <Text style={styles.metricValue}>{t("status.loading")}</Text>
+            </SettingsRow>
+          )}
+          <SettingsAction
+            label={t("act.replay")}
+            hint={t("act.replayHint")}
+            actionLabel={t("act.replayAction")}
+            disabled={gateBusy}
+            onPress={() => runGateAction(() => replayGate({}))}
+          />
+          <Text style={styles.notice}>{t("act.help.pwshUnavailable")}</Text>
         </SettingsCard>
       </SettingsSection>
 

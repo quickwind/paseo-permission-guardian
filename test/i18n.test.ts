@@ -16,8 +16,12 @@ function collectLeafKeys(obj: Record<string, unknown>, prefix = ""): string[] {
 
 describe("client i18n translations", () => {
   it("provides complete zh translations matching every en key", () => {
-    const enKeys = collectLeafKeys(messages.resources.en as Record<string, unknown>);
-    const zhKeys = collectLeafKeys(messages.resources.zh as Record<string, unknown>);
+    const enKeys = collectLeafKeys(
+      messages.resources.en as Record<string, unknown>,
+    );
+    const zhKeys = collectLeafKeys(
+      messages.resources.zh as Record<string, unknown>,
+    );
 
     expect(enKeys.length).toBeGreaterThan(0);
     expect(zhKeys).toEqual(enKeys);
@@ -27,5 +31,41 @@ describe("client i18n translations", () => {
     const msg = messages.message("settings.title");
     expect(msg).toBeDefined();
     expect(typeof msg).toBe("object");
+  });
+
+  it("defines every act-mode key in en and zh", () => {
+    const required = [
+      "act.section.title",
+      "act.minSamples",
+      "act.windowDays",
+      "act.autoFallback",
+      "act.allowOverride",
+      "act.override.accept",
+      "act.override.confirm",
+      ...[
+        "replaying",
+        "unavailable",
+        "failed_false_allow",
+        "collecting",
+        "passed",
+        "latched",
+        "suspended",
+      ].map((s) => `act.state.${s}`),
+      "act.entries.annotate",
+      "act.entries.acknowledge",
+      "act.help.pwshUnavailable",
+      "act.unconfirmed",
+      "act.integrity",
+    ];
+    const enKeys = collectLeafKeys(
+      messages.resources.en as Record<string, unknown>,
+    );
+    const zhKeys = collectLeafKeys(
+      messages.resources.zh as Record<string, unknown>,
+    );
+    for (const key of required) {
+      expect(enKeys, key).toContain(key);
+      expect(zhKeys, key).toContain(key);
+    }
   });
 });
