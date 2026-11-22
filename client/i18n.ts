@@ -311,7 +311,7 @@ export const messages = defineTranslations({
           annotate: "不是安全问题",
           acknowledge: "确认",
           openChat: "打开对话",
-          gateHint: "在下列每个条目都被标记之前，门控将保持不可用。",
+          gateHint: "在下列每个条目都被标记之前，门槛将保持不可用。",
           kind: {
             false_allow: "误放行",
             orphan_deny: "未匹配的拒绝",
@@ -345,7 +345,7 @@ export const messages = defineTranslations({
         integrity: "审计完整性",
         integrityNormal: "正常",
         integritySep: "；",
-        integrityUnavailable: "门控不可用",
+        integrityUnavailable: "门槛不可用",
         integrityDetail: {
           orphan_deny: {
             one: "条未匹配的拒绝待处理",

@@ -132,7 +132,7 @@ describe("entry UX helpers", () => {
     );
     expect(integrityText(ok, t)).toBe("正常");
     expect(integrityText({ ...ok, state: "unavailable", entries: [e("orphan_deny")] }, t)).toBe(
-      "1 条未匹配的拒绝待处理；门控不可用",
+      "1 条未匹配的拒绝待处理；门槛不可用",
     );
   });
   it("open chat calls navigation.openAgent with the entry agentId, hidden without navigation", () => {
