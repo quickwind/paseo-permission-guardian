@@ -122,3 +122,10 @@ describe("F7 startup ordering", () => {
     }
   });
 });
+
+describe("F10 plugin version", () => {
+  it("PLUGIN_VERSION is read from package.json", async () => {
+    const mod = await import("../index.server.js");
+    expect(mod.PLUGIN_VERSION).toBe(pkg.version);
+  });
+});

@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import { resolvePaseoHomeRoots, resolvePaseoSelfRoots } from "../paths/index.js";
 
-/** Version of the persisted engine data layout. Bump when stored gate data changes shape. */
+/**
+ * Engine data version, part of the fingerprint. Bump it on ANY decision-affecting change — rules,
+ * command registry, path/secret classification, normalization or other classification code — as
+ * well as on any change to the shape of stored gate data, so a latch never outlives the engine
+ * that earned it.
+ */
 export const ENGINE_DATA_VERSION = 1;
 
 export interface FingerprintInput {

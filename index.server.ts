@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
@@ -13,7 +14,21 @@ import { PermissionGuardianService } from "./server/guardian.js";
 import { registerGateRpcs } from "./server/rpc-handlers.js";
 import { createIsolatedPwshHost, disposeSharedPwshHost } from "./server/shell/pwsh-host.js";
 
-const PLUGIN_VERSION = "0.1.0";
+/** Derived from package.json so the engine fingerprint follows releases (F10). */
+export const PLUGIN_VERSION: string = readPluginVersion();
+
+function readPluginVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as {
+      version?: unknown;
+    };
+    if (typeof pkg.version === "string" && pkg.version) return pkg.version;
+  } catch (error) {
+    console.error("[paseo-permission-guardian] Failed to read package.json version:", error);
+  }
+  // Unknown version: a distinct value so a fingerprint never matches a real release's latch.
+  return "0.0.0-unknown";
+}
 
 function resolveAuditDataDir(): string {
   const override = process.env.PASEO_GUARDIAN_DATA_DIR?.trim();
