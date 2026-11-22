@@ -69,6 +69,14 @@ describe("p2a control surface hardening", () => {
     "paseo --json agent send a hi",
   ])("paseo CLI control `%s` is L2", async (src) =>
     expect((await decideAction(bashExec(src), opts)).decision.level).toBe("L2"));
+  it("paseo CLI control in a cmd command is L2", async () => {
+    const r = await decideAction(
+      { ...base(), host: { os: "windows" }, kind: "exec", exec: { shell: "cmd", source: "paseo plugin reload x" } },
+      { ...opts, pathCtx: { cwd: "C:\\repo", worktreeRoot: "C:\\repo", home: "C:\\Users\\u", os: "windows" } },
+    );
+    expect(r.decision.level).toBe("L2");
+    expect(r.decision.effects?.some((e) => e.detail === "paseo_control")).toBe(true);
+  });
   it("sandbox bypass flag raises a benign command to L2", async () => {
     const r = await decideAction({ ...bashExec("ls"), sandboxBypass: true }, opts);
     expect(r.decision.level).toBe("L2");
