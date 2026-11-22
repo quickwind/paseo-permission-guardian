@@ -10,7 +10,7 @@ import type {
 import { AuditStore } from "./audit/store.js";
 import { SessionContextStore, type SessionState, type TimelineFetcher } from "./context/session.js";
 import { decideAction } from "./decide.js";
-import { resolvePaseoSelfRoots } from "./paths/index.js";
+import { buildDecideContext, buildDecidePathCtx } from "./decide-context.js";
 import { detectHostOs, normalizePermissionRequest } from "./normalize/index.js";
 
 export interface PluginAnsweredEntry {
@@ -123,12 +123,15 @@ export class PermissionGuardianService {
         includeRaw: this.settings.includeRawInAudit,
       });
 
-      const pathCtx = {
-        cwd: normalized.action.cwd,
-        worktreeRoot: normalized.action.worktreeRoot ?? payload.agent.cwd,
-        pluginDataDir: this.auditStore.getDataDir(),
-        paseoRoots: resolvePaseoSelfRoots(process.env, homedir(), this.auditStore.getDataDir()),
+      const ctxInput = {
+        action: normalized.action,
+        agentCwd: payload.agent.cwd,
+        dataDir: this.auditStore.getDataDir(),
+        home: homedir(),
+        env: process.env,
+        denyAsAsk: this.settings.denyAsAsk,
       };
+      const pathCtx = buildDecidePathCtx(ctxInput);
 
       // Incremental same-turn timeline sync for context-sensitive calls (ADR-0002)
       let contextUnavailable = false;
@@ -145,13 +148,10 @@ export class PermissionGuardianService {
         session = this.sessionStore.getOrCreate(payload.agent.id);
       }
 
-      const evaluated = await decideAction(normalized.action, {
-        pathCtx,
-        session,
-        contextUnavailable,
-        denyAsAsk: this.settings.denyAsAsk,
-        envSnapshot: process.env,
-      });
+      const evaluated = await decideAction(
+        normalized.action,
+        buildDecideContext({ ...ctxInput, session, contextUnavailable }),
+      );
 
       // Update live session context from this request's effects
       if (evaluated.touchedSecret) {

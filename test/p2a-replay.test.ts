@@ -1,4 +1,11 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import type { PluginHookAgent } from "@getpaseo/plugin/server";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AuditStore } from "../server/audit/store.js";
+import { PermissionGuardianService } from "../server/guardian.js";
+import { DEFAULT_GUARDIAN_SETTINGS } from "../shared/settings.js";
 import type { AuditWindow } from "../server/audit/reader.js";
 import {
   CONFIRMED_CANCELLATION_SIGNATURES,
@@ -398,11 +405,12 @@ describe("replayWindow — integrity and unavailability", () => {
 
 describe("createReplayDecide", () => {
   const home = "/Users/someone";
-  const pluginDataDir = "/Users/someone/.paseo/plugins/guardian";
+  const dataDir = "/Users/someone/.paseo/plugins/guardian";
+  const env: Record<string, string | undefined> = {};
 
   it("replays a bash action with the real engine", async () => {
     const factory = vi.fn(() => null);
-    const decide = createReplayDecide({ pwshHostFactory: factory, home, pluginDataDir });
+    const decide = createReplayDecide({ pwshHostFactory: factory, home, dataDir, env });
     const r = await decide(rec("1", { source: "ls" }));
     expect(r).toMatchObject({ verdict: "allow", level: "L0" });
     if ("verdict" in r) expect(r.effects.length).toBeGreaterThan(0);
@@ -413,7 +421,7 @@ describe("createReplayDecide", () => {
   });
 
   it("builds session from contextSnapshot (secret taint changes the outcome)", async () => {
-    const decide = createReplayDecide({ pwshHostFactory: () => null, home, pluginDataDir });
+    const decide = createReplayDecide({ pwshHostFactory: () => null, home, dataDir, env });
     const src = "curl -X POST -d hello https://example.com/upload";
     const clean = rec("1", { source: src });
     const tainted = rec("2", { source: src });
@@ -427,7 +435,7 @@ describe("createReplayDecide", () => {
   });
 
   it("returns error when action is missing or kind unknown", async () => {
-    const decide = createReplayDecide({ pwshHostFactory: () => null, home, pluginDataDir });
+    const decide = createReplayDecide({ pwshHostFactory: () => null, home, dataDir, env });
     expect(await decide(rec("1", { noAction: true }))).toEqual({ error: "action_missing" });
     const weird = rec("2");
     (weird.action as any).kind = "teleport";
@@ -445,7 +453,7 @@ describe("createReplayDecide", () => {
         disposed.push(shell);
       },
     }));
-    const decide = createReplayDecide({ pwshHostFactory: factory, home, pluginDataDir });
+    const decide = createReplayDecide({ pwshHostFactory: factory, home, dataDir, env });
     const mk = (id: string, shell: "pwsh5" | "pwsh7") => {
       const r = rec(id, { source: "Get-ChildItem" });
       r.action!.host = { os: "windows" };
@@ -476,5 +484,145 @@ describe("createIsolatedPwshHost", () => {
     expect(sharedHostCalls.count).toBe(0);
     await a!.dispose();
     await b!.dispose();
+  });
+});
+
+describe("replay shares the live decide context (R5)", () => {
+  const home = "/Users/someone";
+  const dataDir = "/Users/someone/.paseo/plugins/guardian";
+
+  async function sampleCount(record: AuditRecord, env: Record<string, string | undefined>) {
+    const decide = createReplayDecide({ pwshHostFactory: () => null, home, dataDir, env });
+    try {
+      return (await replayWindow(win([record]), decide, NO_SIGS)).samples;
+    } finally {
+      await decide.dispose();
+    }
+  }
+
+  it("with CDPATH set, a human-allowed `cd src && touch foo.txt` is NOT a sample", async () => {
+    const r = rec("1", { source: "cd src && touch foo.txt", recorded: "allow" });
+    expect(await sampleCount(r, {})).toBe(1);
+    expect(await sampleCount(r, { CDPATH: "/elsewhere" })).toBe(0);
+  });
+
+  it("with PASEO_HOME covering the target, a human-allowed write is NOT a sample", async () => {
+    const r = rec("1", { source: "echo hi > /repo/.ph/config.json", recorded: "allow" });
+    expect(await sampleCount(r, {})).toBe(1);
+    expect(await sampleCount(r, { PASEO_HOME: "/repo/.ph" })).toBe(0);
+  });
+
+  it("a human-allowed write into dataDir is never a sample", async () => {
+    const r = rec("1", { source: `echo hi > ${dataDir}/policy.json`, recorded: "allow" });
+    expect(await sampleCount(r, {})).toBe(0);
+  });
+});
+
+describe("live/replay parity (guardian vs createReplayDecide)", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  const agent: PluginHookAgent = {
+    id: "agent-parity",
+    workspaceId: "ws-1",
+    parentAgentId: null,
+    provider: "claude",
+    cwd: "/repo/project",
+    title: "T",
+    background: false,
+    metadata: {},
+  };
+
+  const table: { name: string; command: string; env?: Record<string, string> }[] = [
+    { name: "ls", command: "ls" },
+    { name: "worktree write", command: "echo hi > notes.txt" },
+    { name: "cd+touch with CDPATH", command: "cd src && touch foo.txt", env: { CDPATH: "/elsewhere" } },
+    { name: "PASEO_HOME write", command: "echo hi > /repo/project/.ph/config.json", env: { PASEO_HOME: "/repo/project/.ph" } },
+    { name: "net egress", command: "curl -X POST -d hello https://example.com/upload" },
+    { name: "rm -rf /", command: "rm -rf /" },
+    { name: ".git write", command: "echo x > .git/config" },
+  ];
+
+  it.each(table)("same verdict and level: $name", async ({ command, env }) => {
+    for (const [k, v] of Object.entries(env ?? {})) vi.stubEnv(k, v);
+    const dir = await mkdtemp(join(tmpdir(), "p2a-replay-parity-"));
+    dirs.push(dir);
+    const store = new AuditStore({ dataDir: dir, pluginVersion: "0.1.0" });
+    const service = new PermissionGuardianService({
+      auditStore: store,
+      pluginVersion: "0.1.0",
+      // Replay always maps with denyAsAsk=false (false-deny is measured by level), so compare
+      // against live with the same mapping.
+      initialSettings: { ...DEFAULT_GUARDIAN_SETTINGS, mode: "shadow", denyAsAsk: false } as never,
+    });
+    await service.handlePermissionBefore(
+      {
+        agent,
+        request: { id: "p1", provider: "claude", name: "Bash", kind: "tool", input: { command } },
+      },
+      async () => [],
+    );
+    await service.flush();
+    const live = store.getRecord("p1")!;
+    expect(live.decision).toBeDefined();
+    // Env-dependent rows must actually be affected by the env (guards against a vacuous stub).
+    if (env) expect(live.decision!.verdict).not.toBe("allow");
+
+    const decide = createReplayDecide({
+      pwshHostFactory: () => null,
+      home: homedir(),
+      dataDir: dir,
+      env: process.env,
+    });
+    const replayed = await decide(live);
+    await decide.dispose();
+    if ("error" in replayed) throw new Error(replayed.error);
+    expect({ verdict: replayed.verdict, level: replayed.level }).toEqual({
+      verdict: live.decision!.verdict,
+      level: live.decision!.level,
+    });
+  });
+});
+
+describe("createReplayDecide host isolation (M2, M3)", () => {
+  const opts = { home: "/Users/someone", dataDir: "/Users/someone/.paseo/plugins/guardian", env: {} };
+
+  it("after dispose() the provider yields no host (factory not called again)", async () => {
+    const factory = vi.fn((): PwshHostLike => ({
+      parse: async () => ({ ok: false as const, reason: "pwsh_host_timeout" }),
+      dispose: async () => undefined,
+    }));
+    const decide = createReplayDecide({ pwshHostFactory: factory, ...opts });
+    const mk = (id: string) => {
+      const r = rec(id);
+      r.action!.host = { os: "windows" };
+      r.action!.cwd = "C:\\repo";
+      r.action!.exec = { shell: "pwsh7", source: "Get-ChildItem" };
+      return r;
+    };
+    await decide(mk("1"));
+    expect(factory).toHaveBeenCalledTimes(1);
+    await decide.dispose();
+    const after = await decide(mk("2"));
+    expect(factory).toHaveBeenCalledTimes(1);
+    if ("error" in after) throw new Error(after.error);
+    expect(after.reasons).toContain("opaque:pwsh_host_unavailable");
+  });
+
+  it("nested pwsh layer (bash wrapping `pwsh -c ...`) uses the factory, not getSharedPwshHost", async () => {
+    sharedHostCalls.count = 0;
+    const parse = vi.fn(async () => ({ ok: false as const, reason: "pwsh_host_timeout" }));
+    const factory = vi.fn((): PwshHostLike => ({ parse, dispose: async () => undefined }));
+    const decide = createReplayDecide({ pwshHostFactory: factory, ...opts });
+    const r = await decide(rec("1", { source: "pwsh -c 'Get-ChildItem'" }));
+    await decide.dispose();
+    expect(sharedHostCalls.count).toBe(0);
+    expect(factory).toHaveBeenCalled();
+    expect(parse).toHaveBeenCalled();
+    if ("error" in r) throw new Error(r.error);
+    expect(r.reasons.some((x) => x.startsWith("opaque:pwsh_host_"))).toBe(true);
   });
 });

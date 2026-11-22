@@ -9,6 +9,7 @@ import type {
 import type { AuditWindow } from "../audit/reader.js";
 import type { SessionState } from "../context/session.js";
 import { decideAction } from "../decide.js";
+import { buildDecideContext } from "../decide-context.js";
 import type { PwshHostLike, PwshShellVariant } from "../shell/pwsh-host.js";
 
 /**
@@ -199,18 +200,26 @@ function sessionFromRecord(record: AuditRecord): SessionState {
 }
 
 /**
- * Real-engine ReplayDecide. Uses `skipHostRealpath` (no dependency on current filesystem state), a
- * fresh session built from the record's `contextSnapshot`, and replay-only PowerShell hosts from
- * `pwshHostFactory` (one cached per shell for the handle's lifetime; never the shared live host).
- * The returned function carries `dispose()` which disposes the cached hosts.
+ * Real-engine ReplayDecide. Options come from the same `buildDecideContext` as the live path (same
+ * env, home, data dir and therefore paseoRoots/CDPATH handling), plus `skipHostRealpath` (no
+ * dependency on current filesystem state), a fresh session built from the record's
+ * `contextSnapshot`, and replay-only PowerShell hosts from `pwshHostFactory` (one cached per shell
+ * for the handle's lifetime; never the shared live host). The returned function carries
+ * `dispose()`, which disposes the cached hosts; afterwards the provider yields no host (records then
+ * get the normal `opaque:pwsh_host_unavailable` result).
  */
 export function createReplayDecide(opts: {
   pwshHostFactory: (shell: PwshShellVariant) => PwshHostLike | null;
   home: string;
-  pluginDataDir: string;
+  /** Plugin data dir (same value the live path uses). */
+  dataDir: string;
+  /** Environment the live path uses (normally `process.env`). */
+  env: Record<string, string | undefined>;
 }): ReplayDecideHandle {
   const hosts = new Map<PwshShellVariant, PwshHostLike | null>();
+  let disposed = false;
   const provider = (shell: PwshShellVariant): PwshHostLike | null => {
+    if (disposed) return null;
     if (!hosts.has(shell)) hosts.set(shell, opts.pwshHostFactory(shell));
     return hosts.get(shell) ?? null;
   };
@@ -221,19 +230,19 @@ export function createReplayDecide(opts: {
     if (!KNOWN_KINDS.has(action.kind)) return { error: "unknown_action_kind" };
     if (!action.host || typeof action.cwd !== "string") return { error: "action_incomplete" };
     try {
-      const result = await decideAction(action, {
-        pathCtx: {
-          cwd: action.cwd,
-          worktreeRoot: action.worktreeRoot ?? action.cwd,
+      const result = await decideAction(
+        action,
+        buildDecideContext({
+          action,
+          dataDir: opts.dataDir,
           home: opts.home,
-          pluginDataDir: opts.pluginDataDir,
+          env: opts.env,
+          session: sessionFromRecord(record),
+          denyAsAsk: false,
           skipHostRealpath: true,
-          os: action.host.os,
-        },
-        session: sessionFromRecord(record),
-        denyAsAsk: false,
-        pwshHostProvider: provider,
-      });
+          pwshHostProvider: provider,
+        }),
+      );
       const d = result.decision;
       const effects = Array.from(
         new Set((d.effects ?? []).map((e) => (e.detail ? `${e.tag}:${e.detail}` : e.tag))),
@@ -246,6 +255,7 @@ export function createReplayDecide(opts: {
 
   const handle = decide as ReplayDecideHandle;
   handle.dispose = async () => {
+    disposed = true;
     const owned = Array.from(hosts.values()).filter((h): h is PwshHostLike => h !== null);
     hosts.clear();
     await Promise.all(owned.map((h) => h.dispose().catch(() => undefined)));

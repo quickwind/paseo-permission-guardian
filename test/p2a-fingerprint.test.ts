@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ENGINE_DATA_VERSION, computeFingerprint } from "../server/gate/fingerprint.js";
+import { ENGINE_DATA_VERSION, computeEnvDigest, computeFingerprint } from "../server/gate/fingerprint.js";
 import { type GateStateFile, readGateState, writeGateState } from "../server/gate/state-file.js";
 
 const dirs: string[] = [];
@@ -73,9 +73,48 @@ describe("computeFingerprint", () => {
     );
   });
 
+  it("changes when envDigest changes; undefined envDigest equals the 'none' marker", () => {
+    const d = computeEnvDigest({}, "/home/u", "/data");
+    expect(computeFingerprint({ ...base, envDigest: d })).not.toBe(computeFingerprint(base));
+    expect(computeFingerprint({ ...base, envDigest: "none" })).toBe(computeFingerprint(base));
+  });
+
   it("treats undefined policyHash the same as the builtin marker", () => {
     const { policyHash: _omit, ...rest } = base;
     expect(computeFingerprint(rest)).toBe(computeFingerprint({ ...base, policyHash: "builtin" }));
+  });
+});
+
+describe("computeEnvDigest", () => {
+  const home = "/home/u";
+  const dataDir = "/data";
+
+  it("is a stable sha256 hex digest", () => {
+    expect(computeEnvDigest({}, home, dataDir)).toMatch(/^[0-9a-f]{64}$/);
+    expect(computeEnvDigest({}, home, dataDir)).toBe(computeEnvDigest({}, home, dataDir));
+  });
+
+  it("changes with CDPATH presence but not its value", () => {
+    const none = computeEnvDigest({}, home, dataDir);
+    const a = computeEnvDigest({ CDPATH: "/a" }, home, dataDir);
+    expect(a).not.toBe(none);
+    expect(computeEnvDigest({ CDPATH: "/b" }, home, dataDir)).toBe(a);
+    expect(computeEnvDigest({ CDPATH: "" }, home, dataDir)).toBe(none);
+  });
+
+  it("changes with paseo self roots (PASEO_HOME, PASEO_PLUGIN_DIR, PASEO_GUARDIAN_DATA_DIR, home, dataDir)", () => {
+    const none = computeEnvDigest({}, home, dataDir);
+    expect(computeEnvDigest({ PASEO_HOME: "/ph" }, home, dataDir)).not.toBe(none);
+    expect(computeEnvDigest({ PASEO_PLUGIN_DIR: "/pp" }, home, dataDir)).not.toBe(none);
+    expect(computeEnvDigest({ PASEO_GUARDIAN_DATA_DIR: "/gd" }, home, dataDir)).not.toBe(none);
+    expect(computeEnvDigest({}, "/home/v", dataDir)).not.toBe(none);
+    expect(computeEnvDigest({}, home, "/data2")).not.toBe(none);
+  });
+
+  it("ignores unrelated environment variables", () => {
+    expect(computeEnvDigest({ PATH: "/bin", RANDOM_X: "1" }, home, dataDir)).toBe(
+      computeEnvDigest({}, home, dataDir),
+    );
   });
 });
 
