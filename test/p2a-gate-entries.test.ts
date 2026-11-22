@@ -466,4 +466,38 @@ describe("agent title resolution (entry UX)", () => {
     expect(store.getRecord("k")?.agentTitle).toBe("Kept");
     await store.flush();
   });
+
+  it("overlapping backfills share one in-flight lookup", async () => {
+    const { store, service } = await setup();
+    await service.handlePermissionAfter({ agent, requestId: "a", resolution: { behavior: "deny" } });
+    let calls = 0;
+    let release!: (t: string) => void;
+    const resolver = () => {
+      calls += 1;
+      return new Promise<string>((r) => (release = r));
+    };
+    const p1 = service.backfillAgentTitles(["a"], resolver);
+    const p2 = service.backfillAgentTitles(["a"], resolver);
+    release("Slow title");
+    await Promise.all([p1, p2]);
+    expect(calls).toBe(1);
+    expect(store.getRecord("a")?.agentTitle).toBe("Slow title");
+    await store.flush();
+  });
+
+  it("a never-resolving lookup times out, is cached as a failure and not retried", async () => {
+    const { store, service } = await setup();
+    service.agentTitleTimeoutMs = 20;
+    await service.handlePermissionAfter({ agent, requestId: "a", resolution: { behavior: "deny" } });
+    let calls = 0;
+    const resolver = () => {
+      calls += 1;
+      return new Promise<string>(() => {});
+    };
+    await service.backfillAgentTitles(["a"], resolver);
+    await service.backfillAgentTitles(["a"], resolver);
+    expect(calls).toBe(1);
+    expect(store.getRecord("a")?.agentTitle).toBeUndefined();
+    await store.flush();
+  });
 });

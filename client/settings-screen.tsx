@@ -567,15 +567,6 @@ export function GuardianSettingsScreen({
                 const details = entryDetails(entry);
                 return (
                   <View key={entry.key}>
-                    {canOpenChat(entry, navigation) ? (
-                      <SettingsAction
-                        label={t("act.entries.openChat")}
-                        actionLabel={t("act.entries.openChat")}
-                        onPress={() => {
-                          openEntryChat(entry, navigation);
-                        }}
-                      />
-                    ) : null}
                     <SettingsAction
                       label={`${entryKindLabel(entry)}: ${entryHeadline(entry)}`}
                       hint={details.length > 0 ? details : undefined}
@@ -590,6 +581,15 @@ export function GuardianSettingsScreen({
                         )
                       }
                     />
+                    {canOpenChat(entry, navigation) ? (
+                      <SettingsAction
+                        label={entryAgentLabel(entry) ?? ""}
+                        actionLabel={t("act.entries.openChat")}
+                        onPress={() => {
+                          openEntryChat(entry, navigation);
+                        }}
+                      />
+                    ) : null}
                   </View>
                 );
               })}

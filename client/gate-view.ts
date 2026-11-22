@@ -10,11 +10,6 @@ export function effectiveModeLabelKey(
   return "mode.effectiveValues.shadow";
 }
 
-/** Integrity is bad when the gate is unavailable or any entry is not a plain false allow. */
-export function hasIntegrityProblem(gate: Pick<GateStatus, "state" | "entries">): boolean {
-  return gate.state === "unavailable" || gate.entries.some((e) => e.kind !== "false_allow");
-}
-
 export type CountedKind = "orphan_deny" | "unevaluable_deny" | "corrupt_line";
 export const COUNTED_KINDS: readonly CountedKind[] = ["orphan_deny", "unevaluable_deny", "corrupt_line"];
 
@@ -57,7 +52,7 @@ export function integrityText(
     const word = t(`act.integrityDetail.${k}.${n === 1 ? "one" : "other"}`);
     return `${n} ${word}`;
   });
-  if (gate.state === "unavailable" && parts.length === 0) return t("act.integrityUnavailable");
+  if (gate.state === "unavailable") parts.push(t("act.integrityUnavailable"));
   if (parts.length === 0) return t("act.integrityNormal");
   return parts.join(t("act.integritySep"));
 }

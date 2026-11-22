@@ -6,7 +6,6 @@ import {
   entryAgentLabel,
   entryContentView,
   entryTime,
-  hasIntegrityProblem,
 } from "../client/gate-view.js";
 import { emptyGateStatus, type GateEntry } from "../shared/types.js";
 
@@ -17,14 +16,6 @@ describe("F8 client gate view helpers", () => {
     expect(effectiveModeLabelKey("act")).toBe("mode.effectiveValues.act");
     expect(effectiveModeLabelKey("off")).toBe("mode.effectiveValues.off");
     expect(effectiveModeLabelKey("shadow")).toBe("mode.effectiveValues.shadow");
-  });
-  it("integrity reflects unavailable state and any non-false_allow entry", () => {
-    const ok = emptyGateStatus();
-    expect(hasIntegrityProblem({ ...ok, entries: [e("false_allow")] })).toBe(false);
-    expect(hasIntegrityProblem({ ...ok, state: "unavailable" })).toBe(true);
-    for (const k of ["corrupt_line", "orphan_deny", "unevaluable_deny"] as const) {
-      expect(hasIntegrityProblem({ ...ok, entries: [e(k)] })).toBe(true);
-    }
   });
   it("corrupt lines are acknowledged; denials are annotated", () => {
     expect(entryActionLabelKey(e("corrupt_line"))).toBe("act.entries.acknowledge");
@@ -128,7 +119,10 @@ describe("entry UX helpers", () => {
       "1 unmatched denial needs review; 1 audit problem needs review",
     );
     expect(integrityText(ok, t)).toBe("Normal");
-    expect(integrityText({ ...ok, state: "unavailable" }, t)).toBe("The gate is unavailable");
+    expect(integrityText({ ...ok, state: "unavailable" }, t)).toBe("Gate unavailable");
+    expect(integrityText({ ...ok, state: "unavailable", entries: [e("orphan_deny")] }, t)).toBe(
+      "1 unmatched denial needs review; Gate unavailable",
+    );
   });
   it("integrity text: zh", () => {
     const t = translator("zh");
@@ -137,6 +131,9 @@ describe("entry UX helpers", () => {
       "1 条未匹配的拒绝待处理；1 条拒绝无法重新评估",
     );
     expect(integrityText(ok, t)).toBe("正常");
+    expect(integrityText({ ...ok, state: "unavailable", entries: [e("orphan_deny")] }, t)).toBe(
+      "1 条未匹配的拒绝待处理；门控不可用",
+    );
   });
   it("open chat calls navigation.openAgent with the entry agentId, hidden without navigation", () => {
     const calls: unknown[] = [];

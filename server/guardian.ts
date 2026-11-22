@@ -96,8 +96,10 @@ export class PermissionGuardianService {
   private readonly backfillAttempted = new Set<string>();
   /** Ids stored as `{ unavailable: true }` that backfill already retried once (this process). */
   private readonly unavailableRetried = new Set<string>();
-  /** agentId -> resolved title, or null when already attempted and unresolvable. */
-  private readonly agentTitles = new Map<string, string | null>();
+  /** agentId -> in-flight or settled title lookup (null = unresolvable); one lookup per agent. */
+  private readonly agentTitles = new Map<string, Promise<string | null>>();
+  /** Budget for one agent title lookup. */
+  agentTitleTimeoutMs = 3_000;
   private readonly pendingEnrichments = new Set<Promise<void>>();
 
   private settings: GuardianSettings;
@@ -416,19 +418,34 @@ export class PermissionGuardianService {
       const record = this.auditStore.getRecord(id);
       if (!record || record.agentTitle || !record.agentId) continue;
       const agentId = record.agentId;
-      let title = this.agentTitles.get(agentId);
-      if (title === undefined) {
+      if (!this.agentTitles.has(agentId)) {
         if (started >= MAX_BACKFILL_PER_CALL) continue;
         started += 1;
         if (this.agentTitles.size >= MAX_BACKFILL_TRACKED) this.agentTitles.clear();
-        try {
-          title = (await resolver(agentId))?.trim() || null;
-        } catch {
-          title = null;
-        }
-        this.agentTitles.set(agentId, title);
+        // Marker first: overlapping/later calls reuse the in-flight lookup and never start another.
+        this.agentTitles.set(agentId, this.lookupAgentTitle(resolver, agentId));
       }
+      const title = await this.agentTitles.get(agentId);
       if (title) this.auditStore.setAgentTitle(id, title);
+    }
+  }
+
+  /** Bounded lookup; failure or timeout resolves to null (cached, not retried). */
+  private async lookupAgentTitle(
+    resolver: (agentId: string) => Promise<string | undefined>,
+    agentId: string,
+  ): Promise<string | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), this.agentTitleTimeoutMs);
+      });
+      const title = await Promise.race([resolver(agentId), timeout]);
+      return title?.trim() || null;
+    } catch {
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

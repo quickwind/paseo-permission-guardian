@@ -157,11 +157,9 @@ export const messages = defineTranslations({
         },
         unconfirmed: "Unconfirmed automatic answers",
         integrity: "Audit integrity",
-        integrityOk: "No integrity problems",
-        integrityBad: "Problems found",
         integrityNormal: "Normal",
         integritySep: "; ",
-        integrityUnavailable: "The gate is unavailable",
+        integrityUnavailable: "Gate unavailable",
         integrityDetail: {
           orphan_deny: {
             one: "unmatched denial needs review",
@@ -345,8 +343,6 @@ export const messages = defineTranslations({
         validation: { range: "请输入允许范围内的整数（见提示）。" },
         unconfirmed: "未确认的自动应答",
         integrity: "审计完整性",
-        integrityOk: "没有完整性问题",
-        integrityBad: "发现问题",
         integrityNormal: "正常",
         integritySep: "；",
         integrityUnavailable: "门控不可用",

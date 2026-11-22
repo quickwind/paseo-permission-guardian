@@ -93,4 +93,19 @@ describe("F8 act-mode labels", () => {
     expect(en.act.autoFallbackOffWarning.length).toBeGreaterThan(20);
     expect(zh.act.autoFallbackOffWarning.length).toBeGreaterThan(5);
   });
+
+  it("has the entry UX keys in both locales", () => {
+    for (const locale of ["en", "zh"] as const) {
+      const keys = collectLeafKeys(messages.resources[locale] as Record<string, unknown>);
+      for (const k of [
+        "act.entries.openChat",
+        "act.entries.gateHint",
+        "act.counts.orphan_deny",
+        "act.counts.unevaluable_deny",
+        "act.counts.corrupt_line",
+      ]) {
+        expect(keys).toContain(k);
+      }
+    }
+  });
 });
