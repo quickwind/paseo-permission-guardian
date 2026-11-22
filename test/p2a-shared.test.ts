@@ -55,3 +55,11 @@ describe("p2a shared rpc", () => {
     expect(gateReplay.input.safeParse({}).success).toBe(true);
   });
 });
+
+describe("F9 unevaluable_deny entry kind", () => {
+  it("GateStatusSchema accepts an unevaluable_deny entry", async () => {
+    const { GateStatusSchema: S } = await import("../shared/rpc.js");
+    const st = { ...emptyGateStatus(), entries: [{ requestId: "r", effects: [], kind: "unevaluable_deny", key: "r" }] };
+    expect(S.safeParse(st).success).toBe(true);
+  });
+});

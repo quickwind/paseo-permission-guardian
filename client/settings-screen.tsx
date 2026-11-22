@@ -24,6 +24,7 @@ import type {
   GateStatus,
   GuardianStatusSnapshot,
 } from "../shared/types.js";
+import { effectiveModeLabelKey, entryActionLabelKey, hasIntegrityProblem } from "./gate-view.js";
 import { messages } from "./i18n.js";
 
 function NumberField(props: {
@@ -225,9 +226,7 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
       : t("act.override.active");
 
   const effectiveModeLabel = status
-    ? status.effectiveMode === "off"
-      ? t("mode.effectiveValues.off")
-      : t("mode.effectiveValues.shadow")
+    ? t(effectiveModeLabelKey(status.effectiveMode))
     : "...";
 
   return (
@@ -368,6 +367,11 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
               updateActGate({ autoFallbackOnFalseAllow })
             }
           />
+          {!values.actGate.autoFallbackOnFalseAllow ? (
+            <Text style={styles.errorText}>
+              {t("act.autoFallbackOffWarning")}
+            </Text>
+          ) : null}
           <SettingsSwitch
             label={t("act.allowOverride")}
             hint={t("act.allowOverrideHint")}
@@ -484,7 +488,7 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
               </SettingsRow>
               <SettingsRow label={t("act.integrity")}>
                 <Text style={styles.metricValue}>
-                  {gate.entries.some((e) => e.kind === "corrupt_line")
+                  {hasIntegrityProblem(gate)
                     ? t("act.integrityBad")
                     : t("act.integrityOk")}
                 </Text>
@@ -508,11 +512,7 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
                       ? entry.effects.join(", ")
                       : undefined
                   }
-                  actionLabel={
-                    entry.kind === "corrupt_line"
-                      ? t("act.entries.acknowledge")
-                      : t("act.entries.annotate")
-                  }
+                  actionLabel={t(entryActionLabelKey(entry))}
                   disabled={gateBusy}
                   onPress={() =>
                     runGateAction(() =>

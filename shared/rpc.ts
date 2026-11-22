@@ -23,7 +23,7 @@ export const GateEntrySchema = z.object({
   requestedAt: z.string().optional(),
   command: z.string().optional(),
   effects: z.array(z.string()),
-  kind: z.enum(["false_allow", "orphan_deny", "corrupt_line"]),
+  kind: z.enum(["false_allow", "orphan_deny", "corrupt_line", "unevaluable_deny"]),
   key: z.string(),
 });
 

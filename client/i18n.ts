@@ -9,7 +9,7 @@ export const messages = defineTranslations({
         resetHint: "Restore default Permission Guardian settings.",
         resetAction: "Reset",
         p0Notice:
-          "P0 runs in shadow-only mode. Deterministic AST rules and act mode arrive in P1a/P2.",
+          "Act mode only answers low-risk (L0) prompts with a one-time allow, only for agy, and only while the evidence gate allows it. Everything else stays with you.",
         loadStatusError: "Failed to load status",
       },
       sections: {
@@ -23,11 +23,12 @@ export const messages = defineTranslations({
         options: {
           shadow: "Shadow (observe & audit only)",
           off: "Off (disabled)",
-          act: "Act (available in P2, currently shadow)",
+          act: "Act (answer routine prompts once the evidence gate passes)",
         },
         effectiveValues: {
           shadow: "Shadow",
           off: "Off",
+          act: "Act",
         },
       },
       denyAsAsk: {
@@ -76,6 +77,8 @@ export const messages = defineTranslations({
         autoFallback: "Fall back to shadow on false allow",
         autoFallbackHint:
           "Stop answering automatically if a past auto-allow turned out unsafe.",
+        autoFallbackOffWarning:
+          "Auto-fallback is off: automatic answering continues even after a human denies a request the current rules would allow. Turn it back on unless you are reviewing every reported false allow.",
         allowOverride: "Allow gate override",
         allowOverrideHint:
           "Lets you accept act mode before the sample requirement is met.",
@@ -123,6 +126,7 @@ export const messages = defineTranslations({
             false_allow: "False allow",
             orphan_deny: "Unmatched denial",
             corrupt_line: "Audit problem",
+            unevaluable_deny: "Denial could not be re-evaluated",
           },
         },
         help: {
@@ -159,7 +163,7 @@ export const messages = defineTranslations({
         resetHint: "恢复权限守卫的默认配置。",
         resetAction: "重置",
         p0Notice:
-          "P0 阶段仅以影子模式运行，确定性 AST 规则与自动响应模式将在 P1a/P2 阶段提供。",
+          "自动应答模式只会对低风险（L0）请求做一次性允许，仅适用于 agy，且仅在证据门槛允许时生效。其余请求都由你决定。",
         loadStatusError: "加载状态失败",
       },
       sections: {
@@ -173,11 +177,12 @@ export const messages = defineTranslations({
         options: {
           shadow: "影子模式（仅观察与审计）",
           off: "关闭（已停用）",
-          act: "自动模式（P2 提供，当前按影子模式运行）",
+          act: "自动应答模式（证据门槛通过后自动应答常规请求）",
         },
         effectiveValues: {
           shadow: "影子模式",
           off: "已关闭",
+          act: "自动应答中",
         },
       },
       denyAsAsk: {
@@ -224,6 +229,8 @@ export const messages = defineTranslations({
         windowDaysHint: "仅统计最近这么多天内的决策（1-365）。",
         autoFallback: "出现误放行时回退到影子模式",
         autoFallbackHint: "如果过去的自动放行被证明不安全，则停止自动应答。",
+        autoFallbackOffWarning:
+          "自动回退已关闭：即使人工拒绝了当前规则会放行的请求，自动应答仍会继续。除非你会逐条审查报告的误放行，否则请重新开启。",
         allowOverride: "允许手动放行门槛",
         allowOverrideHint: "允许在样本数未达标时手动接受自动模式。",
         override: {
@@ -268,6 +275,7 @@ export const messages = defineTranslations({
             false_allow: "误放行",
             orphan_deny: "未匹配的拒绝",
             corrupt_line: "审计问题",
+            unevaluable_deny: "无法重新评估的拒绝",
           },
         },
         help: {

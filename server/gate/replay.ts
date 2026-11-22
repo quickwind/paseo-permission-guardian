@@ -145,7 +145,9 @@ export async function replayWindow(
 
       const replayed = await safeDecide(decide, record);
       if ("error" in replayed || hasHostFailure(replayed)) {
+        // Keyed by request id so a `not_safety` annotation (handled above) can acknowledge it (F9).
         unevaluable = true;
+        integrity.push(entry(record, "unevaluable_deny", []));
         continue;
       }
       if (replayed.verdict === "allow") {

@@ -198,7 +198,7 @@ export interface GateEntry {
   requestedAt?: string;
   command?: string;
   effects: string[];
-  kind: "false_allow" | "orphan_deny" | "corrupt_line";
+  kind: "false_allow" | "orphan_deny" | "corrupt_line" | "unevaluable_deny";
   key: string;
 }
 

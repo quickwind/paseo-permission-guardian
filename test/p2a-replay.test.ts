@@ -372,6 +372,21 @@ describe("replayWindow — integrity and unavailability", () => {
     }
   });
 
+  it("F9: an unevaluable human denial yields an unevaluable_deny entry keyed by request id", async () => {
+    const r = await replayWindow(win([rec("u9", { resolution: DENY })]), fake({ u9: { error: "x" } }), NO_SIGS);
+    expect(r.unavailableReason).toBe("human_deny_unevaluable");
+    expect(r.integrity).toEqual([
+      expect.objectContaining({ kind: "unevaluable_deny", key: "u9", requestId: "u9", command: "cmd-u9" }),
+    ]);
+    const annotated = await replayWindow(
+      win([rec("u9", { resolution: DENY })], { annotations: new Map([["u9", "not_safety"]]) }),
+      fake({ u9: { error: "x" } }),
+      NO_SIGS,
+    );
+    expect(annotated.unavailableReason).toBeNull();
+    expect(annotated.integrity).toEqual([]);
+  });
+
   it("human denial with an opaque:pwsh_host_* reason ⇒ human_deny_unevaluable", async () => {
     for (const reason of ["opaque:pwsh_host_timeout", "opaque:pwsh_host_circuit_open", "opaque:pwsh_host_unavailable"]) {
       const r = await replayWindow(

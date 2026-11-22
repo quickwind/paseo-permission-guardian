@@ -61,6 +61,9 @@ describe("client i18n translations", () => {
       "act.help.pwshUnavailable",
       "act.unconfirmed",
       "act.integrity",
+      "mode.effectiveValues.act",
+      "act.autoFallbackOffWarning",
+      "act.entries.kind.unevaluable_deny",
     ];
     const enKeys = collectLeafKeys(
       messages.resources.en as Record<string, unknown>,
@@ -72,5 +75,22 @@ describe("client i18n translations", () => {
       expect(enKeys, key).toContain(key);
       expect(zhKeys, key).toContain(key);
     }
+  });
+});
+
+describe("F8 act-mode labels", () => {
+  const en = messages.resources.en as any;
+  const zh = messages.resources.zh as any;
+  it("effective act mode has an Act label in en and zh", () => {
+    expect(en.mode.effectiveValues.act).toBe("Act");
+    expect(zh.mode.effectiveValues.act).toBe("自动应答中");
+  });
+  it("the act option no longer claims to be unavailable / currently shadow", () => {
+    expect(en.mode.options.act).not.toMatch(/P2|currently shadow/i);
+    expect(zh.mode.options.act).not.toMatch(/P2|当前按影子模式运行/);
+  });
+  it("has a warning for auto-fallback off", () => {
+    expect(en.act.autoFallbackOffWarning.length).toBeGreaterThan(20);
+    expect(zh.act.autoFallbackOffWarning.length).toBeGreaterThan(5);
   });
 });
