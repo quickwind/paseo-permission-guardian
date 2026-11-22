@@ -501,6 +501,15 @@ describe("ActResponder.attribute (§3.6)", () => {
     expect(gate.status().unconfirmedCount).toBe(1);
   });
 
+  it("M4: actOutcome is \"sent\" at mark time, before any after", async () => {
+    await setup();
+    await before(L0("r-sent"));
+    expect(answerer.calls).toHaveLength(1);
+    expect(store.getRecord("r-sent")?.actOutcome).toBe("sent");
+    await after("r-sent", { behavior: "allow", selectedActionId: "allow" });
+    expect(store.getRecord("r-sent")?.actOutcome).toBe("answered");
+  });
+
   it("attribution is one-shot (second identical after ⇒ human)", async () => {
     await setup();
     await before(L0("r-once"));
@@ -514,7 +523,7 @@ describe("ActResponder.attribute (§3.6)", () => {
     await before(L0("r-disp"));
     responder.dispose();
     vi.advanceTimersByTime(20_000);
-    expect(store.getRecord("r-disp")?.actOutcome).toBeUndefined();
+    expect(store.getRecord("r-disp")?.actOutcome).toBe("sent");
     expect(gate.status().unconfirmedCount).toBe(0);
   });
 });

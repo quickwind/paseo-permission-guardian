@@ -449,8 +449,11 @@ Added 2026-11-22; earlier sections are unchanged.
   also matches agy's own `allow` (it contains `all`). The implemented pattern treats `all` as a
   standalone word only; the other terms keep substring matching.
 - **R10 (replay samples).** Replay never counts a human-attributed allow whose `actOutcome` is
-  `unconfirmed` or `lost_race` as a sample (the outcome of the plugin's own answer is unclear, so the record is not trusted
-  as human evidence).
+  `sent`, `unconfirmed` or `lost_race` as a sample (the outcome of the plugin's own answer is
+  unclear, so the record is not trusted as human evidence). The responder writes `actOutcome: "sent"`
+  when it marks a request, before sending; the matching `after` replaces it (`answered`,
+  `lost_race`, `unconfirmed`), so `sent` remains only when no attribution happened (e.g. the plugin
+  was reloaded between the send and the `after`).
 - **R11 (Paseo self roots).** §3.9.4's literal `~/.paseo/**` also covers Paseo's default worktree
   location `~/.paseo/worktrees/...`, which made ordinary worktree edits L3 and repo `config.json`
   reads secret reads. For the Paseo home roots `~/.paseo` and `$PASEO_HOME` (POSIX and Windows,

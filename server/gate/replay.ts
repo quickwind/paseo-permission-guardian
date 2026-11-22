@@ -160,7 +160,10 @@ export async function replayWindow(
     if (resolution.behavior !== "allow" || resolution.actor !== "human") continue;
     if (!record.decision) continue; // orphan allow: nothing to replay, never a sample
     // R10: the plugin's own answer may be what landed, so the "human" allow is not evidence.
-    if (record.actOutcome === "unconfirmed" || record.actOutcome === "lost_race") continue;
+    // `sent` = a frame was sent but no attribution happened (e.g. plugin reloaded before `after`).
+    if (record.actOutcome === "unconfirmed" || record.actOutcome === "lost_race" || record.actOutcome === "sent") {
+      continue;
+    }
 
     const replayed = await safeDecide(decide, record);
     if ("error" in replayed) {

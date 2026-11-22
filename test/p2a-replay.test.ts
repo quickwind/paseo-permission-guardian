@@ -649,7 +649,7 @@ describe("replayWindow — R10 actOutcome exclusion", () => {
     return r;
   };
 
-  it.each(["unconfirmed", "lost_race"])("human allow with actOutcome %s is not a sample", async (o) => {
+  it.each(["unconfirmed", "lost_race", "sent"])("human allow with actOutcome %s is not a sample", async (o) => {
     const r = await replayWindow(win([withOutcome("1", o)]), fake({ "1": ok("allow") }), NO_SIGS);
     expect(r.samples).toBe(0);
   });

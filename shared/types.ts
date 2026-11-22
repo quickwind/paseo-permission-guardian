@@ -178,7 +178,8 @@ export type GateState =
   | "latched"
   | "suspended";
 
-export type ActOutcome = "answered" | "lost_race" | "unconfirmed" | "error" | "skipped";
+/** `sent` is written at mark time (before the send); a later `after` replaces it. */
+export type ActOutcome = "sent" | "answered" | "lost_race" | "unconfirmed" | "error" | "skipped";
 
 export interface OfferedAction {
   id: string;

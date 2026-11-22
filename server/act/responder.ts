@@ -125,6 +125,9 @@ export class ActResponder {
       mark.timer = setTimeout(() => this.onWindowElapsed(requestId, mark), this.windowMs);
       mark.timer.unref?.();
       this.marks.set(requestId, mark);
+      // M4: persist that a frame is being sent, so an `after` that arrives after a plugin reload
+      // (no in-memory mark ⇒ attributed human) is still excluded from replay samples.
+      this.store.setActOutcome(requestId, "sent");
 
       // 7. Fire-and-forget send.
       await answerer.respond(agentId, requestId, response);
