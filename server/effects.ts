@@ -24,6 +24,7 @@ import {
 } from "./secrets/patterns.js";
 import { analyzeShellLayers } from "./shell/layers.js";
 import type { PwshHostMode } from "./shell/pwsh.js";
+import type { PwshHostProvider } from "./shell/pwsh-host.js";
 import type { AssignmentFact, CommandFact, PipelineFact } from "./shell/types.js";
 
 export interface EffectAnalysisResult {
@@ -41,6 +42,8 @@ export interface EffectAnalysisOptions {
   trustedDomains?: string[];
   session?: SessionState;
   pwshHost?: PwshHostMode;
+  /** When set, PowerShell parsing uses these hosts instead of the shared host (replay isolation). */
+  pwshHostProvider?: PwshHostProvider;
   allowPosixPwshHost?: boolean;
   pwshBinaryPath?: string;
   envSnapshot?: Record<string, string | undefined>;
@@ -1821,6 +1824,7 @@ export async function analyzeActionEffects(
     home: options.pathCtx.home,
     depth: 0,
     pwshHost: options.pwshHost,
+    pwshHostProvider: options.pwshHostProvider,
     allowPosixPwshHost: options.allowPosixPwshHost,
     pwshBinaryPath: options.pwshBinaryPath,
     envSnapshot: options.envSnapshot ?? options.pathCtx.envSnapshot,

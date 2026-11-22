@@ -1,6 +1,7 @@
 import type { EffectTag, HostOs, Shell } from "../../shared/types.js";
 import type { SessionState } from "../context/session.js";
 import type { PwshHostMode } from "./pwsh.js";
+import type { PwshHostProvider } from "./pwsh-host.js";
 
 export interface RedirectionFact {
   operator: string;
@@ -57,6 +58,7 @@ export interface LayerContext {
   home?: string;
   depth: number;
   pwshHost?: PwshHostMode;
+  pwshHostProvider?: PwshHostProvider;
   allowPosixPwshHost?: boolean;
   pwshBinaryPath?: string;
   envSnapshot?: Record<string, string | undefined>;

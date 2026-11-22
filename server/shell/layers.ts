@@ -444,6 +444,7 @@ export async function analyzeShellLayers(
       worktreeRoot: ctx.worktreeRoot,
       home: ctx.home,
       pwshHostMode: ctx.pwshHost,
+      hostProvider: ctx.pwshHostProvider,
       allowPosixHost: ctx.allowPosixPwshHost,
       binaryPath: ctx.pwshBinaryPath,
       envSnapshot: ctx.envSnapshot,

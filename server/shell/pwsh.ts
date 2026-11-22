@@ -12,6 +12,7 @@ import { scanCmdPercentExpansions } from "./cmd.js";
 import {
   getSharedPwshHost,
   type PwshHostAstPayload,
+  type PwshHostProvider,
   type PwshHostCommand,
   type PwshHostOptions,
   type PwshShellVariant,
@@ -25,6 +26,8 @@ export interface PwshParseOptions extends PwshHostOptions {
   worktreeRoot?: string;
   home?: string;
   pwshHostMode?: PwshHostMode;
+  /** When set, used instead of the shared host (e.g. replay's isolated hosts). */
+  hostProvider?: PwshHostProvider;
   envSnapshot?: Record<string, string | undefined>;
   session?: SessionState;
 }
@@ -744,12 +747,14 @@ export async function parsePowerShell(
     return { commands, pipelines, effects, opaque, envReads: [], assignments, unescapedSources, cwdChanged };
   }
 
-  const host = getSharedPwshHost(shell, {
-    allowPosixHost: options.allowPosixHost,
-    binaryPath: options.binaryPath,
-    warmTimeoutMs: options.warmTimeoutMs,
-    coldTimeoutMs: options.coldTimeoutMs,
-  });
+  const host = options.hostProvider
+    ? options.hostProvider(shell)
+    : getSharedPwshHost(shell, {
+        allowPosixHost: options.allowPosixHost,
+        binaryPath: options.binaryPath,
+        warmTimeoutMs: options.warmTimeoutMs,
+        coldTimeoutMs: options.coldTimeoutMs,
+      });
   if (!host) {
     opaque.push("pwsh_host_unavailable");
     return { commands, pipelines, effects, opaque, envReads: [], assignments, unescapedSources, cwdChanged };

@@ -1359,6 +1359,28 @@ export class PwshParserHost {
   }
 }
 
+/** Minimal host surface used by the PowerShell parse path (lets replay inject isolated hosts). */
+export interface PwshHostLike {
+  parse(source: string): Promise<PwshHostResult>;
+  dispose(): Promise<void>;
+}
+
+export type PwshHostProvider = (shell: PwshShellVariant) => PwshHostLike | null;
+
+/**
+ * Create a new, unshared PowerShell parser host (own queue and circuit breaker). Not registered in
+ * the shared host map; the caller owns it and must `dispose()` it. Returns null when no verified
+ * binary is available.
+ */
+export function createIsolatedPwshHost(
+  shell: PwshShellVariant,
+  options?: PwshHostOptions,
+): PwshParserHost | null {
+  const bin = resolvePwshBinaryPath(shell, options);
+  if (!bin) return null;
+  return new PwshParserHost(shell, bin, options);
+}
+
 const sharedHosts = new Map<string, PwshParserHost>();
 
 export function getSharedPwshHost(
