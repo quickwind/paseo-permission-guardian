@@ -30,8 +30,9 @@ const DENIED_RE = /\b(?:denied|deny|rejected|reject|declined|permission|not allo
 
 type ToolCall = Extract<AgentTimelineItem, { type: "tool_call" }>;
 
+/** Redact the full text first (a token cut at the limit must not escape redaction), then truncate. */
 function clip(s: string): string {
-  return redactString(s.length > SUMMARY_MAX ? s.slice(0, SUMMARY_MAX) : s).slice(0, SUMMARY_MAX);
+  return redactString(s).slice(0, SUMMARY_MAX);
 }
 
 function safeJson(v: unknown): string {

@@ -94,6 +94,7 @@ export class PermissionGuardianService {
   private readonly responder: ActResponder | undefined;
   private readonly gitStateProvider: GitStateProvider;
   private readonly backfillAttempted = new Set<string>();
+  private readonly pendingEnrichments = new Set<Promise<void>>();
 
   private settings: GuardianSettings;
   private settingsInvalid = false;
@@ -348,11 +349,15 @@ export class PermissionGuardianService {
       // Display only: recover what an orphan human denial was about (never changes the gate).
       if (ctx?.fetchTimelineEntries && this.isOrphanHumanDeny(merged)) {
         this.backfillAttempted.add(merged.requestId);
-        await this.enrichOrphan(merged.requestId, merged.agentId, ctx.fetchTimelineEntries, {
-          allowUntimed: true,
-          ...(ctx.signal ? { signal: ctx.signal } : {}),
-          ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
-        });
+        // Background: the after hook must not wait for the timeline fetch.
+        this.trackEnrichment(
+          this.enrichOrphan(merged.requestId, merged.agentId, ctx.fetchTimelineEntries, {
+            allowUntimed: true,
+            ...(ctx.signal ? { signal: ctx.signal } : {}),
+            ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
+          }),
+          merged.requestId,
+        );
       }
     } catch (error) {
       console.error(
@@ -380,12 +385,32 @@ export class PermissionGuardianService {
       if (this.backfillAttempted.size >= MAX_BACKFILL_TRACKED) this.backfillAttempted.clear();
       this.backfillAttempted.add(id);
       started += 1;
-      try {
-        await this.enrichOrphan(id, record.agentId, fetcher, signal ? { signal } : {});
-      } catch (error) {
-        console.error(`[paseo-permission-guardian] orphan backfill failed for ${id}:`, error);
-      }
+      this.trackEnrichment(this.enrichOrphan(id, record.agentId, fetcher, signal ? { signal } : {}), id);
     }
+    await this.whenEnrichmentsIdle();
+  }
+
+  /** Resolves once every background orphan enrichment started so far has settled. */
+  async whenEnrichmentsIdle(): Promise<void> {
+    while (this.pendingEnrichments.size > 0) {
+      await Promise.all([...this.pendingEnrichments]);
+    }
+  }
+
+  private trackEnrichment(task: Promise<void>, requestId: string): void {
+    const tracked: Promise<void> = task
+      .catch((error) => {
+        console.error(`[paseo-permission-guardian] orphan enrichment failed for ${requestId}:`, error);
+        try {
+          this.auditStore.setOrphanContext(requestId, { unavailable: true });
+        } catch {
+          // display data only
+        }
+      })
+      .finally(() => {
+        this.pendingEnrichments.delete(tracked);
+      });
+    this.pendingEnrichments.add(tracked);
   }
 
   private isOrphanHumanDeny(record: AuditRecord): boolean {
@@ -419,6 +444,7 @@ export class PermissionGuardianService {
   }
 
   async flush(): Promise<void> {
+    await this.whenEnrichmentsIdle();
     await this.auditStore.flush();
   }
 

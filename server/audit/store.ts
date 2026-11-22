@@ -276,7 +276,7 @@ export class AuditStore {
       ...(input.offeredActions ? { offeredActions: input.offeredActions.map((o) => ({ ...o })) } : {}),
       ...(input.contextSnapshot ? { contextSnapshot: redactSnapshot(input.contextSnapshot) } : {}),
       ...(existing?.actOutcome ? { actOutcome: existing.actOutcome } : {}),
-      ...(existing?.orphanContext ? { orphanContext: existing.orphanContext } : {}),
+      // A record that gains a decision is no longer an orphan: its orphanContext is dropped.
       ...(hadResolutionFirst || existing?.outOfOrder ? { outOfOrder: true } : {}),
     };
 

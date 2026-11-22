@@ -156,6 +156,13 @@ describe("B: orphan tool-call matching", () => {
     const token = "ghp_" + "b".repeat(36);
     const m = matchOrphanToolCall([{ item: toolCall("c1", "canceled", `curl -H "x: ${token}"`), timestamp: iso(T0 - 1000) }], { resolvedAtMs: T0 });
     expect(m?.summary).not.toContain(token);
+    // M5: a token straddling the 200-char limit is redacted before truncation.
+    const straddle = matchOrphanToolCall(
+      [{ item: toolCall("c2", "canceled", `${"a".repeat(190)} ${token}`), timestamp: iso(T0 - 1000) }],
+      { resolvedAtMs: T0 },
+    );
+    expect(straddle?.summary).not.toContain("ghp_bbbb");
+    expect(straddle?.summary?.length).toBeLessThanOrEqual(200);
   });
 
   it("untimed entries are only used when allowed (live), never for backfill", () => {
@@ -231,6 +238,7 @@ describe("B: guardian enrichment", () => {
         },
       },
     );
+    await service.whenEnrichmentsIdle();
     expect(fetched).toEqual(["agent-1"]);
     expect(mergeEvents).toBe(1);
     const before = gate.status();
@@ -252,11 +260,13 @@ describe("B: guardian enrichment", () => {
       { agent, requestId: "o1", resolution: { behavior: "deny" } },
       { fetchTimelineEntries: async () => Promise.reject(new Error("boom")) },
     );
+    await service.whenEnrichmentsIdle();
     expect(store.getRecord("o1")?.orphanContext).toEqual({ unavailable: true });
     await service.handlePermissionAfter(
       { agent, requestId: "o2", resolution: { behavior: "deny" } },
       { fetchTimelineEntries: () => new Promise(() => {}), timeoutMs: 20 },
     );
+    await service.whenEnrichmentsIdle();
     expect(store.getRecord("o2")?.orphanContext).toEqual({ unavailable: true });
     // Allows and non-orphans are never enriched.
     await service.handlePermissionAfter(
@@ -264,6 +274,47 @@ describe("B: guardian enrichment", () => {
       { fetchTimelineEntries: async () => { throw new Error("must not be called"); } },
     );
     expect(store.getRecord("o3")?.orphanContext).toBeUndefined();
+    await store.flush();
+  });
+
+  it("the after hook does not wait for the timeline fetch (M4)", async () => {
+    const clock = { now: T0 + 60_000 };
+    const { store, service } = await setup(clock);
+    let release!: () => void;
+    const gateP = new Promise<void>((r) => {
+      release = r;
+    });
+    await service.handlePermissionAfter(
+      { agent, requestId: "slow", resolution: { behavior: "deny" } },
+      {
+        fetchTimelineEntries: async () => {
+          await gateP;
+          return [{ item: toolCall("c1", "canceled", "rm q"), timestamp: iso(T0 + 59_000) }];
+        },
+      },
+    );
+    expect(store.getRecord("slow")?.resolution?.behavior).toBe("deny");
+    expect(store.getRecord("slow")?.orphanContext).toBeUndefined();
+    release();
+    await service.flush();
+    expect(store.getRecord("slow")?.orphanContext).toMatchObject({ callId: "c1" });
+  });
+
+  it("a record that gains a decision drops its orphanContext (M6)", async () => {
+    const clock = { now: T0 };
+    const { store, service } = await setup(clock);
+    await service.handlePermissionAfter(
+      { agent, requestId: "late", resolution: { behavior: "deny" } },
+      { fetchTimelineEntries: async () => Promise.reject(new Error("x")) },
+    );
+    await service.whenEnrichmentsIdle();
+    expect(store.getRecord("late")?.orphanContext).toEqual({ unavailable: true });
+    await service.handlePermissionBefore({
+      agent,
+      request: { id: "late", provider: "agy", name: "Bash", kind: "tool", input: { command: "ls" } },
+    });
+    expect(store.getRecord("late")?.decision).toBeDefined();
+    expect(store.getRecord("late")?.orphanContext).toBeUndefined();
     await store.flush();
   });
 
