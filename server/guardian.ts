@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { emptyGateStatus } from "../shared/types.js";
 import type { PluginHookEvents } from "@getpaseo/plugin/server";
 import { DEFAULT_GUARDIAN_SETTINGS, type GuardianSettings } from "../shared/settings.js";
 import type {
@@ -84,6 +85,7 @@ export class PermissionGuardianService {
       effectiveMode: this.getEffectiveBaseMode() === "off" ? "off" : "shadow",
       dataDir: this.auditStore.getDataDir(),
       metrics: this.auditStore.getMetrics(),
+      gate: emptyGateStatus(),
     };
   }
 

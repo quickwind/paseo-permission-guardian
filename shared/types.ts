@@ -139,6 +139,9 @@ export interface AuditRecord {
   resolution?: AuditResolution;
   agreement: AgreementOutcome;
   outOfOrder?: boolean;
+  offeredActions?: OfferedAction[];
+  contextSnapshot?: ContextSnapshot;
+  actOutcome?: ActOutcome;
 }
 
 export interface AuditMetricsSummary {
@@ -160,7 +163,76 @@ export interface AuditMetricsSummary {
 export interface GuardianStatusSnapshot {
   pluginVersion: string;
   mode: GuardianMode;
-  effectiveMode: "off" | "shadow";
+  effectiveMode: "off" | "shadow" | "act";
   dataDir: string;
   metrics: AuditMetricsSummary;
+  gate: GateStatus;
+}
+
+export type GateState =
+  | "replaying"
+  | "unavailable"
+  | "failed_false_allow"
+  | "collecting"
+  | "passed"
+  | "latched"
+  | "suspended";
+
+export type ActOutcome = "answered" | "lost_race" | "unconfirmed" | "error" | "skipped";
+
+export interface OfferedAction {
+  id: string;
+  behavior: "allow" | "deny";
+}
+
+export interface ContextSnapshot {
+  secretTaint: boolean;
+  untrustedTaint: boolean;
+  modifiedEntrypoints: string[];
+  modifiedFiles: string[];
+  modifiedFilesTruncated: boolean;
+}
+
+export interface GateEntry {
+  requestId: string;
+  requestedAt?: string;
+  command?: string;
+  effects: string[];
+  kind: "false_allow" | "orphan_deny" | "corrupt_line";
+  key: string;
+}
+
+export interface GateStatus {
+  state: GateState;
+  reason: string;
+  samples: number;
+  minSamples: number;
+  falseAllowCount: number;
+  falseDenyCount: number;
+  entries: GateEntry[];
+  unconfirmedCount: number;
+  lastReplayAt: string | null;
+  fingerprint: string;
+  override: { valid: boolean; accepted: boolean; acceptedAt: string | null };
+  latched: boolean;
+  suspended: boolean;
+}
+
+/** Temporary placeholder until the gate is wired in (Task 8). */
+export function emptyGateStatus(): GateStatus {
+  return {
+    state: "collecting",
+    reason: "gate_not_initialized",
+    samples: 0,
+    minSamples: 200,
+    falseAllowCount: 0,
+    falseDenyCount: 0,
+    entries: [],
+    unconfirmedCount: 0,
+    lastReplayAt: null,
+    fingerprint: "",
+    override: { valid: false, accepted: false, acceptedAt: null },
+    latched: false,
+    suspended: false,
+  };
 }
