@@ -71,3 +71,56 @@ describe("N1 Windows Paseo roots resolve junction targets", () => {
     expect(r.touchedSecret).toBe(true);
   });
 });
+
+// N3 — cmd copy/move/ren judge sensitive and protected independently; %PASEO_*% macros expand.
+function cmdExec(source: string, env: Record<string, string> = {}): [Action, DecideOptions] {
+  const envSnapshot = { USERPROFILE: "C:\\Users\\u", ...env };
+  return [
+    {
+      provider: "claude",
+      agentId: "a",
+      requestId: "r",
+      toolName: "Bash",
+      host: { os: "windows" },
+      cwd: "C:\\repo",
+      worktreeRoot: "C:\\repo",
+      kind: "exec",
+      exec: { shell: "cmd", source },
+    },
+    {
+      denyAsAsk: false,
+      envSnapshot,
+      pathCtx: { os: "windows", cwd: "C:\\repo", worktreeRoot: "C:\\repo", home: "C:\\Users\\u", envSnapshot },
+    },
+  ];
+}
+
+describe("N3 cmd plugin-self writes and %PASEO_*% macros", () => {
+  it.each(["copy", "move", "ren"])("%s x C:\\Users\\u\\.paseo\\config.json is L3", async (verb) => {
+    const r = await decideAction(...cmdExec(`${verb} x C:\\Users\\u\\.paseo\\config.json`));
+    expect(r.decision.level, JSON.stringify(r.decision.reasons)).toBe("L3");
+  });
+  it("copy onto a plugin-self non-secret path is L3", async () => {
+    const r = await decideAction(...cmdExec("copy x C:\\Users\\u\\.paseo\\plugins\\p\\index.js"));
+    expect(r.decision.level, JSON.stringify(r.decision.reasons)).toBe("L3");
+  });
+  it("del %PASEO_HOME%\\config.json with PASEO_HOME set is L3", async () => {
+    const r = await decideAction(...cmdExec("del %PASEO_HOME%\\config.json", { PASEO_HOME: "D:\\ph" }));
+    expect(r.decision.level, JSON.stringify(r.decision.reasons)).toBe("L3");
+  });
+  it("copy x %PASEO_GUARDIAN_DATA_DIR%\\a.json with the var set is L3", async () => {
+    const r = await decideAction(
+      ...cmdExec("copy x %PASEO_GUARDIAN_DATA_DIR%\\a.json", { PASEO_GUARDIAN_DATA_DIR: "D:\\gd" }),
+    );
+    expect(r.decision.level, JSON.stringify(r.decision.reasons)).toBe("L3");
+  });
+  it("del %PASEO_HOME%\\config.json with PASEO_HOME unset stays opaque (not L0)", async () => {
+    const r = await decideAction(...cmdExec("del %PASEO_HOME%\\config.json"));
+    expect(r.decision.level).not.toBe("L0");
+    expect(JSON.stringify(r.decision)).toMatch(/dynamic_or_unexpanded_path/);
+  });
+  it("copy within the worktree stays L0-able (no regression)", async () => {
+    const r = await decideAction(...cmdExec("copy a.txt b.txt"));
+    expect(r.decision.level).not.toBe("L3");
+  });
+});

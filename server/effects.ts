@@ -631,10 +631,23 @@ const SAFE_PATH_ENV_MACROS = new Set([
 const WINDOWS_DESTRUCTIVE_ROOT_REGEX =
   /^[A-Za-z]:\\(?:windows(?:\\system32|\\syswow64)?|program files(?: \(x86\))?|users|programdata)?$/i;
 
+/** Paseo path vars are safe macros only when the env snapshot provides a value (N3). */
+const PASEO_PATH_ENV_MACROS = new Set(["PASEO_HOME", "PASEO_PLUGIN_DIR", "PASEO_GUARDIAN_DATA_DIR"]);
+
+function isSafePathMacro(name: string, env?: Record<string, string | undefined>): boolean {
+  if (SAFE_PATH_ENV_MACROS.has(name)) return true;
+  if (!PASEO_PATH_ENV_MACROS.has(name) || !env) return false;
+  for (const [k, v] of Object.entries(env)) {
+    if (k.toUpperCase() === name) return typeof v === "string" && v.trim() !== "";
+  }
+  return false;
+}
+
 function isDynamicOrUnexpandedPath(
   target: string,
   shell?: Shell,
   explicitDynamic?: boolean,
+  env?: Record<string, string | undefined>,
 ): boolean {
   if (explicitDynamic || target === "<dynamic>" || target === "[hashtable]") {
     return true;
@@ -646,7 +659,7 @@ function isDynamicOrUnexpandedPath(
     const percentVars = target.matchAll(/%([^%\r\n=]+)%/g);
     for (const m of percentVars) {
       const varName = m[1].trim().toUpperCase();
-      if (!SAFE_PATH_ENV_MACROS.has(varName)) {
+      if (!isSafePathMacro(varName, env)) {
         return true;
       }
     }
@@ -655,7 +668,7 @@ function isDynamicOrUnexpandedPath(
     const envRefs = target.matchAll(/\$env:([A-Za-z0-9_]+)|\$\{env:([^}]+)\}/gi);
     for (const m of envRefs) {
       const name = (m[1] ?? m[2] ?? "").trim().toUpperCase();
-      if (!SAFE_PATH_ENV_MACROS.has(name)) {
+      if (!isSafePathMacro(name, env)) {
         return true;
       }
     }
@@ -680,7 +693,7 @@ function classifyDeleteTargets(
     const target = typeof entry === "string" ? entry : entry.value;
     const isDyn = typeof entry === "string" ? false : Boolean(entry.dynamic);
 
-    if (isDynamicOrUnexpandedPath(target, cmd.layer, isDyn)) {
+    if (isDynamicOrUnexpandedPath(target, cmd.layer, isDyn, pathCtx.envSnapshot)) {
       effects.push({
         tag: "opaque",
         layer: cmd.depth,
@@ -1081,7 +1094,7 @@ function classifyPowerShellCmdlet(
 
     for (const item of targets) {
       const target = item.value;
-      if (isDynamicOrUnexpandedPath(target, cmd.layer, item.dynamic)) {
+      if (isDynamicOrUnexpandedPath(target, cmd.layer, item.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         continue;
@@ -1136,7 +1149,7 @@ function classifyPowerShellCmdlet(
             : [];
 
     for (const src of srcItems) {
-      if (isDynamicOrUnexpandedPath(src.value, cmd.layer, src.dynamic)) {
+      if (isDynamicOrUnexpandedPath(src.value, cmd.layer, src.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         continue;
@@ -1168,7 +1181,7 @@ function classifyPowerShellCmdlet(
     }
 
     for (const dest of destItems) {
-      if (isDynamicOrUnexpandedPath(dest.value, cmd.layer, dest.dynamic)) {
+      if (isDynamicOrUnexpandedPath(dest.value, cmd.layer, dest.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         continue;
@@ -1218,7 +1231,7 @@ function classifyPowerShellCmdlet(
 
     for (const wtItem of writeTargets) {
       const wt = wtItem.value;
-      if (isDynamicOrUnexpandedPath(wt, cmd.layer, wtItem.dynamic)) {
+      if (isDynamicOrUnexpandedPath(wt, cmd.layer, wtItem.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         continue;
@@ -1293,7 +1306,7 @@ function classifyPowerShellCmdlet(
       }
     }
     for (const outItem of collectPwshTargetsWithDynamic(cmd, ["OutFile"])) {
-      if (isDynamicOrUnexpandedPath(outItem.value, cmd.layer, outItem.dynamic)) {
+      if (isDynamicOrUnexpandedPath(outItem.value, cmd.layer, outItem.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({
           tag: "opaque",
@@ -1560,7 +1573,7 @@ function classifyWindowsBuiltins(
     const pos = cmd.argv.filter((a) => !a.startsWith("/"));
     const dest = pos[1];
     if (dest) {
-      if (isDynamicOrUnexpandedPath(dest, cmd.layer)) {
+      if (isDynamicOrUnexpandedPath(dest, cmd.layer, undefined, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         return true;
@@ -1583,7 +1596,7 @@ function classifyWindowsBuiltins(
     if (bin === "dir" || bin === "type") {
       const targets = cmd.argv.filter((a) => !a.startsWith("/"));
       for (const target of targets) {
-        if (isDynamicOrUnexpandedPath(target, cmd.layer)) {
+        if (isDynamicOrUnexpandedPath(target, cmd.layer, undefined, cmdPathCtx.envSnapshot)) {
           opaqueReasons.push("dynamic_or_unexpanded_path");
           effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
           continue;
@@ -1609,7 +1622,7 @@ function classifyWindowsBuiltins(
     if (bin === "copy" || bin === "move" || bin === "ren" || bin === "rename") {
       const pos = cmd.argv.filter((a) => !a.startsWith("/"));
       for (const target of pos) {
-        if (isDynamicOrUnexpandedPath(target, cmd.layer)) {
+        if (isDynamicOrUnexpandedPath(target, cmd.layer, undefined, cmdPathCtx.envSnapshot)) {
           opaqueReasons.push("dynamic_or_unexpanded_path");
           effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
           continue;
@@ -1622,11 +1635,16 @@ function classifyWindowsBuiltins(
         }
         const p = classifyPath(target, cmdPathCtx);
         emitWindowsPathAlerts(p, cmd.depth, effects, opaqueReasons);
+        // N3: sensitive and protected are judged independently (a positional may be the destination);
+        // plugin-self destinations must carry pluginSelf so they reach L3 like the pwsh path.
         if (p.isSensitive) effects.push({ tag: "read_secret", layer: cmd.depth, target: p.realPath });
-        else if (p.isProtected) effects.push({ tag: "write_protected", layer: cmd.depth, target: p.realPath });
-        else if (p.inWorktree) {
-          if (!uncertainRelative) effects.push({ tag: "write_worktree", layer: cmd.depth, target: p.realPath });
-        } else effects.push({ tag: "write_outside", layer: cmd.depth, target: p.realPath });
+        if (p.isProtected) {
+          effects.push({ tag: "write_protected", layer: cmd.depth, target: p.realPath, pluginSelf: p.isPluginSelf });
+        } else if (!p.isSensitive) {
+          if (p.inWorktree) {
+            if (!uncertainRelative) effects.push({ tag: "write_worktree", layer: cmd.depth, target: p.realPath });
+          } else effects.push({ tag: "write_outside", layer: cmd.depth, target: p.realPath });
+        }
       }
       return true;
     }
@@ -1912,7 +1930,7 @@ export async function analyzeActionEffects(
 
     for (const redir of cmd.redirections) {
       if (redir.target === "/dev/null" || redir.target.toUpperCase() === "NUL") continue;
-      if (isDynamicOrUnexpandedPath(redir.target, cmd.layer, redir.dynamic)) {
+      if (isDynamicOrUnexpandedPath(redir.target, cmd.layer, redir.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({
           tag: "opaque",
@@ -2207,7 +2225,7 @@ export async function analyzeActionEffects(
           if (outCandidate === "-" || outCandidate === "/dev/null" || outCandidate.toUpperCase() === "NUL") {
             continue;
           }
-          if (isDynamicOrUnexpandedPath(outCandidate, cmd.layer, outIsDyn)) {
+          if (isDynamicOrUnexpandedPath(outCandidate, cmd.layer, outIsDyn, cmdPathCtx.envSnapshot)) {
             opaqueReasons.push("dynamic_or_unexpanded_path");
             effects.push({
               tag: "opaque",
@@ -2250,7 +2268,7 @@ export async function analyzeActionEffects(
           !/^https?:\/\//i.test(candidate)
         ) {
           if (
-            isDynamicOrUnexpandedPath(candidate, cmd.layer, isDynArg) &&
+            isDynamicOrUnexpandedPath(candidate, cmd.layer, isDynArg, cmdPathCtx.envSnapshot) &&
             (arg.startsWith("@") || egress)
           ) {
             opaqueReasons.push("dynamic_or_unexpanded_path");
