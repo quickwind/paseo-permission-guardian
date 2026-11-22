@@ -157,6 +157,8 @@ export async function replayWindow(
     // Human allow. Only an explicit human actor counts (an `unknown` actor never adds samples).
     if (resolution.behavior !== "allow" || resolution.actor !== "human") continue;
     if (!record.decision) continue; // orphan allow: nothing to replay, never a sample
+    // R10: the plugin's own answer may be what landed, so the "human" allow is not evidence.
+    if (record.actOutcome === "unconfirmed" || record.actOutcome === "lost_race") continue;
 
     const replayed = await safeDecide(decide, record);
     if ("error" in replayed) {

@@ -10,6 +10,7 @@ import { decideAction } from "./server/decide.js";
 import { GateController } from "./server/gate/gate.js";
 import { createReplayDecide } from "./server/gate/replay.js";
 import { PermissionGuardianService } from "./server/guardian.js";
+import { registerGateRpcs } from "./server/rpc-handlers.js";
 import { createIsolatedPwshHost, disposeSharedPwshHost } from "./server/shell/pwsh-host.js";
 
 const PLUGIN_VERSION = "0.1.0";
@@ -121,6 +122,7 @@ export default function contribute(server: PluginServerContext) {
   });
 
   server.handle(getGuardianStatus, async () => guardian.getStatus());
+  registerGateRpcs(server, { gate, storeReady });
 
   server.handle(evaluateGuardianDryRun, async (input) => {
     const res = await decideAction(

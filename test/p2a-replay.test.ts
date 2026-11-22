@@ -626,3 +626,30 @@ describe("createReplayDecide host isolation (M2, M3)", () => {
     expect(r.reasons.some((x) => x.startsWith("opaque:pwsh_host_"))).toBe(true);
   });
 });
+
+describe("replayWindow — R10 actOutcome exclusion", () => {
+  const withOutcome = (id: string, outcome: string | undefined, res: Partial<AuditResolution> = {}) => {
+    const r = rec(id, { resolution: res });
+    if (outcome !== undefined) (r as { actOutcome?: string }).actOutcome = outcome;
+    return r;
+  };
+
+  it.each(["unconfirmed", "lost_race"])("human allow with actOutcome %s is not a sample", async (o) => {
+    const r = await replayWindow(win([withOutcome("1", o)]), fake({ "1": ok("allow") }), NO_SIGS);
+    expect(r.samples).toBe(0);
+  });
+
+  it.each(["answered", undefined])("human allow with actOutcome %s still counts", async (o) => {
+    const r = await replayWindow(win([withOutcome("1", o)]), fake({ "1": ok("allow") }), NO_SIGS);
+    expect(r.samples).toBe(1);
+  });
+
+  it("human deny with unconfirmed outcome still yields a false-allow", async () => {
+    const r = await replayWindow(
+      win([withOutcome("1", "unconfirmed", { behavior: "deny", selectedActionId: "deny_once" })]),
+      fake({ "1": ok("allow") }),
+      NO_SIGS,
+    );
+    expect(r.falseAllows).toHaveLength(1);
+  });
+});
