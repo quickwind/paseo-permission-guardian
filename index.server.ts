@@ -3,11 +3,14 @@ import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { evaluateGuardianDryRun, getGuardianStatus } from "./shared/rpc.js";
 import { DEFAULT_GUARDIAN_SETTINGS, guardianSettings } from "./shared/settings.js";
+import { ActResponder, type PermissionAnswerer } from "./server/act/responder.js";
 import { AuditStore } from "./server/audit/store.js";
 import type { TimelineFetcher } from "./server/context/session.js";
 import { decideAction } from "./server/decide.js";
+import { GateController } from "./server/gate/gate.js";
+import { createReplayDecide } from "./server/gate/replay.js";
 import { PermissionGuardianService } from "./server/guardian.js";
-import { disposeSharedPwshHost } from "./server/shell/pwsh-host.js";
+import { createIsolatedPwshHost, disposeSharedPwshHost } from "./server/shell/pwsh-host.js";
 
 const PLUGIN_VERSION = "0.1.0";
 
@@ -21,14 +24,35 @@ function resolveAuditDataDir(): string {
 
 export default function contribute(server: PluginServerContext) {
   const settingsHandle = server.registerSettings(guardianSettings);
+  const dataDir = resolveAuditDataDir();
   const auditStore = new AuditStore({
-    dataDir: resolveAuditDataDir(),
+    dataDir,
     pluginVersion: PLUGIN_VERSION,
   });
+  // The contribution must return its cleanup synchronously, so permission hooks are registered now
+  // but every permission handler awaits this load first (in-memory history before any merge).
+  const storeReady: Promise<void> = auditStore.loadFromDisk().catch((error) => {
+    console.error("[paseo-permission-guardian] Failed to load audit history:", error);
+  });
+  // The gate subscribes to auditStore.onMerged itself.
+  const gate = new GateController({
+    store: auditStore,
+    dataDir,
+    replayDecide: createReplayDecide({
+      pwshHostFactory: (shell) => createIsolatedPwshHost(shell),
+      env: process.env,
+      home: homedir(),
+      dataDir,
+    }),
+  });
+  const responder = new ActResponder({ gate, store: auditStore, now: () => Date.now() });
+  // Constructing the guardian configures the gate (safe shadow defaults until settings load).
   const guardian = new PermissionGuardianService({
     auditStore,
     pluginVersion: PLUGIN_VERSION,
     initialSettings: DEFAULT_GUARDIAN_SETTINGS,
+    gate,
+    responder,
   });
 
   // Load initial persisted settings asynchronously; keep safe shadow defaults until ready.
@@ -59,6 +83,7 @@ export default function contribute(server: PluginServerContext) {
   const removeBeforeHook = server.addHook(
     "agent.permission.before",
     async (payload, context) => {
+      await storeReady;
       const fetchTimeline: TimelineFetcher = async (agentId) => {
         const res = await context.paseo.agents.ref(agentId).timeline.refetch({
           direction: "tail",
@@ -67,11 +92,19 @@ export default function contribute(server: PluginServerContext) {
         });
         return res.entries.map((entry) => entry.item);
       };
-      await guardian.handlePermissionBefore(payload, fetchTimeline);
+      const answerer: PermissionAnswerer = {
+        respond: (agentId, requestId, response) =>
+          context.paseo.agents.ref(agentId).respondToPermission({ requestId, response }),
+      };
+      await guardian.handlePermissionBefore(payload, fetchTimeline, {
+        answerer,
+        signal: context.signal,
+      });
     },
   );
 
   const removeAfterHook = server.addHook("agent.permission.after", async (payload) => {
+    await storeReady;
     await guardian.handlePermissionAfter(payload);
   });
 
@@ -127,6 +160,8 @@ export default function contribute(server: PluginServerContext) {
     removeCloseAfterHook();
     removeArchiveAfterHook();
     await unsubscribeSettings();
+    responder.dispose();
+    await gate.dispose();
     await guardian.flush();
     await disposeSharedPwshHost();
   };

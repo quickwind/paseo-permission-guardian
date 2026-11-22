@@ -101,6 +101,21 @@ function emptyMetrics(): AuditMetricsSummary {
   };
 }
 
+/**
+ * Redacts only the path lists of a context snapshot. `redactValue` on the whole object would replace
+ * the boolean `secretTaint` (its key matches the sensitive-name pattern) with a marker, and replay
+ * would then read it as "not tainted".
+ */
+function redactSnapshot(snap: ContextSnapshot): ContextSnapshot {
+  return {
+    secretTaint: snap.secretTaint === true,
+    untrustedTaint: snap.untrustedTaint === true,
+    modifiedEntrypoints: redactValue([...snap.modifiedEntrypoints]),
+    modifiedFiles: redactValue([...snap.modifiedFiles]),
+    modifiedFilesTruncated: snap.modifiedFilesTruncated === true,
+  };
+}
+
 export class AuditStore {
   private readonly dataDir: string;
   private readonly pluginVersion: string;
@@ -244,7 +259,7 @@ export class AuditStore {
       resolution: existing?.resolution,
       agreement: computeAgreement(redactedDecision, existing?.resolution),
       ...(input.offeredActions ? { offeredActions: input.offeredActions.map((o) => ({ ...o })) } : {}),
-      ...(input.contextSnapshot ? { contextSnapshot: redactValue(input.contextSnapshot) } : {}),
+      ...(input.contextSnapshot ? { contextSnapshot: redactSnapshot(input.contextSnapshot) } : {}),
       ...(existing?.actOutcome ? { actOutcome: existing.actOutcome } : {}),
       ...(hadResolutionFirst || existing?.outOfOrder ? { outOfOrder: true } : {}),
     };

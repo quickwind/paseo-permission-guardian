@@ -2,15 +2,21 @@ import { homedir } from "node:os";
 import { emptyGateStatus } from "../shared/types.js";
 import type { PluginHookEvents } from "@getpaseo/plugin/server";
 import { DEFAULT_GUARDIAN_SETTINGS, type GuardianSettings } from "../shared/settings.js";
+import type { AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type {
+  ContextSnapshot,
   GuardianStatusSnapshot,
   GuardianVerdict,
+  OfferedAction,
   ResolutionActor,
 } from "../shared/types.js";
+import type { ActResponder, PermissionAnswerer } from "./act/responder.js";
 import { AuditStore } from "./audit/store.js";
 import { SessionContextStore, type SessionState, type TimelineFetcher } from "./context/session.js";
 import { decideAction } from "./decide.js";
 import { buildDecideContext, buildDecidePathCtx } from "./decide-context.js";
+import { computeEnvDigest, computeFingerprint } from "./gate/fingerprint.js";
+import type { GateController } from "./gate/gate.js";
 import { detectHostOs, normalizePermissionRequest } from "./normalize/index.js";
 
 export interface PluginAnsweredEntry {
@@ -25,6 +31,29 @@ export interface GuardianServiceOptions {
   sessionStore?: SessionContextStore;
   answeredTtlMs?: number;
   now?: () => number;
+  /** Evidence gate (act mode). Absent ⇒ shadow-only behaviour. */
+  gate?: GateController;
+  /** Act responder. Absent ⇒ never answers; legacy plugin-mark attribution. */
+  responder?: ActResponder;
+}
+
+export interface PermissionBeforeContext {
+  answerer?: PermissionAnswerer;
+  signal?: AbortSignal;
+}
+
+const SNAPSHOT_MAX_MODIFIED_FILES = 200;
+
+/** Spec §3.7: session state as seen by the decision (taken before this request's own updates). */
+export function buildContextSnapshot(session: SessionState): ContextSnapshot {
+  const files = [...session.modifiedFiles];
+  return {
+    secretTaint: session.secretTaint,
+    untrustedTaint: session.untrustedTaint,
+    modifiedEntrypoints: [...session.modifiedEntrypoints],
+    modifiedFiles: files.slice(0, SNAPSHOT_MAX_MODIFIED_FILES),
+    modifiedFilesTruncated: files.length > SNAPSHOT_MAX_MODIFIED_FILES,
+  };
 }
 
 const DEFAULT_ANSWERED_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -37,6 +66,8 @@ export class PermissionGuardianService {
   private readonly answeredTtlMs: number;
   private readonly now: () => number;
   private readonly answeredByPlugin = new Map<string, PluginAnsweredEntry>();
+  private readonly gate: GateController | undefined;
+  private readonly responder: ActResponder | undefined;
 
   private settings: GuardianSettings;
   private settingsInvalid = false;
@@ -49,12 +80,16 @@ export class PermissionGuardianService {
     this.answeredTtlMs = options.answeredTtlMs ?? DEFAULT_ANSWERED_TTL_MS;
     this.now = options.now ?? (() => Date.now());
     this.settings = options.initialSettings ?? DEFAULT_GUARDIAN_SETTINGS;
+    this.gate = options.gate;
+    this.responder = options.responder;
+    this.configureGate();
   }
 
   updateSettings(next: GuardianSettings): void {
     this.settings = next;
     this.settingsInvalid = false;
     this.settingsInvalidReason = null;
+    this.configureGate();
   }
 
   getSettings(): GuardianSettings {
@@ -68,6 +103,30 @@ export class PermissionGuardianService {
   markSettingsInvalid(reason: string): void {
     this.settingsInvalid = true;
     this.settingsInvalidReason = reason;
+    this.configureGate();
+  }
+
+  private configureGate(): void {
+    if (!this.gate) return;
+    try {
+      const dataDir = this.auditStore.getDataDir();
+      const fingerprint = computeFingerprint({
+        pluginVersion: this.pluginVersion,
+        policyHash: null,
+        denyAsAsk: this.settings.denyAsAsk,
+        windowsDefaultShell: this.settings.windowsDefaultShell,
+        envDigest: computeEnvDigest(process.env, homedir(), dataDir),
+      });
+      this.gate.configure({
+        settings: this.settings,
+        settingsValid: !this.settingsInvalid,
+        settingsInvalidReason: this.settingsInvalidReason,
+        fingerprint,
+      });
+    } catch (error) {
+      // The gate stays in its previous (or unconfigured ⇒ shadow) state.
+      console.error("[paseo-permission-guardian] gate configure failed:", error);
+    }
   }
 
   getSettingsInvalidReason(): string | null {
@@ -82,10 +141,14 @@ export class PermissionGuardianService {
     return {
       pluginVersion: this.pluginVersion,
       mode: this.settings.mode,
-      effectiveMode: this.getEffectiveBaseMode() === "off" ? "off" : "shadow",
+      effectiveMode: this.gate
+        ? this.gate.effectiveMode()
+        : this.getEffectiveBaseMode() === "off"
+          ? "off"
+          : "shadow",
       dataDir: this.auditStore.getDataDir(),
       metrics: this.auditStore.getMetrics(),
-      gate: emptyGateStatus(),
+      gate: this.gate ? this.gate.status() : emptyGateStatus(),
     };
   }
 
@@ -107,6 +170,7 @@ export class PermissionGuardianService {
   async handlePermissionBefore(
     payload: PluginHookEvents["agent.permission.before"],
     fetchTimeline?: TimelineFetcher,
+    ctx?: PermissionBeforeContext,
   ): Promise<void> {
     if (this.settings.mode === "off") {
       return;
@@ -148,6 +212,9 @@ export class PermissionGuardianService {
         session = this.sessionStore.getOrCreate(payload.agent.id);
       }
 
+      // Spec §3.7: snapshot before decideAction and before this request's own taint updates.
+      const contextSnapshot = buildContextSnapshot(session);
+
       const evaluated = await decideAction(
         normalized.action,
         buildDecideContext({ ...ctxInput, session, contextUnavailable }),
@@ -167,6 +234,8 @@ export class PermissionGuardianService {
       }
 
       const latencyMs = Math.max(0, this.now() - startedAt);
+      const offeredActions: OfferedAction[] =
+        payload.request.actions?.map((a) => ({ id: a.id, behavior: a.behavior })) ?? [];
 
       await this.auditStore.recordBefore({
         requestId: payload.request.id,
@@ -179,7 +248,21 @@ export class PermissionGuardianService {
         warnings: normalized.warnings,
         action: normalized.action,
         decision: evaluated.decision,
+        offeredActions,
+        contextSnapshot,
       });
+
+      // Spec §3.5: act path (recordBefore above is memory-first; disk append is queued).
+      if (this.responder && ctx?.answerer) {
+        await this.responder.maybeAnswer({
+          agentId: payload.agent.id,
+          request: payload.request,
+          decision: evaluated.decision,
+          kind: normalized.action.kind,
+          answerer: ctx.answerer,
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+      }
     } catch (error) {
       // Fail-to-human invariant: never auto-allow, never auto-deny, never break Paseo hook delivery.
       console.error(
@@ -197,7 +280,7 @@ export class PermissionGuardianService {
     }
 
     try {
-      const actor = this.resolveActor(payload.requestId);
+      const actor = this.resolveActor(payload.requestId, payload.resolution);
       await this.auditStore.recordAfter({
         requestId: payload.requestId,
         agentId: payload.agent.id,
@@ -232,7 +315,8 @@ export class PermissionGuardianService {
     await this.auditStore.flush();
   }
 
-  private resolveActor(requestId: string): ResolutionActor {
+  private resolveActor(requestId: string, resolution: AgentPermissionResponse): ResolutionActor {
+    if (this.responder) return this.responder.attribute(requestId, resolution);
     this.evictExpiredAnswers();
     const entry = this.answeredByPlugin.get(requestId);
     if (entry) {
