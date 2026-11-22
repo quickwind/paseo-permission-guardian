@@ -616,7 +616,9 @@ notifications. Timeout ⇒ normal human flow. The plugin detects and prefers it 
   options), `contextSnapshot` (taint flags, modified entrypoints/files before the decision, paths
   redacted, files capped at 200 with a truncation flag, `contextUnavailable` when the timeline
   could not be synced, and `deleteTargetsClean` — per non-recursive worktree delete target, keyed
-  by the redacted target, whether it was tracked and clean in git at decision time, ADR-0009), and `actOutcome` (`sent | answered | unconfirmed | lost_race | error`;
+  by the redacted target, whether it was tracked and clean in git at decision time, ADR-0009),
+  `agentTitle` (from the hook payload, redacted, on both `before` and `after` records),
+  `orphanContext` (display-only timeline recovery for orphan human denials, see §13.2), and `actOutcome` (`sent | answered | unconfirmed | lost_race | error`;
   `skipped` exists in the type but is never written). Lines for the same `requestId` merge
   field-wise: a later line's defined values win and missing fields never erase earlier ones.
   Every unparsable line is a corrupt line, including a crash-truncated final line.
@@ -639,7 +641,18 @@ be ~0 before `act`), latency p50/p95, opaque rate per shell.
 **Gate metrics (P2a).** `guardian.status` returns `effectiveMode` and a `gate` object: state
 (`replaying | unavailable | failed_false_allow | collecting | passed | latched | suspended`), reason,
 samples x/`minSamples`, false-allow and false-deny counts, up to 5 unannotated entries, unconfirmed
-act-answer count, integrity issues, last replay time, short fingerprint, override info. Over the last
+act-answer count, integrity issues, last replay time, short fingerprint, override info. Each entry
+carries enough to judge it (`server/gate/entry.ts`, display fields re-read from the latest record
+on every status): requested/resolved time, provider, agent id and title, tool name, a summary (exec
+source ≤200 chars, paths, URL, or MCP `server:tool`), per-sub-command effects, and the human's
+resolution (behavior, selected option, message). For an orphan human denial the `after` hook
+best-effort recovers the matching tool call from the agent timeline (same tail/wholeTurns query as
+the `before` hook, 3 s budget, hook signal; prefers a denied, then failed/canceled, then running
+call nearest before `resolvedAt` within 10 minutes) and stores `orphanContext: { toolName,
+summary, callId, matchedBy }` or `{ unavailable: true }` via an `update` event. This is display
+data only: it never notifies the gate, and orphans keep the gate `unavailable` until annotated.
+`guardian.status` also triggers a non-blocking backfill for orphans without `orphanContext`
+(once per id per process, at most 5 per call; untimed timeline items are not used). Over the last
 `windowDays`, a sample is a human-resolved request the current engine judges `allow`; a false-allow
 is a human denial of such a request (any non-plugin `deny` counts unless it matches a confirmed
 cancellation signature, initially none); a false-deny is a human allow of a request the engine

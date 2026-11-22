@@ -7,6 +7,11 @@ import { DEFAULT_GUARDIAN_SETTINGS, guardianSettings } from "./shared/settings.j
 import { ActResponder, type PermissionAnswerer } from "./server/act/responder.js";
 import { AuditStore } from "./server/audit/store.js";
 import type { TimelineFetcher } from "./server/context/session.js";
+import { createGitStateProvider } from "./server/context/git-state.js";
+import type { TimelineEntriesFetcher } from "./server/context/orphan-context.js";
+import type { PluginHandlerContext } from "@getpaseo/plugin/server";
+
+type PaseoApi = PluginHandlerContext["paseo"];
 import { decideAction } from "./server/decide.js";
 import { GateController } from "./server/gate/gate.js";
 import { createReplayDecide } from "./server/gate/replay.js";
@@ -26,6 +31,18 @@ function resolveAuditDataDir(): string {
     return override;
   }
   return join(homedir(), ".paseo", "permission-guardian", "audit");
+}
+
+/** Latest turn(s) with timestamps — the same query as the before-hook timeline fetcher. */
+function timelineEntriesFetcher(paseo: PaseoApi): TimelineEntriesFetcher {
+  return async (agentId) => {
+    const res = await paseo.agents.ref(agentId).timeline.refetch({
+      direction: "tail",
+      limit: 1,
+      wholeTurns: true,
+    });
+    return res.entries.map((entry) => ({ item: entry.item, timestamp: entry.timestamp }));
+  };
 }
 
 export default function contribute(server: PluginServerContext) {
@@ -55,7 +72,9 @@ export default function contribute(server: PluginServerContext) {
   // F7: the gate stays unconfigured (⇒ shadow, no replay, no latch side effects) until BOTH the
   // audit history and the first real settings read (ready or invalid) have completed; configuring
   // with defaults first could clear a latch bound to the stored settings' fingerprint.
+  const gitStateProvider = createGitStateProvider();
   const guardian = new PermissionGuardianService({
+    gitStateProvider,
     auditStore,
     pluginVersion: PLUGIN_VERSION,
     initialSettings: DEFAULT_GUARDIAN_SETTINGS,
@@ -114,9 +133,12 @@ export default function contribute(server: PluginServerContext) {
     },
   );
 
-  const removeAfterHook = server.addHook("agent.permission.after", async (payload) => {
+  const removeAfterHook = server.addHook("agent.permission.after", async (payload, context) => {
     await storeReady;
-    await guardian.handlePermissionAfter(payload);
+    await guardian.handlePermissionAfter(payload, {
+      fetchTimelineEntries: timelineEntriesFetcher(context.paseo),
+      signal: context.signal,
+    });
   });
 
   const removeTurnAfterHook = server.addHook("agent.turn.after", async (payload) => {
@@ -131,7 +153,19 @@ export default function contribute(server: PluginServerContext) {
     guardian.handleAgentClosed(payload.agent.id);
   });
 
-  server.handle(getGuardianStatus, async () => guardian.getStatus());
+  server.handle(getGuardianStatus, async (_input, context) => {
+    const status = guardian.getStatus();
+    // One-off, bounded, non-blocking backfill of orphan denials that lack recovered context.
+    const orphanIds = status.gate.entries
+      .filter((e) => e.kind === "orphan_deny" && !e.orphanContext)
+      .map((e) => e.requestId);
+    if (orphanIds.length > 0) {
+      void storeReady
+        .then(() => guardian.backfillOrphanContexts(orphanIds, timelineEntriesFetcher(context.paseo)))
+        .catch((error) => console.error("[paseo-permission-guardian] orphan backfill failed:", error));
+    }
+    return status;
+  });
   registerGateRpcs(server, { gate, storeReady });
 
   server.handle(evaluateGuardianDryRun, async (input) => {
@@ -155,6 +189,7 @@ export default function contribute(server: PluginServerContext) {
           home: input.home ?? (input.hostOs === "windows" ? "C:\\Users\\user" : homedir()),
         },
         denyAsAsk: guardian.getSettings().denyAsAsk,
+        gitStateProvider,
       },
     );
     return {

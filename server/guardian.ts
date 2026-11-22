@@ -4,6 +4,7 @@ import type { PluginHookEvents } from "@getpaseo/plugin/server";
 import { DEFAULT_GUARDIAN_SETTINGS, type GuardianSettings } from "../shared/settings.js";
 import type { AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type {
+  AuditRecord,
   ContextSnapshot,
   GuardianStatusSnapshot,
   GuardianVerdict,
@@ -13,6 +14,7 @@ import type {
 import type { ActResponder, PermissionAnswerer } from "./act/responder.js";
 import { AuditStore } from "./audit/store.js";
 import { createGitStateProvider, type GitStateProvider } from "./context/git-state.js";
+import { recoverOrphanContext, type TimelineEntriesFetcher } from "./context/orphan-context.js";
 import { SessionContextStore, type SessionState, type TimelineFetcher } from "./context/session.js";
 import { decideAction } from "./decide.js";
 import { buildDecideContext, buildDecidePathCtx } from "./decide-context.js";
@@ -51,6 +53,18 @@ export interface PermissionBeforeContext {
   signal?: AbortSignal;
 }
 
+export interface PermissionAfterContext {
+  /** Timeline (with timestamps) used to recover what an orphan human denial was about. */
+  fetchTimelineEntries?: TimelineEntriesFetcher;
+  signal?: AbortSignal;
+  /** Budget for the orphan timeline fetch (default 3000 ms). */
+  timeoutMs?: number;
+}
+
+/** Bounded once-per-id backfill of orphan contexts from the status path. */
+const MAX_BACKFILL_PER_CALL = 5;
+const MAX_BACKFILL_TRACKED = 1_000;
+
 const SNAPSHOT_MAX_MODIFIED_FILES = 200;
 
 /** Spec §3.7: session state as seen by the decision (taken before this request's own updates). */
@@ -79,6 +93,7 @@ export class PermissionGuardianService {
   private readonly gate: GateController | undefined;
   private readonly responder: ActResponder | undefined;
   private readonly gitStateProvider: GitStateProvider;
+  private readonly backfillAttempted = new Set<string>();
 
   private settings: GuardianSettings;
   private settingsInvalid = false;
@@ -281,6 +296,7 @@ export class PermissionGuardianService {
         decision: evaluated.decision,
         offeredActions,
         contextSnapshot,
+        agentTitle: payload.agent.title,
       });
 
       // Spec §3.5: act path (recordBefore above is memory-first; disk append is queued).
@@ -305,6 +321,7 @@ export class PermissionGuardianService {
 
   async handlePermissionAfter(
     payload: PluginHookEvents["agent.permission.after"],
+    ctx?: PermissionAfterContext,
   ): Promise<void> {
     // N4: invalid settings fall back to effective shadow, which still records.
     if (this.getEffectiveBaseMode() === "off") {
@@ -313,9 +330,10 @@ export class PermissionGuardianService {
 
     try {
       const actor = this.resolveActor(payload.requestId, payload.resolution);
-      await this.auditStore.recordAfter({
+      const merged = await this.auditStore.recordAfter({
         requestId: payload.requestId,
         agentId: payload.agent.id,
+        agentTitle: payload.agent.title,
         provider: payload.agent.provider,
         mode: this.settings.mode,
         resolution: {
@@ -327,12 +345,69 @@ export class PermissionGuardianService {
           actor,
         },
       });
+      // Display only: recover what an orphan human denial was about (never changes the gate).
+      if (ctx?.fetchTimelineEntries && this.isOrphanHumanDeny(merged)) {
+        this.backfillAttempted.add(merged.requestId);
+        await this.enrichOrphan(merged.requestId, merged.agentId, ctx.fetchTimelineEntries, {
+          allowUntimed: true,
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+          ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
+        });
+      }
     } catch (error) {
       console.error(
         `[paseo-permission-guardian] Error handling agent.permission.after for ${payload.requestId}:`,
         error,
       );
     }
+  }
+
+  /**
+   * One-off best-effort backfill for orphan human denials that lack an orphan context (e.g. written
+   * before this feature). Each id is attempted at most once per process; at most 5 per call.
+   */
+  async backfillOrphanContexts(
+    requestIds: string[],
+    fetcher: TimelineEntriesFetcher,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    let started = 0;
+    for (const id of requestIds) {
+      if (started >= MAX_BACKFILL_PER_CALL) break;
+      if (!id || this.backfillAttempted.has(id)) continue;
+      const record = this.auditStore.getRecord(id);
+      if (!record || !this.isOrphanHumanDeny(record) || record.orphanContext) continue;
+      if (this.backfillAttempted.size >= MAX_BACKFILL_TRACKED) this.backfillAttempted.clear();
+      this.backfillAttempted.add(id);
+      started += 1;
+      try {
+        await this.enrichOrphan(id, record.agentId, fetcher, signal ? { signal } : {});
+      } catch (error) {
+        console.error(`[paseo-permission-guardian] orphan backfill failed for ${id}:`, error);
+      }
+    }
+  }
+
+  private isOrphanHumanDeny(record: AuditRecord): boolean {
+    return (
+      !record.decision &&
+      record.resolution?.behavior === "deny" &&
+      record.resolution.actor !== "plugin"
+    );
+  }
+
+  private async enrichOrphan(
+    requestId: string,
+    agentId: string,
+    fetcher: TimelineEntriesFetcher,
+    opts: { allowUntimed?: boolean; signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<void> {
+    const record = this.auditStore.getRecord(requestId);
+    const resolvedAtMs = Date.parse(record?.resolution?.resolvedAt ?? "");
+    const orphanContext = Number.isNaN(resolvedAtMs)
+      ? { unavailable: true }
+      : await recoverOrphanContext(fetcher, agentId, { resolvedAtMs, ...opts });
+    this.auditStore.setOrphanContext(requestId, orphanContext);
   }
 
   handleTurnAfter(agentId: string): void {

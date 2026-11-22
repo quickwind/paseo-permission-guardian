@@ -123,11 +123,26 @@ export interface AuditResolution {
   actor: ResolutionActor;
 }
 
+/**
+ * Display-only context for an orphan human denial (an `after` without a `before`), recovered
+ * best-effort from the agent timeline. `unavailable` ⇒ recovery failed. Never affects the gate.
+ */
+export interface OrphanContext {
+  unavailable?: boolean;
+  toolName?: string;
+  summary?: string;
+  callId?: string;
+  /** How the tool call was matched (e.g. `permission_denied`, `failed_or_canceled`). */
+  matchedBy?: string;
+}
+
 export interface AuditRecord {
   version: 1;
   pluginVersion: string;
   requestId: string;
   agentId: string;
+  /** Agent title from the hook payload (redacted), for display. */
+  agentTitle?: string;
   provider: string;
   mode: GuardianMode;
   requestedAt?: string;
@@ -142,6 +157,7 @@ export interface AuditRecord {
   offeredActions?: OfferedAction[];
   contextSnapshot?: ContextSnapshot;
   actOutcome?: ActOutcome;
+  orphanContext?: OrphanContext;
 }
 
 export interface AuditMetricsSummary {
@@ -206,6 +222,12 @@ export interface ContextSnapshot {
   deleteTargetsClean?: Record<string, boolean>;
 }
 
+export interface GateEntryResolution {
+  behavior: "allow" | "deny";
+  selectedActionId?: string;
+  message?: string;
+}
+
 export interface GateEntry {
   requestId: string;
   requestedAt?: string;
@@ -213,6 +235,16 @@ export interface GateEntry {
   effects: string[];
   kind: "false_allow" | "orphan_deny" | "corrupt_line" | "unevaluable_deny";
   key: string;
+  // Display fields (optional, backward compatible): enough for a human to judge the entry.
+  resolvedAt?: string;
+  provider?: string;
+  agentId?: string;
+  agentTitle?: string;
+  toolName?: string;
+  /** Exec source (≤200 chars), paths, URL, or MCP `server:tool`. */
+  summary?: string;
+  resolution?: GateEntryResolution;
+  orphanContext?: OrphanContext;
 }
 
 export interface GateStatus {

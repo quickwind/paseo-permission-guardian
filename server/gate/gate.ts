@@ -9,6 +9,7 @@ import {
   type ReplayResult,
 } from "./replay.js";
 import { readGateState, writeGateState, type GateStateFile } from "./state-file.js";
+import { buildGateEntry, refreshGateEntry } from "./entry.js";
 
 /**
  * Evidence gate (spec §3.2). Decides the effective mode (`off` | `shadow` | `act`).
@@ -216,6 +217,11 @@ export class GateController {
     }
     entries.push(...faEntries.slice(0, MAX_FALSE_ALLOW_ENTRIES));
     if (result) entries.push(...result.integrity.slice(0, MAX_INTEGRITY_ENTRIES));
+    // Display fields come from the latest in-memory record (e.g. orphan context added later).
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i]!;
+      if (e.requestId) entries[i] = refreshGateEntry(e, this.store.getRecord(e.requestId));
+    }
     return {
       state: c.state,
       reason: c.reason,
@@ -278,15 +284,7 @@ export class GateController {
         !CONFIRMED_CANCELLATION_SIGNATURES.some((sig) => sig(res, record)) &&
         (!record.decision || record.decision.verdict === "allow")
       ) {
-        const entry: GateEntry = {
-          requestId: record.requestId,
-          effects: [],
-          kind: record.decision ? "false_allow" : "orphan_deny",
-          key: record.requestId,
-        };
-        if (record.requestedAt) entry.requestedAt = record.requestedAt;
-        const src = record.action?.exec?.source;
-        if (typeof src === "string") entry.command = src.slice(0, 200);
+        const entry = buildGateEntry(record, record.decision ? "false_allow" : "orphan_deny", []);
         const modeBefore = this.safeCompute().mode;
         this.seq += 1;
         this.candidates.set(record.requestId, { seq: this.seq, entry });

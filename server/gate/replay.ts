@@ -10,6 +10,7 @@ import type { AuditWindow } from "../audit/reader.js";
 import type { SessionState } from "../context/session.js";
 import { decideAction } from "../decide.js";
 import { buildDecideContext } from "../decide-context.js";
+import { buildGateEntry } from "./entry.js";
 import type { PwshHostLike, PwshShellVariant } from "../shell/pwsh-host.js";
 
 /**
@@ -61,7 +62,6 @@ export interface ReplayResult {
   unavailableReason: ReplayUnavailableReason | null;
 }
 
-const COMMAND_MAX = 200;
 const PWSH_HOST_FAILURE_PREFIX = "opaque:pwsh_host_";
 
 const KNOWN_KINDS = new Set<ActionKind>([
@@ -77,17 +77,8 @@ const KNOWN_KINDS = new Set<ActionKind>([
   "other",
 ]);
 
-function commandOf(record: AuditRecord): string | undefined {
-  const src = record.action?.exec?.source;
-  return typeof src === "string" ? src.slice(0, COMMAND_MAX) : undefined;
-}
-
 function entry(record: AuditRecord, kind: GateEntry["kind"], effects: string[]): GateEntry {
-  const e: GateEntry = { requestId: record.requestId, effects, kind, key: record.requestId };
-  if (record.requestedAt !== undefined) e.requestedAt = record.requestedAt;
-  const command = commandOf(record);
-  if (command !== undefined) e.command = command;
-  return e;
+  return buildGateEntry(record, kind, effects);
 }
 
 async function safeDecide(

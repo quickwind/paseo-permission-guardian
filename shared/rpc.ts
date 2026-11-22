@@ -25,6 +25,28 @@ export const GateEntrySchema = z.object({
   effects: z.array(z.string()),
   kind: z.enum(["false_allow", "orphan_deny", "corrupt_line", "unevaluable_deny"]),
   key: z.string(),
+  resolvedAt: z.string().optional(),
+  provider: z.string().optional(),
+  agentId: z.string().optional(),
+  agentTitle: z.string().optional(),
+  toolName: z.string().optional(),
+  summary: z.string().optional(),
+  resolution: z
+    .object({
+      behavior: z.enum(["allow", "deny"]),
+      selectedActionId: z.string().optional(),
+      message: z.string().optional(),
+    })
+    .optional(),
+  orphanContext: z
+    .object({
+      unavailable: z.boolean().optional(),
+      toolName: z.string().optional(),
+      summary: z.string().optional(),
+      callId: z.string().optional(),
+      matchedBy: z.string().optional(),
+    })
+    .optional(),
 });
 
 export const GateStatusSchema = z.object({

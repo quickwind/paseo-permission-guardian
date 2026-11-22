@@ -207,11 +207,16 @@ describe("replayWindow — false-allows", () => {
       fake({ "1": ok("allow", "L0", [], ["write_worktree", "read:foo"]) }),
       NO_SIGS,
     );
-    expect(r.falseAllows).toEqual([
+    expect(r.falseAllows).toMatchObject([
       {
         requestId: "1",
         requestedAt: T,
         command: "rm -rf x",
+        summary: "rm -rf x",
+        toolName: "Bash",
+        provider: "claude",
+        agentId: "a",
+        resolvedAt: T,
         effects: ["write_worktree", "read:foo"],
         kind: "false_allow",
         key: "1",
@@ -344,7 +349,7 @@ describe("replayWindow — integrity and unavailability", () => {
       NO_SIGS,
     );
     expect(r.unavailableReason).toBe("orphan_human_deny");
-    expect(r.integrity).toEqual([
+    expect(r.integrity).toMatchObject([
       { requestId: "1", requestedAt: T, command: "curl x", effects: [], kind: "orphan_deny", key: "1" },
     ]);
     expect(r.falseAllows).toEqual([]);

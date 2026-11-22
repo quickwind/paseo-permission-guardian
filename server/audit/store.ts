@@ -7,6 +7,7 @@ import type {
   ActOutcome,
   ContextSnapshot,
   OfferedAction,
+  OrphanContext,
   AuditRecord,
   AuditResolution,
   GuardianDecision,
@@ -41,6 +42,8 @@ export interface RecordBeforeInput {
   decision: GuardianDecision;
   offeredActions?: OfferedAction[];
   contextSnapshot?: ContextSnapshot;
+  /** Agent title from the hook payload (display only; redacted). */
+  agentTitle?: string | null;
 }
 
 export type MergeListener = (record: AuditRecord, previous: AuditRecord | undefined) => void;
@@ -51,6 +54,14 @@ export interface RecordAfterInput {
   provider: string;
   mode: GuardianMode;
   resolution: AuditResolution;
+  agentTitle?: string | null;
+}
+
+const AGENT_TITLE_MAX = 200;
+
+function redactTitle(title: string | null | undefined): string | undefined {
+  if (typeof title !== "string" || title.trim() === "") return undefined;
+  return redactString(title.slice(0, AGENT_TITLE_MAX));
 }
 
 const PERSIST_FAILURE_FILE = "persist-failure.json";
@@ -151,6 +162,20 @@ export class AuditStore {
     void this.enqueueAppend({ event: "update", record: next }).catch(() => {});
   }
 
+  /**
+   * Display-only orphan context (best-effort timeline recovery). Written as an `update` event; does
+   * not notify merge listeners, so it never changes gate state. Ignored once the record has a
+   * decision (no longer an orphan).
+   */
+  setOrphanContext(requestId: string, context: OrphanContext): void {
+    const existing = this.records.get(requestId);
+    if (!existing || existing.decision) return;
+    const next: AuditRecord = { ...existing, orphanContext: redactValue({ ...context }) };
+    this.records.set(requestId, next);
+    this.touched?.add(requestId);
+    void this.enqueueAppend({ event: "update", record: next }).catch(() => {});
+  }
+
   async appendEvent(event: { event: "gate" | "annotation"; [k: string]: unknown }): Promise<void> {
     await this.enqueueAppend(event);
   }
@@ -235,6 +260,9 @@ export class AuditStore {
       pluginVersion: this.pluginVersion,
       requestId: input.requestId,
       agentId: input.agentId,
+      ...(redactTitle(input.agentTitle) ?? existing?.agentTitle
+        ? { agentTitle: redactTitle(input.agentTitle) ?? existing?.agentTitle }
+        : {}),
       provider: input.provider,
       mode: input.mode,
       requestedAt: input.requestedAt,
@@ -248,6 +276,7 @@ export class AuditStore {
       ...(input.offeredActions ? { offeredActions: input.offeredActions.map((o) => ({ ...o })) } : {}),
       ...(input.contextSnapshot ? { contextSnapshot: redactSnapshot(input.contextSnapshot) } : {}),
       ...(existing?.actOutcome ? { actOutcome: existing.actOutcome } : {}),
+      ...(existing?.orphanContext ? { orphanContext: existing.orphanContext } : {}),
       ...(hadResolutionFirst || existing?.outOfOrder ? { outOfOrder: true } : {}),
     };
 
@@ -267,6 +296,9 @@ export class AuditStore {
       pluginVersion: this.pluginVersion,
       requestId: input.requestId,
       agentId: existing?.agentId ?? input.agentId,
+      ...(existing?.agentTitle ?? redactTitle(input.agentTitle)
+        ? { agentTitle: existing?.agentTitle ?? redactTitle(input.agentTitle) }
+        : {}),
       provider: existing?.provider ?? input.provider,
       mode: existing?.mode ?? input.mode,
       requestedAt: existing?.requestedAt,
@@ -280,6 +312,7 @@ export class AuditStore {
       ...(existing?.offeredActions ? { offeredActions: existing.offeredActions } : {}),
       ...(existing?.contextSnapshot ? { contextSnapshot: existing.contextSnapshot } : {}),
       ...(existing?.actOutcome ? { actOutcome: existing.actOutcome } : {}),
+      ...(existing?.orphanContext ? { orphanContext: existing.orphanContext } : {}),
       ...(arrivedBeforeRequest || existing?.outOfOrder ? { outOfOrder: true } : {}),
     };
 
