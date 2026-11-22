@@ -1,7 +1,7 @@
 # P2a: `act` Mode with Evidence Gate — Design
 
 - **Date**: 2026-11-22
-- **Status**: Draft v3 — builder check done; two independent review rounds (neon) incorporated; pending user approval
+- **Status**: Approved (v3, 2026-11-22) — builder check and two independent review rounds (neon) incorporated
 - **Milestone**: P2a (safety core). P2b (shadow dashboard screen, timeline rows, prompt guidance,
   mode policy) is a separate design.
 - **Related**: [DESIGN.md](../../DESIGN.md) §10.4, §12, §13, §14, §16;

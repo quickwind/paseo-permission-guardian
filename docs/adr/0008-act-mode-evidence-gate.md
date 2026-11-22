@@ -1,6 +1,6 @@
 # ADR-0008: `act` Mode Behind an Evidence Gate, Replay with the Current Engine, and Provider Option Mapping
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-11-22
 - **Supersedes**: —
 - **Superseded by**: —
