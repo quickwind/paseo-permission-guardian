@@ -2,6 +2,7 @@ import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { Action } from "../../shared/types.js";
 import { normalizeAcpRequest } from "./acp.js";
 import { normalizeClaudeRequest } from "./claude.js";
+import { hasSandboxBypassFlag } from "./sandbox.js";
 import {
   asNonEmptyString,
   defaultExecShell,
@@ -67,6 +68,7 @@ function normalizeGenericFallback(
     host: { os: ctx.hostOs },
     cwd: ctx.cwd,
     worktreeRoot: ctx.worktreeRoot,
+    ...(hasSandboxBypassFlag(asRecord(request.input)) ? { sandboxBypass: true } : {}),
     ...(ctx.includeRaw ? { raw: request } : {}),
   };
 
@@ -130,4 +132,10 @@ function normalizeGenericFallback(
     normalizedBy: "generic-fallback",
     warnings,
   };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
