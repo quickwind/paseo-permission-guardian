@@ -143,3 +143,63 @@ export function choiceLabelKey(resolution: NonNullable<GateEntry["resolution"]>)
   const scope = /once/i.test(id) ? "Once" : /always|session|forever/i.test(id) ? "Always" : "";
   return `act.entries.choice.${resolution.behavior}${scope}` as ChoiceLabelKey;
 }
+
+export const REVIEW_SCREEN_ID = "guardian-review";
+
+/** Sidebar badge: how many gate entries (all kinds) need review; 0 when unknown. */
+export function reviewBadgeCount(status: { gate: Pick<GateStatus, "entries"> } | null | undefined): number {
+  return status?.gate.entries.length ?? 0;
+}
+
+/** Sidebar press handler: opens the plugin's review screen. */
+export function openReviewScreen(openScreen: (input: { screenId: string }) => void): void {
+  openScreen({ screenId: REVIEW_SCREEN_ID });
+}
+
+export interface EntryViewModel {
+  /** "<kind>: <headline>" */
+  title: string;
+  /** One detail per line. */
+  details: string;
+  /** Label of the annotate / acknowledge action. */
+  actionLabel: string;
+  canOpenChat: boolean;
+}
+
+/** Everything the shared entry list renders for one entry (locale-agnostic translator). */
+export function entryViewModel(
+  entry: GateEntry,
+  t: (key: string) => string,
+  navigation: Partial<OpenAgentNavigation> | undefined,
+): EntryViewModel {
+  const view = entryContentView(entry);
+  let headline: string;
+  if (view.source === "request" || view.source === "recovered") {
+    headline = view.summary ?? view.toolName ?? entry.requestId;
+  } else if (view.source === "missing") {
+    headline = t("act.entries.missing");
+  } else {
+    headline = entry.key;
+  }
+  const lines: string[] = [];
+  const time = entryTime(entry);
+  if (time) lines.push(`${t("act.entries.time")}: ${time}`);
+  if (entry.provider) lines.push(`${t("act.entries.provider")}: ${entry.provider}`);
+  const agent = entryAgentLabel(entry);
+  if (agent) lines.push(`${t("act.entries.agent")}: ${agent}`);
+  if ((view.source === "request" || view.source === "recovered") && view.toolName) {
+    lines.push(`${t("act.entries.tool")}: ${view.toolName}`);
+  }
+  if (view.source === "recovered") lines.push(t("act.entries.recovered"));
+  if (entry.effects.length > 0) lines.push(`${t("act.entries.effects")}: ${entry.effects.join(", ")}`);
+  if (entry.resolution) {
+    lines.push(`${t("act.entries.yourChoice")}: ${t(choiceLabelKey(entry.resolution))}`);
+    if (entry.resolution.message) lines.push(`${t("act.entries.message")}: ${entry.resolution.message}`);
+  }
+  return {
+    title: `${t(`act.entries.kind.${entry.kind}`)}: ${headline}`,
+    details: lines.join("\n"),
+    actionLabel: t(entryActionLabelKey(entry)),
+    canOpenChat: canOpenChat(entry, navigation),
+  };
+}

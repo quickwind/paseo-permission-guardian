@@ -82,7 +82,7 @@ describe("B: entry display helpers", () => {
         expect(typeof v, `${lang}:${k}`).toBe("string");
       }
     }
-    expect((messages.resources.zh as any).act.entries.missing).toBe("插件当时未收到请求内容");
+    expect((messages.resources.zh as any).act.entries.missing).toBe("插件当时没有收到这条请求，也未能从对话记录中找回内容");
     expect((messages.resources.zh as any).act.entries.choice.denyOnce).toBe("拒绝一次");
   });
 });
