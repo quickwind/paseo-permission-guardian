@@ -111,6 +111,13 @@ export class GateController {
   private completed: CompletedReplay | null = null;
   private candidates = new Map<string, Candidate>();
   private seq = 0;
+  /** Human allows of recorded-L3 requests seen since the last replay (incremental false-deny). */
+  private falseDenyCandidates = new Map<string, number>();
+  /** Bumped on every annotate(); replays that started under an older generation are discarded. */
+  private annotationGen = 0;
+  /** Set when a gate-state.json write fails; cleared by the next successful write. */
+  private stateWriteFailed = false;
+  private readonly writeState: typeof writeGateState;
 
   private replayChain: Promise<unknown> = Promise.resolve();
   private queuedReplay: Promise<GateStatus> | null = null;
@@ -128,7 +135,10 @@ export class GateController {
     now?: () => number;
     /** Debounce for reconciliation-triggered replays. */
     debounceMs?: number;
+    /** Injectable gate-state writer (tests simulate write failures). */
+    writeState?: typeof writeGateState;
   }) {
+    this.writeState = opts.writeState ?? writeGateState;
     this.store = opts.store;
     this.dataDir = opts.dataDir;
     this.replayDecide = opts.replayDecide;
@@ -174,7 +184,12 @@ export class GateController {
     try {
       if (this.effectiveMode() !== "act") return false;
       const replay = this.currentReplay();
-      return replay !== null && replay.unavailableReason === null && replay.result.falseDenyCount === 0;
+      return (
+        replay !== null &&
+        replay.unavailableReason === null &&
+        replay.result.falseDenyCount === 0 &&
+        this.falseDenyCandidates.size === 0
+      );
     } catch {
       return false;
     }
@@ -187,7 +202,15 @@ export class GateController {
     const entries: GateEntry[] = [];
     const pf = this.store.getPersistFailure();
     if (pf) entries.push({ kind: "corrupt_line", key: `persist_failure#${pf.firstAt}`, requestId: "", effects: [] });
-    entries.push(...this.falseAllowEntries().slice(0, MAX_FALSE_ALLOW_ENTRIES));
+    const faEntries = this.falseAllowEntries();
+    const listed = new Set(faEntries.map((e) => e.requestId));
+    if (c.suspended && this.file) {
+      // Suspending ids stay annotatable even when the latest replay no longer reports them (R6).
+      for (const id of this.file.suspendedBy) {
+        if (!listed.has(id)) faEntries.push({ requestId: id, effects: [], kind: "false_allow", key: id });
+      }
+    }
+    entries.push(...faEntries.slice(0, MAX_FALSE_ALLOW_ENTRIES));
     if (result) entries.push(...result.integrity.slice(0, MAX_INTEGRITY_ENTRIES));
     return {
       state: c.state,
@@ -195,7 +218,7 @@ export class GateController {
       samples: result?.samples ?? 0,
       minSamples: s?.actGate.minSamples ?? 200,
       falseAllowCount: c.falseAllowIds.length,
-      falseDenyCount: result?.falseDenyCount ?? 0,
+      falseDenyCount: (result?.falseDenyCount ?? 0) + this.falseDenyCandidates.size,
       entries,
       unconfirmedCount: this.consecutiveUnconfirmed,
       lastReplayAt: this.completed ? new Date(this.completed.at).toISOString() : null,
@@ -264,6 +287,9 @@ export class GateController {
         this.applyTransitions(false, modeBefore);
       } else {
         this.seq += 1;
+        if (res.behavior === "allow" && record.decision?.level === "L3") {
+          this.falseDenyCandidates.set(record.requestId, this.seq);
+        }
       }
       this.scheduleReplay();
     } catch (error) {
@@ -272,9 +298,12 @@ export class GateController {
   }
 
   async annotate(key: string, annotation: "not_safety" | null): Promise<GateStatus> {
+    this.annotationGen += 1;
     const pf = this.store.getPersistFailure();
     if (annotation === "not_safety" && pf && key === `persist_failure#${pf.firstAt}`) {
       await this.store.clearPersistFailure();
+      // History may be incomplete: hold shadow until a fresh replay completes.
+      this.completed = null;
     }
     if (annotation === null) {
       // Un-annotating can re-introduce a false-allow: no result counts until the next replay.
@@ -324,6 +353,7 @@ export class GateController {
     if (!fingerprint || !settings || this.disposed) return;
     const windowDays = settings.actGate.windowDays;
     const startSeq = this.seq;
+    const startGen = this.annotationGen;
     const at = this.now();
 
     let completed: CompletedReplay;
@@ -360,10 +390,13 @@ export class GateController {
 
     // Stale: engine identity or window changed while replaying; a newer replay is queued.
     if (this.fingerprint !== fingerprint || this.settings?.actGate.windowDays !== windowDays) return;
+    // Stale: an annotation changed after this replay read the window; annotate() queues a new one.
+    if (this.annotationGen !== startGen) return;
 
     const modeBefore = this.safeCompute().mode;
     this.completed = completed;
     for (const [id, c] of this.candidates) if (c.seq <= startSeq) this.candidates.delete(id);
+    for (const [id, seq] of this.falseDenyCandidates) if (seq <= startSeq) this.falseDenyCandidates.delete(id);
     this.consecutiveUnconfirmed = 0;
     this.paused = false;
 
@@ -461,6 +494,9 @@ export class GateController {
 
     const replay = this.currentReplay();
     const falseAllowIds = this.falseAllowEntries().map((e) => e.requestId);
+    // R6: an unannotated suspending id is still a disagreement even if the latest replay no longer
+    // reports it, so it counts as a false-allow (no re-latching or override while suspended).
+    if (suspended) for (const id of f!.suspendedBy) if (!falseAllowIds.includes(id)) falseAllowIds.push(id);
     const falseAllow = falseAllowIds.length;
     const samples = replay?.result.samples ?? 0;
     const pf = this.store.getPersistFailure();
@@ -471,6 +507,9 @@ export class GateController {
     if (pf) {
       state = "unavailable";
       stateReason = "audit_persist_failure";
+    } else if (this.stateWriteFailed) {
+      state = "unavailable";
+      stateReason = "gate_state_write_failure";
     } else if (!replay) {
       state = "replaying";
       stateReason = "replaying";
@@ -569,7 +608,11 @@ export class GateController {
     }
 
     const replay = this.currentReplay();
-    const available = replay !== null && replay.unavailableReason === null && !this.store.getPersistFailure();
+    const available =
+      replay !== null &&
+      replay.unavailableReason === null &&
+      !this.store.getPersistFailure() &&
+      !this.stateWriteFailed;
     const falseIds = new Set(this.falseAllowEntries().map((e) => e.requestId));
 
     if (this.file && this.file.latched) {
@@ -577,9 +620,12 @@ export class GateController {
       let next = [...before];
       let agedOut = false;
       if (fromReplay && available) {
+        // R6: a suspension is lifted ONLY by a `not_safety` annotation; an unannotated id that is
+        // still in the window (or still a live candidate) keeps suspending even if the replay no
+        // longer reports it; one that left the window unannotated clears the latch.
         next = next.filter((id) => {
-          if (falseIds.has(id)) return true;
-          if (replay!.annotations.get(id) === "not_safety" || replay!.inWindow.has(id)) return false;
+          if (replay!.annotations.get(id) === "not_safety") return false;
+          if (falseIds.has(id) || replay!.inWindow.has(id)) return true;
           agedOut = true;
           return false;
         });
@@ -660,10 +706,21 @@ export class GateController {
     this.writeChain = this.writeChain
       .then(async () => {
         const snapshot = this.file;
-        if (snapshot) await writeGateState(this.dataDir, { ...snapshot, suspendedBy: [...snapshot.suspendedBy] });
+        if (!snapshot) return;
+        await this.writeState(this.dataDir, { ...snapshot, suspendedBy: [...snapshot.suspendedBy] });
+        if (this.stateWriteFailed) {
+          this.stateWriteFailed = false;
+          this.emit("state_write_recovered", {});
+        }
       })
       .catch((error) => {
         console.error("[paseo-permission-guardian] gate-state write failed:", error);
+        // Fail to human: the in-memory latch/suspension may differ from disk (a restart could
+        // resurrect a latch), so the gate is unavailable until a later write succeeds.
+        if (!this.stateWriteFailed) {
+          this.stateWriteFailed = true;
+          this.emit("state_write_failure", { error: error instanceof Error ? error.message : String(error) });
+        }
       });
   }
 

@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuditStore } from "../server/audit/store.js";
 import { GateController } from "../server/gate/gate.js";
 import type { ReplayDecideHandle, ReplayDecision } from "../server/gate/replay.js";
@@ -31,13 +31,43 @@ function fakeDecide(): ReplayDecideHandle {
   return fn;
 }
 
-function makeGate(opts: { debounceMs?: number } = {}): GateController {
+function controlledDecide() {
+  let calls = 0;
+  const holds: { from: number; p: Promise<void> }[] = [];
+  const base = fakeDecide();
+  const fn = (async (record: AuditRecord) => {
+    calls += 1;
+    const i = calls;
+    const h = [...holds].reverse().find((x) => x.from <= i);
+    if (h) await h.p;
+    return base(record);
+  }) as ReplayDecideHandle;
+  fn.dispose = base.dispose;
+  return {
+    fn,
+    calls: () => calls,
+    /** Blocks decide calls numbered ≥ from (until a later hold) until the returned release is called. */
+    holdFrom(from: number): () => void {
+      let release!: () => void;
+      const p = new Promise<void>((r) => {
+        release = r;
+      });
+      holds.push({ from, p });
+      return release;
+    },
+  };
+}
+
+function makeGate(
+  opts: { debounceMs?: number; decide?: ReplayDecideHandle; writeState?: typeof writeGateState } = {},
+): GateController {
   const g = new GateController({
     store,
     dataDir: dir,
-    replayDecide: fakeDecide(),
+    replayDecide: opts.decide ?? fakeDecide(),
     now: () => clock,
     debounceMs: opts.debounceMs ?? 60_000,
+    ...(opts.writeState ? { writeState: opts.writeState } : {}),
   });
   controllers.push(g);
   return g;
@@ -81,7 +111,11 @@ async function seed(id: string, recorded: GuardianVerdict, human: "allow" | "den
       cwd: "/repo",
       exec: { shell: "bash", source: `cmd-${id}` },
     } as AuditRecord["action"] & object,
-    decision: { level: recorded === "allow" ? "L0" : "L1", verdict: recorded, reasons: [] },
+    decision: {
+      level: recorded === "allow" ? "L0" : recorded === "deny" ? "L3" : "L1",
+      verdict: recorded,
+      reasons: [],
+    },
   });
   await store.recordAfter({
     requestId: id,
@@ -643,3 +677,201 @@ async function readAll(): Promise<string> {
   for (const n of names) out += await readFile(join(dir, n), "utf8");
   return out;
 }
+
+async function makePersistFailure(): Promise<string> {
+  const failing = new AuditStore({
+    dataDir: dir,
+    pluginVersion: "0",
+    writeFn: async () => {
+      throw new Error("disk");
+    },
+  });
+  await failing.appendEvent({ event: "gate", type: "x" }).catch(() => {});
+  const pf = failing.getPersistFailure();
+  await store.loadFromDisk();
+  return `persist_failure#${pf!.firstAt}`;
+}
+
+async function latchedControlled() {
+  const ctl = controlledDecide();
+  await seedSamples(200);
+  const g = makeGate({ decide: ctl.fn });
+  configure(g);
+  await g.replay();
+  expect(g.status().state).toBe("latched");
+  expect(ctl.calls()).toBe(200);
+  return { g, ctl };
+}
+
+describe("GateController — fix round 1", () => {
+  it("I1: gate-state write failure ⇒ unavailable/shadow until a later write succeeds", async () => {
+    await seedSamples(200);
+    let failWrites = false;
+    const g = makeGate({
+      writeState: async (d, st) => {
+        if (failWrites) throw new Error("EIO");
+        await writeGateState(d, st);
+      },
+    });
+    configure(g);
+    await g.replay();
+    expect(g.effectiveMode()).toBe("act");
+    failWrites = true;
+    configure(g, settings({ actGate: { autoFallbackOnFalseAllow: false } }));
+    await g.replay(); // lastReplay write fails
+    await vi.waitFor(() => expect(g.status().reason).toBe("gate_state_write_failure"));
+    expect(g.status().state).toBe("unavailable");
+    expect(g.effectiveMode()).toBe("shadow");
+    await store.flush();
+    expect(await readAll()).toMatch(/"type":"state_write_failure"/);
+
+    failWrites = false;
+    await g.replay();
+    await vi.waitFor(() => expect(g.status().state).toBe("latched"));
+    expect(g.effectiveMode()).toBe("act");
+  });
+
+  it("I1: failed suspension write keeps shadow, and the recovered write persists the suspension", async () => {
+    await seedSamples(200);
+    let failWrites = false;
+    const g = makeGate({
+      writeState: async (d, st) => {
+        if (failWrites) throw new Error("EIO");
+        await writeGateState(d, st);
+      },
+    });
+    configure(g);
+    await g.replay();
+    failWrites = true;
+    await seed("bad", "allow", "deny");
+    await vi.waitFor(() => expect(g.status().reason).toBe("gate_state_write_failure"));
+    expect((await readGateState(dir))?.suspendedBy).toEqual([]);
+    // still failing: no latch-state change is trusted, gate stays shadow
+    await g.replay();
+    expect(g.effectiveMode()).toBe("shadow");
+    failWrites = false;
+    await g.replay();
+    await vi.waitFor(() => expect(g.status().state).toBe("suspended"));
+    await g.dispose();
+    expect((await readGateState(dir))?.suspendedBy).toEqual(["bad"]);
+  });
+
+  it("I2: replay that read the window before annotate(null) is discarded", async () => {
+    const { g, ctl } = await latchedControlled();
+    await seed("bad", "allow", "deny");
+    await g.annotate("bad", "not_safety"); // calls 201..400 (bad is skipped as annotated)
+    expect(g.effectiveMode()).toBe("act");
+    const release1 = ctl.holdFrom(401);
+    const p1 = g.replay();
+    await vi.waitFor(() => expect(ctl.calls()).toBeGreaterThanOrEqual(401));
+    const release2 = ctl.holdFrom(601);
+    const pa = g.annotate("bad", null);
+    expect(g.effectiveMode()).toBe("shadow");
+    await store.flush();
+    release1();
+    await p1;
+    expect(g.status().state).toBe("replaying");
+    expect(g.effectiveMode()).toBe("shadow");
+    release2();
+    const s = await pa;
+    expect(s.state).toBe("suspended");
+    expect(g.effectiveMode()).toBe("shadow");
+  });
+
+  it("R6: suspension is not lifted when replay stops reporting the id; only annotation lifts it", async () => {
+    const g = await latchedGate();
+    await seed("bad", "allow", "deny");
+    await g.replay();
+    expect(g.status().state).toBe("suspended");
+    replayVerdicts.set("bad", "ask"); // replay no longer reports it as a false-allow
+    const s = await g.replay();
+    expect(s.falseAllowCount).toBe(1); // still counted while it suspends
+    expect(s).toMatchObject({ state: "suspended", suspended: true });
+    configure(g, settings({ actOverride: { accepted: true, fingerprint: FP } }));
+    expect(g.effectiveMode()).toBe("shadow"); // override does not help while suspended
+    expect(s.entries.some((e) => e.requestId === "bad" && e.kind === "false_allow")).toBe(true);
+    expect(g.effectiveMode()).toBe("shadow");
+    const s2 = await g.annotate("bad", "not_safety");
+    expect(s2).toMatchObject({ state: "latched", suspended: false });
+    expect(g.effectiveMode()).toBe("act");
+  });
+
+  it("R6: a suspending id the replay no longer reports still ages out ⇒ latch cleared", async () => {
+    const g = await latchedGate();
+    await seed("bad", "allow", "deny");
+    await g.replay();
+    replayVerdicts.set("bad", "ask");
+    await g.replay();
+    expect(g.status().state).toBe("suspended");
+    clock += 31 * DAY;
+    const s = await g.replay();
+    expect(s).toMatchObject({ state: "collecting", latched: false });
+  });
+
+  it("M1: fingerprint switch while a replay is in flight ⇒ stale result discarded, no latch under new fp", async () => {
+    const ctl = controlledDecide();
+    await seedSamples(200);
+    const g = makeGate({ decide: ctl.fn });
+    const release1 = ctl.holdFrom(1);
+    configure(g);
+    const p1 = g.replay();
+    await vi.waitFor(() => expect(ctl.calls()).toBeGreaterThanOrEqual(1));
+    const release2 = ctl.holdFrom(201);
+    configure(g, settings(), FP2);
+    release1();
+    await p1;
+    expect(g.status()).toMatchObject({ state: "replaying", latched: false, fingerprint: FP2 });
+    expect(g.effectiveMode()).toBe("shadow");
+    expect((await readGateState(dir))?.latched ?? false).toBe(false);
+    release2();
+    const s = await g.replay();
+    expect(s.state).toBe("latched");
+    await g.dispose();
+    expect(await readGateState(dir)).toMatchObject({ latched: true, fingerprint: FP2 });
+  });
+
+  it("M1: onReconciled false-allow during an in-flight replay survives that replay", async () => {
+    const { g, ctl } = await latchedControlled();
+    const release = ctl.holdFrom(201);
+    const p1 = g.replay();
+    await vi.waitFor(() => expect(ctl.calls()).toBeGreaterThanOrEqual(201));
+    await seed("bad", "allow", "deny");
+    expect(g.effectiveMode()).toBe("shadow");
+    release();
+    await p1;
+    expect(g.status()).toMatchObject({ state: "suspended", latched: true });
+    expect(g.effectiveMode()).toBe("shadow");
+    await g.replay();
+    expect(g.status()).toMatchObject({ state: "suspended", falseAllowCount: 1 });
+  });
+
+  it("M3: human allow of a recorded-L3 request ⇒ canAutoDeny false immediately", async () => {
+    const g = await latchedGate();
+    expect(g.canAutoDeny()).toBe(true);
+    await seed("l3", "deny", "allow");
+    expect(g.canAutoDeny()).toBe(false);
+    expect(g.status().falseDenyCount).toBe(1);
+    expect(g.effectiveMode()).toBe("act");
+    await g.replay(); // replay confirms L3
+    expect(g.canAutoDeny()).toBe(false);
+    replayVerdicts.set("l3", "allow"); // engine no longer L3 ⇒ replay clears it
+    await g.replay();
+    expect(g.canAutoDeny()).toBe(true);
+  });
+
+  it("M4: acknowledging a persist failure holds shadow until a fresh replay completes", async () => {
+    const { g, ctl } = await latchedControlled();
+    const key = await makePersistFailure();
+    expect(g.status().state).toBe("unavailable");
+    const release = ctl.holdFrom(201);
+    const pa = g.annotate(key, "not_safety");
+    await vi.waitFor(() => expect(ctl.calls()).toBeGreaterThanOrEqual(201));
+    expect(store.getPersistFailure()).toBeNull();
+    expect(g.status().state).toBe("replaying");
+    expect(g.effectiveMode()).toBe("shadow");
+    release();
+    const s = await pa;
+    expect(s.state).toBe("latched");
+    expect(g.effectiveMode()).toBe("act");
+  });
+});
