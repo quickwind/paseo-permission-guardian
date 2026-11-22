@@ -277,7 +277,9 @@ describe("A: real git provider (integration)", () => {
     git(repo, "add", "staged.txt");
     await writeFile(join(repo, "untracked.txt"), "u");
     await writeFile(join(repo, "ignored.txt"), "i");
-    await writeFile(join(repo, "weird*.txt"), "w");
+    // `*` is invalid in Windows file names; the glob-literal case is POSIX-only.
+    const posixOnly = process.platform !== "win32";
+    if (posixOnly) await writeFile(join(repo, "weird*.txt"), "w");
     const outside = join(root, "outside.txt");
     await writeFile(outside, "o");
 
@@ -290,7 +292,7 @@ describe("A: real git provider (integration)", () => {
       t("staged.txt"),
       t("untracked.txt"),
       t("ignored.txt"),
-      t("weird*.txt"),
+      ...(posixOnly ? [t("weird*.txt")] : []),
       t("sub"),
       t("missing.txt"),
       outside,
@@ -303,7 +305,7 @@ describe("A: real git provider (integration)", () => {
       [t("staged.txt")]: false,
       [t("untracked.txt")]: false,
       [t("ignored.txt")]: false,
-      [t("weird*.txt")]: false,
+      ...(posixOnly ? { [t("weird*.txt")]: false } : {}),
       [t("sub")]: false,
       [t("missing.txt")]: false,
       [outside]: false,
@@ -489,7 +491,10 @@ describe("Fix round 1: symlinks, reproducible keys, env isolation", () => {
     }
   }, 20_000);
 
-  it("live L0 delete in a symlinked worktree + human deny ⇒ replay counts a false_allow (C1)", async () => {
+  // On Windows hosts a bash `rm` is mapped through WSL (/mnt/c/...), which git cannot vouch for, so
+  // it always goes to a human; the C1 scenario uses the provider `delete` kind there instead.
+  const c1Variants = process.platform === "win32" ? (["provider-delete"] as const) : (["bash-rm", "provider-delete"] as const);
+  it.each(c1Variants)("live L0 delete in a symlinked worktree + human deny ⇒ replay counts a false_allow (C1, %s)", async (variant) => {
     const { base, repo } = await symlinkedRepo();
     const { AuditStore } = await import("../server/audit/store.js");
     const { PermissionGuardianService } = await import("../server/guardian.js");
@@ -504,12 +509,14 @@ describe("Fix round 1: symlinks, reproducible keys, env isolation", () => {
       initialSettings: DEFAULT_GUARDIAN_SETTINGS,
       gitStateProvider: createGitStateProvider(),
     });
-    const agent = { id: "ag", workspaceId: "w", parentAgentId: null, provider: "claude", cwd: repo, title: "T", background: false, metadata: {} };
-    const command = process.platform === "win32" ? "del a.txt" : "rm a.txt";
-    await service.handlePermissionBefore({
-      agent,
-      request: { id: "q1", provider: "claude", name: "Bash", kind: "tool", input: { command } },
-    });
+    const provider = variant === "bash-rm" ? "claude" : "acp";
+    const agent = { id: "ag", workspaceId: "w", parentAgentId: null, provider, cwd: repo, title: "T", background: false, metadata: {} };
+    const request =
+      variant === "bash-rm"
+        ? { id: "q1", provider, name: "Bash", kind: "tool" as const, input: { command: "rm a.txt" } }
+        : { id: "q1", provider, name: "delete", kind: "tool" as const, input: { path: join(repo, "a.txt") } };
+    await service.handlePermissionBefore({ agent, request });
+    expect(store.getRecord("q1")?.action?.kind).toBe(variant === "bash-rm" ? "exec" : "delete");
     expect(store.getRecord("q1")?.decision?.level, JSON.stringify(store.getRecord("q1")?.decision)).toBe("L0");
     await service.handlePermissionAfter({ agent, requestId: "q1", resolution: { behavior: "deny" } });
     await service.flush();

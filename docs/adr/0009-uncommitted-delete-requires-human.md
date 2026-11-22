@@ -67,6 +67,9 @@ engine. Git state changes over time, so replay cannot ask git again and still be
   rated L0 is therefore **not** counted as a false allow, and a human allow is not counted as a
   sample. The `ENGINE_DATA_VERSION` bump clears any existing latch, but evidence inside the replay
   window that predates this change under-reports deletes until it ages out of the window.
+- On Windows hosts, bash-layer deletes are mapped through WSL (`/mnt/c/...`), which the git
+  lookup cannot vouch for, so they always go to a human (cmd, PowerShell and provider `delete`
+  deletes are checked normally).
 - More deletes reach the human than before (e.g. deleting a freshly created scratch file).
 
 ### Follow-up / Guardrails

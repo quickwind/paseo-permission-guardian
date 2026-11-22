@@ -468,7 +468,8 @@ Rules:
   changes. `server/context/git-state.ts` asks `git` (`execFile`, no shell, inherited `GIT_*`
   removed, `GIT_OPTIONAL_LOCKS=0`, literal pathspecs, fsmonitor/untracked cache off, 1500 ms
   budget, hook signal) about the entry `rm` removes (parent realpath + kept basename, so a symlink
-  is judged as the link). A raw target with a `..` segment is never clean (no git call). Anything else — untracked, ignored, modified,
+  is judged as the link). A raw target with a `..` segment is never clean (no git call).
+  On Windows hosts, bash-layer deletes are mapped via WSL and therefore always go to a human. Anything else — untracked, ignored, modified,
   staged, outside the worktree or repository, not a repo, git error/timeout — is L1
   `delete_uncommitted:<path>`. The provider is injected (`gitStateProvider`); `decideAction` never
   spawns git itself. Replay uses the recorded `contextSnapshot.deleteTargetsClean` and never calls
