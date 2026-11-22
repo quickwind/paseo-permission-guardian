@@ -597,6 +597,36 @@ describe("GateController — reconciliation, annotations, events", () => {
     expect(s.state).toBe("unavailable");
   });
 
+  it("F5: orphan deny is not persisted into suspendedBy; a later before(L2 ask) drops the candidate", async () => {
+    const g = await latchedGate();
+    const at = new Date(clock).toISOString();
+    await store.recordAfter({
+      requestId: "orph2", agentId: "a", provider: "claude", mode: "act",
+      resolution: { behavior: "deny", resolvedAt: at, actor: "human" },
+    });
+    expect(g.effectiveMode()).toBe("shadow");
+    expect(g.status().suspended).toBe(false);
+    await new Promise((r) => setTimeout(r, 20));
+    expect((await readGateState(dir))?.suspendedBy ?? []).toEqual([]);
+    await store.recordBefore({
+      requestId: "orph2", agentId: "a", provider: "claude", mode: "act",
+      requestedAt: at, latencyMs: 1, normalizedBy: "t", warnings: [],
+      action: {
+        provider: "claude", agentId: "a", requestId: "orph2", kind: "exec", toolName: "Bash",
+        host: { os: "darwin" }, cwd: "/repo", exec: { shell: "bash", source: "git push --force" },
+      } as AuditRecord["action"] & object,
+      decision: { level: "L2", verdict: "ask", reasons: [] },
+    });
+    expect(g.effectiveMode()).toBe("act");
+    const s = await g.replay();
+    expect(s.state).toBe("latched");
+    expect(s.suspended).toBe(false);
+    expect(s.entries).toEqual([]);
+    expect(g.effectiveMode()).toBe("act");
+    await new Promise((r) => setTimeout(r, 20));
+    expect((await readGateState(dir))?.suspendedBy ?? []).toEqual([]);
+  });
+
   it("human deny of a recorded ask does not change mode immediately", async () => {
     const g = await latchedGate();
     await seed("d1", "ask", "deny");

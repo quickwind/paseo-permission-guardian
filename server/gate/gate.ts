@@ -290,6 +290,13 @@ export class GateController {
         this.candidates.set(record.requestId, { seq: this.seq, entry });
         this.applyTransitions(false, modeBefore);
       } else {
+        // The merged record no longer qualifies (e.g. the `before` of an orphan deny arrived with a
+        // verdict other than allow): drop its in-memory candidate.
+        if (this.candidates.has(record.requestId)) {
+          const modeBefore = this.safeCompute().mode;
+          this.candidates.delete(record.requestId);
+          this.applyTransitions(false, modeBefore);
+        }
         this.seq += 1;
         if (res.behavior === "allow" && record.decision?.level === "L3") {
           this.falseDenyCandidates.set(record.requestId, this.seq);
@@ -644,7 +651,9 @@ export class GateController {
       replay.unavailableReason === null &&
       !this.store.getPersistFailure() &&
       !this.stateWriteFailed;
-    const falseIds = new Set(this.falseAllowEntries().map((e) => e.requestId));
+    const faEntries = this.falseAllowEntries();
+    const falseIds = new Set(faEntries.map((e) => e.requestId));
+    const orphanIds = new Set(faEntries.filter((e) => e.kind === "orphan_deny").map((e) => e.requestId));
 
     if (this.file && this.file.latched) {
       const before = this.file.suspendedBy;
@@ -665,7 +674,9 @@ export class GateController {
         this.clearLatch("suspending_entry_aged_out");
       } else {
         if (s.actGate.autoFallbackOnFalseAllow) {
-          for (const id of falseIds) if (!next.includes(id)) next.push(id);
+          // Orphan candidates (no decision yet) only force shadow in memory; they are never
+          // persisted into suspendedBy (F5). The replay decides once the `before` is known.
+          for (const id of falseIds) if (!orphanIds.has(id) && !next.includes(id)) next.push(id);
         }
         const added = next.filter((id) => !before.includes(id));
         const changed = added.length > 0 || next.length !== before.length;
