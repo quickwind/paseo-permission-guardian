@@ -300,10 +300,13 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
   const realHome = resolveReal(home);
   const paseoRoots = ctx.paseoRoots ?? resolvePaseoSelfRoots(ctx.envSnapshot ?? {}, home, ctx.pluginDataDir);
   let pathInput = rawPath;
-  const paseoHomeEnv = ctx.envSnapshot?.PASEO_HOME;
-  if (paseoHomeEnv) {
-    const m = /^\$(?:\{PASEO_HOME\}|PASEO_HOME)(?=\/|$)/.exec(rawPath.trim());
-    if (m) pathInput = paseoHomeEnv + rawPath.trim().slice(m[0].length);
+  const varMatch = /^\$(?:\{(PASEO_HOME|PASEO_PLUGIN_DIR|PASEO_GUARDIAN_DATA_DIR)\}|(PASEO_HOME|PASEO_PLUGIN_DIR|PASEO_GUARDIAN_DATA_DIR))(?=\/|$)/.exec(
+    rawPath.trim(),
+  );
+  if (varMatch) {
+    const varName = varMatch[1] ?? varMatch[2];
+    const varValue = ctx.envSnapshot?.[varName]?.trim();
+    if (varValue) pathInput = varValue + rawPath.trim().slice(varMatch[0].length);
   }
   const normalized = expandPosixPath(pathInput, ctx.cwd, home);
   const realPath = resolveReal(normalized);
@@ -378,7 +381,7 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
     ) {
       isProtected = true;
       isPluginSelf = true;
-      matchedRules.push("protected:plugin_self");
+      if (!matchedRules.includes("protected:plugin_self")) matchedRules.push("protected:plugin_self");
       if (base === "config.json" || base === "settings.json") {
         isSensitive = true;
         matchedRules.push(`sensitive:paseo_self:${base}`);

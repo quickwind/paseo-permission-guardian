@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { SessionContextStore } from "../server/context/session.js";
 import { decideAction, type DecideOptions } from "../server/decide.js";
 import { collectPathsFromObject } from "../server/normalize/types.js";
 import { isBuildOrScriptEntrypoint, resolvePaseoSelfRoots } from "../server/paths/index.js";
@@ -67,4 +68,38 @@ describe("p2a path/normalization hardening", () => {
   );
   it("`.cargo/config.toml` is an entrypoint", () =>
     expect(isBuildOrScriptEntrypoint("/repo/.cargo/config.toml", "/repo")).toBe(true));
+
+  it.each([
+    "$PASEO_PLUGIN_DIR/x.json", "${PASEO_PLUGIN_DIR}/x.json", "$PASEO_GUARDIAN_DATA_DIR/x",
+    "${PASEO_GUARDIAN_DATA_DIR}/x", "${PASEO_HOME}/x", "$PASEO_HOME",
+  ])("writes to %s are L3 when the variable is set", async (p) => {
+    const r = await decideAction(
+      editAction(p),
+      optsWithEnv({ PASEO_HOME: "/ph", PASEO_PLUGIN_DIR: "/pd", PASEO_GUARDIAN_DATA_DIR: "/gd" }),
+    );
+    expect(r.decision.level).toBe("L3");
+  });
+  it("PASEO_PLUGIN_DIR is a plugin-self root", async () => {
+    const r = await decideAction(editAction("/pd/a.json"), optsWithEnv({ PASEO_PLUGIN_DIR: "/pd" }));
+    expect(r.decision.level).toBe("L3");
+  });
+  it("$PASEO_HOME with PASEO_HOME unset does not crash or become plugin-self", async () => {
+    const r = await decideAction(editAction("$PASEO_HOME/x.ts"), optsWithEnv({}));
+    expect(r.decision.level).not.toBe("L3");
+  });
+  it("shell assignment PASEO_HOME=/x ls is exec_inline L1, L2 under untrusted taint", async () => {
+    const action: Action = {
+      ...base(),
+      kind: "exec",
+      toolName: "Bash",
+      exec: { shell: "bash", source: "PASEO_HOME=/x ls" },
+    };
+    const clean = await decideAction(action, opts);
+    expect(clean.decision.level).toBe("L1");
+    expect(clean.decision.effects?.some((e) => e.tag === "exec_inline")).toBe(true);
+    const sessions = new SessionContextStore();
+    sessions.markUntrustedTaint("agent-1");
+    const tainted = await decideAction(action, { ...opts, session: sessions.getOrCreate("agent-1") });
+    expect(tainted.decision.level).toBe("L2");
+  });
 });
