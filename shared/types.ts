@@ -62,6 +62,11 @@ export interface EffectTag {
   recursive?: boolean;
   pluginSelf?: boolean;
   detail?: string;
+  /**
+   * Engine-internal (ADR-0009): the lexically resolved path (no host realpath) of a delete target,
+   * reproducible by replay. Stripped from recorded decisions.
+   */
+  lexicalTarget?: string;
 }
 
 export interface ActionHost {

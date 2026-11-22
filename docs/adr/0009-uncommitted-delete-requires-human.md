@@ -30,14 +30,21 @@ engine. Git state changes over time, so replay cannot ask git again and still be
    `Remove-Item` and aliases, cmd `del`/`erase`, and the provider `delete` action kind, at any
    shell layer.
 2. The lookup lives in `server/context/git-state.ts`: `execFile("git", …)` (no shell), cwd under
-   the worktree root, `GIT_OPTIONAL_LOCKS=0`, `GIT_LITERAL_PATHSPECS=1`, a shared 1500 ms budget
-   per request, and the hook's `AbortSignal`. It is injectable (`gitStateProvider` on the decide
+   the worktree root, inherited `GIT_*` variables removed, `GIT_OPTIONAL_LOCKS=0`,
+   `GIT_LITERAL_PATHSPECS=1`, `-c core.fsmonitor=false -c core.untrackedCache=false`, a shared
+   1500 ms budget per request, and the hook's `AbortSignal`. Git judges the entry `rm` removes:
+   only the parent directory is realpath-resolved and the final component is kept, so a symlink is
+   checked as the link itself (an untracked or retargeted link is not clean even if its target is). It is injectable (`gitStateProvider` on the decide
    options / guardian options) so tests do not shell out. `decideAction` never spawns git by
    itself: without a provider every target is not clean.
 3. The live decision records the per-target result in the audit record as
-   `contextSnapshot.deleteTargetsClean: Record<redactedTarget, boolean>` (keys redacted like other
-   paths; on a key collision `false` wins). Replay passes the recorded map and **never calls git**;
-   a missing key ⇒ not clean (L1). Results are not cached anywhere else (no cross-state caching).
+   `contextSnapshot.deleteTargetsClean: Record<redactedLexicalPath, boolean>`. The key is the
+   target's lexically resolved path (no host realpath; carried on the effect as the engine-internal
+   `lexicalTarget` and stripped from recorded decisions), redacted like other paths (on a key
+   collision `false` wins). Replay runs without host realpaths and reproduces exactly this key, so a
+   live decision always finds its own result in replay. Replay passes the recorded map and **never
+   calls git**; a missing key ⇒ not clean (L1). Results are not cached anywhere else (no
+   cross-state caching).
 4. `ENGINE_DATA_VERSION` becomes 2, so an existing latch does not outlive the old rule.
 
 ## Consequences
@@ -45,15 +52,17 @@ engine. Git state changes over time, so replay cannot ask git again and still be
 ### Positive
 
 - Irreversible loss of uncommitted work always involves the human, including in `act` mode.
-- Replay stays deterministic and offline; old records without the map replay as L1, which can only
-  remove samples, never add a false allow.
+- Replay stays deterministic and offline, and reproduces the live result for every record written
+  by this engine version (keys are reproducible, including through symlinked directories).
 
 ### Negative / Trade-offs
 
 - One to three short `git` processes per delete request (bounded by 1500 ms).
-- Replay keys on the effect target. The live target is host-realpath-resolved while replay skips
-  host realpaths, so a worktree reached through a symlinked directory replays as L1 (fewer samples;
-  safe direction).
+- Legacy records written before this ADR have no `deleteTargetsClean` map, so their
+  non-recursive worktree deletes replay as L1. A human denial of such a delete that the old engine
+  rated L0 is therefore **not** counted as a false allow, and a human allow is not counted as a
+  sample. The `ENGINE_DATA_VERSION` bump clears any existing latch, but evidence inside the replay
+  window that predates this change under-reports deletes until it ages out of the window.
 - More deletes reach the human than before (e.g. deleting a freshly created scratch file).
 
 ### Follow-up / Guardrails

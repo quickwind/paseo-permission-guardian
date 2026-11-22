@@ -465,12 +465,15 @@ Rules:
 - **Uncommitted deletes** ([ADR-0009](./adr/0009-uncommitted-delete-requires-human.md)): a
   non-recursive `delete_worktree` (bash `rm`, PowerShell `Remove-Item`, cmd `del`/`erase`, provider
   `delete`) is L0 only if every target is a regular tracked git entry with no worktree/index
-  changes. `server/context/git-state.ts` asks `git` (`execFile`, no shell, `GIT_OPTIONAL_LOCKS=0`,
-  literal pathspecs, 1500 ms budget, hook signal). Anything else — untracked, ignored, modified,
+  changes. `server/context/git-state.ts` asks `git` (`execFile`, no shell, inherited `GIT_*`
+  removed, `GIT_OPTIONAL_LOCKS=0`, literal pathspecs, fsmonitor/untracked cache off, 1500 ms
+  budget, hook signal) about the entry `rm` removes (parent realpath + kept basename, so a symlink
+  is judged as the link). Anything else — untracked, ignored, modified,
   staged, outside the worktree or repository, not a repo, git error/timeout — is L1
   `delete_uncommitted:<path>`. The provider is injected (`gitStateProvider`); `decideAction` never
   spawns git itself. Replay uses the recorded `contextSnapshot.deleteTargetsClean` and never calls
-  git; a missing entry is not clean.
+  git; keys are the redacted lexical target paths (no host realpath), which replay reproduces
+  exactly. A missing entry (e.g. legacy records) is not clean.
 
 **What `act` answers** ([ADR-0008](./adr/0008-act-mode-evidence-gate.md)): only when the effective
 mode is `act` (the evidence gate is open, see §12.1/§13.2). L0 `allow` is answered with the
@@ -616,7 +619,7 @@ notifications. Timeout ⇒ normal human flow. The plugin detects and prefers it 
   options), `contextSnapshot` (taint flags, modified entrypoints/files before the decision, paths
   redacted, files capped at 200 with a truncation flag, `contextUnavailable` when the timeline
   could not be synced, and `deleteTargetsClean` — per non-recursive worktree delete target, keyed
-  by the redacted target, whether it was tracked and clean in git at decision time, ADR-0009),
+  by the redacted lexical target path, whether it was tracked and clean in git at decision time, ADR-0009),
   `agentTitle` (from the hook payload, redacted, on both `before` and `after` records),
   `orphanContext` (display-only timeline recovery for orphan human denials, see §13.2), and `actOutcome` (`sent | answered | unconfirmed | lost_race | error`;
   `skipped` exists in the type but is never written). Lines for the same `requestId` merge
@@ -647,9 +650,10 @@ on every status): requested/resolved time, provider, agent id and title, tool na
 source ≤200 chars, paths, URL, or MCP `server:tool`), per-sub-command effects, and the human's
 resolution (behavior, selected option, message). For an orphan human denial the `after` hook
 best-effort recovers the matching tool call from the agent timeline (same tail/wholeTurns query as
-the `before` hook, 3 s budget, hook signal; prefers a denied, then failed/canceled, then running
+the `before` hook, run in the background, 3 s budget, hook signal; prefers a denied, then failed/canceled, then running
 call nearest before `resolvedAt` within 10 minutes) and stores `orphanContext: { toolName,
-summary, callId, matchedBy }` or `{ unavailable: true }` via an `update` event. This is display
+summary, callId, matchedBy }` (redacted, then truncated) or `{ unavailable: true }` via an
+`update` event; it is dropped if the request's `before` arrives later. This is display
 data only: it never notifies the gate, and orphans keep the gate `unavailable` until annotated.
 `guardian.status` also triggers a non-blocking backfill for orphans without `orphanContext`
 (once per id per process, at most 5 per call; untimed timeline items are not used). Over the last

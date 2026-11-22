@@ -54,9 +54,11 @@ export interface DecideResult {
 function deleteTargetsNeedingGitCheck(effects: EffectTag[]): string[] {
   const targets = new Set<string>();
   for (const e of effects) {
-    if (e.tag === "delete_worktree" && !e.recursive && typeof e.target === "string") {
-      targets.add(e.target);
-    }
+    if (e.tag !== "delete_worktree" || e.recursive) continue;
+    // Keyed by the lexical path: replay (skipHostRealpath) reproduces it exactly, and the git
+    // check must look at the path `rm` removes (a symlink itself, not its target).
+    const key = e.lexicalTarget ?? e.target;
+    if (typeof key === "string") targets.add(key);
   }
   return [...targets];
 }
@@ -302,7 +304,7 @@ export async function decideAction(
 
   const redactedReasons = Array.from(new Set(reasons.map((r) => redactString(r))));
   const redactedOpaqueReasons = Array.from(new Set(opaqueReasons.map((r) => redactString(r))));
-  const redactedEffects = effects.map((e) => ({
+  const redactedEffects = effects.map(({ lexicalTarget: _lexical, ...e }) => ({
     ...e,
     ...(e.target !== undefined ? { target: redactString(e.target) } : {}),
     ...(e.detail !== undefined ? { detail: redactString(e.detail) } : {}),

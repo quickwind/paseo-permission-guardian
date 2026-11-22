@@ -757,6 +757,7 @@ function classifyDeleteTargets(
           tag: "delete_worktree",
           layer: cmd.depth,
           target: p.realPath,
+          lexicalTarget: p.normalized,
           recursive,
           reversibility: "irreversible",
         });
@@ -1759,7 +1760,7 @@ export async function analyzeActionEffects(
           pluginSelf: p.isPluginSelf,
         });
       } else if (p.inWorktree || p.isTemp) {
-        effects.push({ tag: "delete_worktree", layer: 0, target: p.realPath });
+        effects.push({ tag: "delete_worktree", layer: 0, target: p.realPath, lexicalTarget: p.normalized });
       } else {
         effects.push({ tag: "delete_outside", layer: 0, target: p.realPath });
       }

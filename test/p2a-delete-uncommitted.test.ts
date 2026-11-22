@@ -415,3 +415,111 @@ describe("A: live path records deleteTargetsClean in the context snapshot", () =
     await store.flush();
   });
 });
+
+describe("Fix round 1: symlinks, reproducible keys, env isolation", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    while (dirs.length) await rm(dirs.pop() as string, { recursive: true, force: true });
+  });
+  const gitEnvVars = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+  function git(cwd: string, ...args: string[]) {
+    execFileSync("git", args, { cwd, stdio: "ignore", env: { ...process.env, ...gitEnvVars } });
+  }
+
+  /** A repo reached through a symlinked parent directory (the path used is NOT realpath-resolved). */
+  async function symlinkedRepo(): Promise<{ base: string; repo: string }> {
+    const base = await realpath(await mkdtemp(join(tmpdir(), "pg-sym-")));
+    dirs.push(base);
+    const { symlink } = await import("node:fs/promises");
+    await mkdir(join(base, "real"));
+    await symlink(join(base, "real"), join(base, "link"), process.platform === "win32" ? "junction" : "dir");
+    const repo = join(base, "link", "repo");
+    await mkdir(repo);
+    git(repo, "init", "-q");
+    await writeFile(join(repo, "a.txt"), "a");
+    git(repo, "add", ".");
+    git(repo, "commit", "-q", "-m", "init");
+    return { base, repo };
+  }
+
+  (process.platform === "win32" ? it.skip : it)("symlinks are judged as the link itself (I2)", async () => {
+    const { repo } = await symlinkedRepo();
+    const { symlink } = await import("node:fs/promises");
+    await writeFile(join(repo, "b.txt"), "b");
+    await symlink("a.txt", join(repo, "tracked-link"));
+    git(repo, "add", ".");
+    git(repo, "commit", "-q", "-m", "more");
+    await symlink("a.txt", join(repo, "untracked-link"));
+    await symlink("a.txt", join(repo, "retarget-link"));
+    git(repo, "add", "retarget-link");
+    git(repo, "commit", "-q", "-m", "retarget");
+    await rm(join(repo, "retarget-link"));
+    await symlink("b.txt", join(repo, "retarget-link"));
+
+    const provider = createGitStateProvider();
+    const t = (n: string) => join(repo, n);
+    expect(
+      await provider({ worktreeRoot: repo, targets: [t("untracked-link"), t("retarget-link"), t("tracked-link"), t("a.txt")] }),
+    ).toEqual({ [t("untracked-link")]: false, [t("retarget-link")]: false, [t("tracked-link")]: true, [t("a.txt")]: true });
+
+    // End to end: `rm untracked-link` (target a.txt is tracked and clean) is L1.
+    const action: Action = { ...bash("rm untracked-link"), cwd: repo, worktreeRoot: repo };
+    const r = await decideAction(action, {
+      pathCtx: { cwd: repo, worktreeRoot: repo, home: "/Users/alice", pluginDataDir: "/Users/alice/.paseo/permission-guardian" },
+      denyAsAsk: false,
+      gitStateProvider: provider,
+    });
+    expect(r.decision.level).toBe("L1");
+    expect(r.decision.reasons.some((x) => x.startsWith("delete_uncommitted:"))).toBe(true);
+  }, 20_000);
+
+  it("inherited GIT_* variables do not redirect the lookup (M3)", async () => {
+    const { repo } = await symlinkedRepo();
+    const saved = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+    process.env.GIT_DIR = join(repo, "no-such-git-dir");
+    process.env.GIT_WORK_TREE = tmpdir();
+    try {
+      const res = await createGitStateProvider()({ worktreeRoot: repo, targets: [join(repo, "a.txt")] });
+      expect(res).toEqual({ [join(repo, "a.txt")]: true });
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }, 20_000);
+
+  it("live L0 delete in a symlinked worktree + human deny ⇒ replay counts a false_allow (C1)", async () => {
+    const { base, repo } = await symlinkedRepo();
+    const { AuditStore } = await import("../server/audit/store.js");
+    const { PermissionGuardianService } = await import("../server/guardian.js");
+    const { DEFAULT_GUARDIAN_SETTINGS } = await import("../shared/settings.js");
+    const { replayWindow, CONFIRMED_CANCELLATION_SIGNATURES } = await import("../server/gate/replay.js");
+    const { readAuditWindow } = await import("../server/audit/reader.js");
+    const dataDir = join(base, "data");
+    const store = new AuditStore({ dataDir, pluginVersion: "0" });
+    const service = new PermissionGuardianService({
+      auditStore: store,
+      pluginVersion: "0",
+      initialSettings: DEFAULT_GUARDIAN_SETTINGS,
+      gitStateProvider: createGitStateProvider(),
+    });
+    const agent = { id: "ag", workspaceId: "w", parentAgentId: null, provider: "claude", cwd: repo, title: "T", background: false, metadata: {} };
+    const command = process.platform === "win32" ? "del a.txt" : "rm a.txt";
+    await service.handlePermissionBefore({
+      agent,
+      request: { id: "q1", provider: "claude", name: "Bash", kind: "tool", input: { command } },
+    });
+    expect(store.getRecord("q1")?.decision?.level, JSON.stringify(store.getRecord("q1")?.decision)).toBe("L0");
+    await service.handlePermissionAfter({ agent, requestId: "q1", resolution: { behavior: "deny" } });
+    await service.flush();
+
+    const window = await readAuditWindow(dataDir, 0);
+    const replay = createReplayDecide({ pwshHostFactory: () => null, home: (await import("node:os")).homedir(), dataDir, env: process.env });
+    gitCalls.count = 0;
+    const res = await replayWindow(window, replay, { cancellationSignatures: CONFIRMED_CANCELLATION_SIGNATURES });
+    await replay.dispose();
+    expect(gitCalls.count).toBe(0);
+    expect(res.falseAllows.map((e) => e.requestId)).toEqual(["q1"]);
+  }, 20_000);
+});

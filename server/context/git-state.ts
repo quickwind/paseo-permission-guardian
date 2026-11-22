@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
  * Git working-tree state for delete targets (ADR-0009). A target is "clean" only when it is a
@@ -9,8 +9,11 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
  * Every other outcome — untracked, ignored, modified, staged, outside the worktree, a directory,
  * not a repository, git missing, timeout, abort or any error — is `false` (fail to human).
  *
- * Pure Node: spawns the `git` binary via `execFile` (no shell) with `GIT_OPTIONAL_LOCKS=0` and
- * literal pathspecs. Results are never cached: each call reflects the state at decision time and
+ * Targets are the lexical delete paths; only their parent directory is realpath-resolved, so a
+ * symlink is judged as the link `rm` removes (tracked and unchanged link ⇒ clean), never its target.
+ *
+ * Pure Node: spawns the `git` binary via `execFile` (no shell) with `GIT_OPTIONAL_LOCKS=0`, literal
+ * pathspecs, inherited `GIT_*` variables removed, and fsmonitor / untracked cache disabled. Results are never cached: each call reflects the state at decision time and
  * the live path records it in the audit snapshot so replay never calls git.
  */
 export interface GitStateRequest {
@@ -31,6 +34,36 @@ export interface GitStateProviderOptions {
 
 export const DEFAULT_GIT_STATE_TIMEOUT_MS = 1500;
 const MAX_BUFFER = 4 * 1024 * 1024;
+
+/** Inherited `GIT_*` variables (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, …) must not redirect git. */
+function gitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!/^GIT_/i.test(k)) env[k] = v;
+  }
+  env.GIT_OPTIONAL_LOCKS = "0";
+  env.GIT_LITERAL_PATHSPECS = "1";
+  env.GIT_TERMINAL_PROMPT = "0";
+  env.LC_ALL = "C";
+  return env;
+}
+
+const GIT_CONFIG_ARGS = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"];
+
+/**
+ * The path `rm` actually removes: only the parent directory is realpath-resolved, the final
+ * component is kept (so a symlink is checked as the link itself, not its target). The entry must
+ * exist (lstat).
+ */
+async function deletedEntryPath(target: string): Promise<string | null> {
+  const abs = resolve(target);
+  const name = basename(abs);
+  if (!name || name === "." || name === "..") return null;
+  const parent = await realpath(dirname(abs));
+  const entry = join(parent, name);
+  await lstat(entry);
+  return entry;
+}
 
 function allFalse(targets: string[]): Record<string, boolean> {
   return Object.fromEntries(targets.map((t) => [t, false]));
@@ -72,20 +105,14 @@ export function createGitStateProvider(options: GitStateProviderOptions = {}): G
         }
         execFile(
           gitBinary,
-          args,
+          [...GIT_CONFIG_ARGS, ...args],
           {
             cwd,
             signal: controller.signal,
             windowsHide: true,
             maxBuffer: MAX_BUFFER,
             encoding: "utf8",
-            env: {
-              ...process.env,
-              GIT_OPTIONAL_LOCKS: "0",
-              GIT_LITERAL_PATHSPECS: "1",
-              GIT_TERMINAL_PROMPT: "0",
-              LC_ALL: "C",
-            },
+            env: gitEnv(),
           },
           (error, stdout) => {
             if (error) reject(error);
@@ -104,8 +131,13 @@ export function createGitStateProvider(options: GitStateProviderOptions = {}): G
       const relByTarget = new Map<string, string>();
       for (const target of targets) {
         if (!isAbsolute(target)) continue;
-        const abs = resolve(target);
-        if (!isUnder(root, abs)) continue;
+        let abs: string | null;
+        try {
+          abs = await deletedEntryPath(target);
+        } catch {
+          abs = null;
+        }
+        if (!abs || !isUnder(root, abs)) continue;
         const rel = toGitRel(top, abs);
         if (rel !== null) relByTarget.set(target, rel);
       }
