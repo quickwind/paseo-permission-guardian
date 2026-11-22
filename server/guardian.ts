@@ -94,6 +94,8 @@ export class PermissionGuardianService {
   private readonly responder: ActResponder | undefined;
   private readonly gitStateProvider: GitStateProvider;
   private readonly backfillAttempted = new Set<string>();
+  /** Ids stored as `{ unavailable: true }` that backfill already retried once (this process). */
+  private readonly unavailableRetried = new Set<string>();
   private readonly pendingEnrichments = new Set<Promise<void>>();
 
   private settings: GuardianSettings;
@@ -353,7 +355,8 @@ export class PermissionGuardianService {
         this.trackEnrichment(
           this.enrichOrphan(merged.requestId, merged.agentId, ctx.fetchTimelineEntries, {
             allowUntimed: true,
-            ...(ctx.signal ? { signal: ctx.signal } : {}),
+            // No hook signal: the hook returns before this finishes and Paseo may abort it then.
+            // The enrichment is bounded by its own timeout instead.
             ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
           }),
           merged.requestId,
@@ -369,7 +372,9 @@ export class PermissionGuardianService {
 
   /**
    * One-off best-effort backfill for orphan human denials that lack an orphan context (e.g. written
-   * before this feature). Each id is attempted at most once per process; at most 5 per call.
+   * before this feature) or whose recovery came back `{ unavailable: true }`. A missing context is
+   * attempted at most once per process, an unavailable one is retried at most once per process;
+   * at most 5 per call.
    */
   async backfillOrphanContexts(
     requestIds: string[],
@@ -379,11 +384,15 @@ export class PermissionGuardianService {
     let started = 0;
     for (const id of requestIds) {
       if (started >= MAX_BACKFILL_PER_CALL) break;
-      if (!id || this.backfillAttempted.has(id)) continue;
+      if (!id) continue;
       const record = this.auditStore.getRecord(id);
-      if (!record || !this.isOrphanHumanDeny(record) || record.orphanContext) continue;
-      if (this.backfillAttempted.size >= MAX_BACKFILL_TRACKED) this.backfillAttempted.clear();
-      this.backfillAttempted.add(id);
+      if (!record || !this.isOrphanHumanDeny(record)) continue;
+      const oc = record.orphanContext;
+      if (oc && oc.unavailable !== true) continue;
+      const attempts = oc ? this.unavailableRetried : this.backfillAttempted;
+      if (attempts.has(id)) continue;
+      if (attempts.size >= MAX_BACKFILL_TRACKED) attempts.clear();
+      attempts.add(id);
       started += 1;
       this.trackEnrichment(this.enrichOrphan(id, record.agentId, fetcher, signal ? { signal } : {}), id);
     }

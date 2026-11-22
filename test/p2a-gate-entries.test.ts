@@ -335,3 +335,83 @@ describe("B: guardian enrichment", () => {
     await store.flush();
   });
 });
+
+describe("Fix round 2: stale orphanContext and enrichment signal", () => {
+  const agent = { id: "agent-1", workspaceId: "w", parentAgentId: null, provider: "agy", cwd: "/repo", title: "T", background: false, metadata: {} };
+  const good = async () => [{ item: toolCall("c1", "canceled", "rm q"), timestamp: iso(T0 + 59_000) }];
+
+  async function setup() {
+    const dataDir = await tmp();
+    const clock = { now: T0 + 60_000 };
+    const store = new AuditStore({ dataDir, pluginVersion: "0", now: () => new Date(clock.now) });
+    const service = new PermissionGuardianService({
+      auditStore: store,
+      pluginVersion: "0",
+      initialSettings: DEFAULT_GUARDIAN_SETTINGS,
+      now: () => clock.now,
+      gitStateProvider: async () => ({}),
+    });
+    return { dataDir, store, service };
+  }
+
+  it("R1: a reload after a late before drops the stale orphanContext; non-orphan entries never show it", async () => {
+    const { dataDir, store, service } = await setup();
+    await service.handlePermissionAfter({ agent, requestId: "late", resolution: { behavior: "deny" } }, { fetchTimelineEntries: good });
+    await service.whenEnrichmentsIdle();
+    expect(store.getRecord("late")?.orphanContext).toMatchObject({ callId: "c1" });
+    await service.handlePermissionBefore({
+      agent,
+      request: { id: "late", provider: "agy", name: "Bash", kind: "tool", input: { command: "ls" } },
+    });
+    await service.flush();
+    const disk = await readAuditDir(dataDir);
+    expect(disk.records.get("late")?.decision).toBeDefined();
+    expect(disk.records.get("late")?.orphanContext).toBeUndefined();
+    const reloaded = new AuditStore({ dataDir, pluginVersion: "0" });
+    await reloaded.loadFromDisk();
+    expect(reloaded.getRecord("late")?.orphanContext).toBeUndefined();
+
+    const withStale = record({ orphanContext: { summary: "stale", callId: "x" } });
+    expect(buildGateEntry(withStale, "false_allow", []).orphanContext).toBeUndefined();
+    expect(buildGateEntry(withStale, "orphan_deny", []).orphanContext).toMatchObject({ callId: "x" });
+  });
+
+  it("R2: background enrichment ignores an aborted hook signal", async () => {
+    const { store, service } = await setup();
+    const ac = new AbortController();
+    ac.abort();
+    await service.handlePermissionAfter(
+      { agent, requestId: "o", resolution: { behavior: "deny" } },
+      { fetchTimelineEntries: good, signal: ac.signal },
+    );
+    await service.whenEnrichmentsIdle();
+    expect(store.getRecord("o")?.orphanContext).toMatchObject({ callId: "c1" });
+    await store.flush();
+  });
+
+  it("R2: backfill retries an unavailable orphanContext at most once per run", async () => {
+    const { store, service } = await setup();
+    await service.handlePermissionAfter(
+      { agent, requestId: "u1", resolution: { behavior: "deny" } },
+      { fetchTimelineEntries: async () => Promise.reject(new Error("x")) },
+    );
+    await service.handlePermissionAfter(
+      { agent, requestId: "u2", resolution: { behavior: "deny" } },
+      { fetchTimelineEntries: async () => Promise.reject(new Error("x")) },
+    );
+    await service.whenEnrichmentsIdle();
+    expect(store.getRecord("u1")?.orphanContext).toEqual({ unavailable: true });
+    await service.backfillOrphanContexts(["u1"], good);
+    expect(store.getRecord("u1")?.orphanContext).toMatchObject({ callId: "c1" });
+    let failing = 0;
+    const bad = async () => {
+      failing += 1;
+      throw new Error("still down");
+    };
+    await service.backfillOrphanContexts(["u2"], bad);
+    await service.backfillOrphanContexts(["u2"], bad);
+    expect(failing).toBe(1);
+    expect(store.getRecord("u2")?.orphanContext).toEqual({ unavailable: true });
+    await store.flush();
+  });
+});

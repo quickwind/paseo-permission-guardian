@@ -137,7 +137,6 @@ export default function contribute(server: PluginServerContext) {
     await storeReady;
     await guardian.handlePermissionAfter(payload, {
       fetchTimelineEntries: timelineEntriesFetcher(context.paseo),
-      signal: context.signal,
     });
   });
 
@@ -157,7 +156,7 @@ export default function contribute(server: PluginServerContext) {
     const status = guardian.getStatus();
     // One-off, bounded, non-blocking backfill of orphan denials that lack recovered context.
     const orphanIds = status.gate.entries
-      .filter((e) => e.kind === "orphan_deny" && !e.orphanContext)
+      .filter((e) => e.kind === "orphan_deny" && (!e.orphanContext || e.orphanContext.unavailable === true))
       .map((e) => e.requestId);
     if (orphanIds.length > 0) {
       void storeReady

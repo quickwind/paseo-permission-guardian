@@ -99,6 +99,9 @@ export async function readAuditDir(
           if (v !== undefined) merged[k] = v;
         }
         const out = merged as unknown as AuditRecord;
+        // A record that has a decision is not an orphan: a stale orphanContext from an earlier
+        // update line must not survive a reload.
+        if (out.decision && out.orphanContext !== undefined) delete out.orphanContext;
         if (prev) {
           const line = rec as AuditRecord;
           if ((line.decision === undefined && out.decision) || (line.resolution === undefined && out.resolution)) {

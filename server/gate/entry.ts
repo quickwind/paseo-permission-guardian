@@ -51,7 +51,8 @@ export function buildGateEntry(
     if (typeof res.message === "string") e.resolution.message = clip(res.message, ENTRY_MESSAGE_MAX);
   }
   const oc = record.orphanContext;
-  if (oc && typeof oc === "object") {
+  // Orphan context describes orphan denials only; never shown on any other entry kind.
+  if (kind === "orphan_deny" && oc && typeof oc === "object") {
     e.orphanContext = {};
     if (oc.unavailable === true) e.orphanContext.unavailable = true;
     for (const k of ["toolName", "summary", "callId", "matchedBy"] as const) {

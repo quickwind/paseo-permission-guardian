@@ -468,7 +468,7 @@ Rules:
   changes. `server/context/git-state.ts` asks `git` (`execFile`, no shell, inherited `GIT_*`
   removed, `GIT_OPTIONAL_LOCKS=0`, literal pathspecs, fsmonitor/untracked cache off, 1500 ms
   budget, hook signal) about the entry `rm` removes (parent realpath + kept basename, so a symlink
-  is judged as the link). Anything else — untracked, ignored, modified,
+  is judged as the link). A raw target with a `..` segment is never clean (no git call). Anything else — untracked, ignored, modified,
   staged, outside the worktree or repository, not a repo, git error/timeout — is L1
   `delete_uncommitted:<path>`. The provider is injected (`gitStateProvider`); `decideAction` never
   spawns git itself. Replay uses the recorded `contextSnapshot.deleteTargetsClean` and never calls
@@ -653,10 +653,13 @@ best-effort recovers the matching tool call from the agent timeline (same tail/w
 the `before` hook, run in the background, 3 s budget, hook signal; prefers a denied, then failed/canceled, then running
 call nearest before `resolvedAt` within 10 minutes) and stores `orphanContext: { toolName,
 summary, callId, matchedBy }` (redacted, then truncated) or `{ unavailable: true }` via an
-`update` event; it is dropped if the request's `before` arrives later. This is display
+`update` event; it is dropped if the request's `before` arrives later (also when re-merging
+from disk) and is only shown on `orphan_deny` entries. The background enrichment does not use the
+hook signal (bounded by its own timeout). This is display
 data only: it never notifies the gate, and orphans keep the gate `unavailable` until annotated.
 `guardian.status` also triggers a non-blocking backfill for orphans without `orphanContext`
-(once per id per process, at most 5 per call; untimed timeline items are not used). Over the last
+(once per id per process, plus one retry of an `{ unavailable: true }` result; at most 5 per
+call; untimed timeline items are not used). Over the last
 `windowDays`, a sample is a human-resolved request the current engine judges `allow`; a false-allow
 is a human denial of such a request (any non-plugin `deny` counts unless it matches a confirmed
 cancellation signature, initially none); a false-deny is a human allow of a request the engine
