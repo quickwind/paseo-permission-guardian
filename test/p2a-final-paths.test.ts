@@ -194,3 +194,16 @@ describe("F2 R11 on Windows paths", () => {
     },
   );
 });
+
+describe("M3 .husky is a protected repo prefix", () => {
+  it("POSIX edit of .husky/pre-commit is protected", async () => {
+    const wt = "/repo";
+    const r = await decideAction(posixAction("edit", "/repo/.husky/pre-commit", wt), posixOpts({}, wt));
+    expect(r.decision.level).not.toBe("L0");
+    expect(r.decision.reasons.join(",")).toMatch(/write_protected/);
+  });
+  it("Windows .husky path is protected", () => {
+    const c = classifyWindowsPath("C:\\repo\\.husky\\pre-commit", { ...winCtx, cwd: "C:\\repo", worktreeRoot: "C:\\repo" });
+    expect(c.isProtected).toBe(true);
+  });
+});

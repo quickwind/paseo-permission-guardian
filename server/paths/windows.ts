@@ -150,6 +150,7 @@ const REPO_PROTECTED_PREFIXES = [
   ".codex",
   ".cursor",
   ".github/workflows",
+  ".husky",
 ];
 
 const HOME_SENSITIVE_POSIX = [

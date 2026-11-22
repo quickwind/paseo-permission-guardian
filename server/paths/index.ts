@@ -91,6 +91,7 @@ const REPO_PROTECTED_PREFIXES = [
   ".codex",
   ".cursor",
   ".github/workflows",
+  ".husky",
 ];
 
 const SENSITIVE_BASENAME_PATTERNS: readonly RegExp[] = [
