@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "phase1/**"
+  pull_request:
+
+jobs:
+  unit-and-os-matrix:
+    name: Unit & OS Matrix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Runtime boundary checks
+        run: npm run check:boundaries
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Verify live Windows PowerShell 5.1 & PowerShell 7 PwshParserHost suites
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $jsonFile = Join-Path $env:RUNNER_TEMP "vitest-pwsh-win.json"
+          npx vitest run test/vectors/windows/pwsh.test.ts test/vectors/windows/security-adversarial.test.ts --reporter=verbose --reporter=json --outputFile.json="$jsonFile"
+          if ($LASTEXITCODE -ne 0) { throw "Windows live pwsh Vitest suites failed" }
+          if (-not (Test-Path $jsonFile)) { throw "Vitest JSON report missing: $jsonFile" }
+          $report = Get-Content -Raw -Path $jsonFile | ConvertFrom-Json
+          $ps5Assertions = @($report.testResults | ForEach-Object { $_.assertionResults } | Where-Object { $_.fullName -match 'Windows PowerShell 5\.1 host' })
+          if ($ps5Assertions.Count -eq 0) {
+            throw "Windows PowerShell 5.1 host test assertions were missing from Vitest JSON report"
+          }
+          $nonPassed = @($ps5Assertions | Where-Object { $_.status -ne 'passed' })
+          if ($nonPassed.Count -gt 0) {
+            $nonPassed | ForEach-Object { Write-Error "PS5.1 test did not pass: $($_.fullName) ($($_.status))" }
+            throw "Windows PowerShell 5.1 host test unexpectedly skipped or failed on windows-latest"
+          }
+
+  paseo-daemon-smoke:
+    name: Paseo Daemon Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install plugin dependencies
+        run: npm ci
+
+      - name: Install @getpaseo/cli@0.16.2
+        run: npm --prefix /tmp/paseo-cli install --no-save @getpaseo/cli@0.16.2
+
+      - name: Run headless Paseo daemon smoke test
+        env:
+          PASEO_BIN: /tmp/paseo-cli/node_modules/.bin/paseo
+        run: npm run smoke:daemon

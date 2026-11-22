@@ -177,6 +177,7 @@ paseo-permission-guardian/
       windows-builtins.ts  # del, rd, reg, sc, schtasks, robocopy, icacls, …
       handlers/            # JS ports for commands needing code (curl, …)
     paths/                 # normalization, ancestor realpath, WSL mapping, sensitive/protected catalogs
+    secrets/               # stateless credential literal patterns & env var classifiers (ADR-0005)
     context/               # incremental timeline sync, taint, secretTaint, provenance, scope grants
     effects.ts             # effect vocabulary + combination rules
     policy/                # layered YAML loading, schema, project sha256 pinning
@@ -228,22 +229,24 @@ analyze(layer: Shell, source: string, ctx: LayerContext): LayerResult
 ```
 
 Each parser produces simple commands (name, argv, redirections, assignments, env reads). Wrapper
-commands produce a **child layer** with an adjusted context and `depth + 1`. Results from all
-layers are merged before combination rules run, so cross-layer patterns (e.g. Windows reads a
-secret, WSL sends it out) are still caught. Maximum depth: 3. Beyond that the call is opaque.
+commands (`cmd /c`, `start`, `wsl`, `powershell -c`, `bash -c`, `env -S`) preserve outer
+`redirections` / `envReads` at their own layer before producing a **child layer** with an adjusted
+context and `depth + 1`. Results from all layers are merged before combination rules run, so
+cross-layer patterns (e.g. Windows reads a secret, WSL sends it out) are still caught. Maximum depth: 3.
+Beyond that the call is opaque.
 
 ### 7.2 Parsers
 
 | Shell | Parser | Notes |
 | --- | --- | --- |
 | bash / sh / zsh (subset) | `web-tree-sitter` + `tree-sitter-bash` (WASM) | Extract every simple command across `&&`, `||`, `;`, pipes, subshells, `$(...)`, backticks, process substitution, heredocs, redirections, variable expansions |
-| PowerShell | Official parser in a persistent host: `System.Management.Automation.Language.Parser.ParseInput` | Exact grammar of the executing shell (5.1 vs 7). Started once (`-NoProfile -NonInteractive`) with explicit UTF-8 stdio encoding, **serialized request queue**, per-request timeout (500 ms), crash restart + circuit breaker, parse-only, never executes. Any non-empty `ParseError[]` → `opaque`. Can be disabled via policy (`shells.pwshHost: "disabled"`) for EDR-restricted hosts ([ADR-0004](./adr/0004-cross-platform-shell-and-path-strategy.md)). |
+| PowerShell | Official parser in a persistent host: `System.Management.Automation.Language.Parser.ParseInput` | Exact grammar of the executing shell (5.1 vs 7). Launched via verified absolute system path (`SystemRoot`/`ProgramFiles` validated) with minimal sanitized env, system-dir `cwd`, `windowsHide: true`, short `-EncodedCommand` bootstrap + full script streamed over UTF-8 `stdin` pipes ([ADR-0006](./adr/0006-windows-env-classification-shell-hardening-and-static-cwd.md)); on Windows PowerShell 5.1 the transport is an authenticated named pipe with `stdin` ignored, and the 5.1 startup path uses no cmdlets (`[Type]::new()` only) ([ADR-0007](./adr/0007-pwsh5-named-pipe-transport-and-cmdlet-free-cold-start.md)), `-NoProfile -NonInteractive`, **bounded serialized request queue** (depth 64, 2 MiB line limit), per-request timeout (1500 ms warm / 10 s cold, 20 s cold on 5.1), crash restart + circuit breaker, parse-only. Walks nested blocks via `Ast.FindAll({$true}, $true)` with a versioned `nodeTypeCensus` (unknown AST node or non-empty `ParseError[]` → `opaque`). All unrecognized static/instance `.NET` member calls, non-literal type expressions, nested `scriptBlockDepth > 1` cwd changes, dynamic cmdlet arguments, and dynamic `-WhatIf:$var` values fall back to `opaque`. Can be disabled via `shells.pwshHost: "disabled"` ([ADR-0004](./adr/0004-cross-platform-shell-and-path-strategy.md)). |
 | PowerShell (fallback) | Conservative opaque fallback | Used on non-Windows hosts, under WDAC Constrained Language Mode, or when `pwshHost` is disabled; all PowerShell commands emit `opaque` (no PowerShell WASM grammar bundled) |
-| cmd.exe | Conservative tokenizer | Splits on `&`, `&&`, `||`, `|` and redirections with correct quote and `^` handling. `%var%`, `!var!`, `for /f`, `call`, nested `cmd /c` → `opaque` |
+| cmd.exe | Conservative tokenizer | Splits on `&`, `&&`, `||`, `|` and redirections with quote and `^` handling ([ADR-0006](./adr/0006-windows-env-classification-shell-hardening-and-static-cwd.md)). Safe system macros in argument position pass deterministically under strict 4-point guardrails + Path Model sweep; non-allowlisted `%var%`, `!var!`, `for /f`, `call`, substring modifiers, and nested `cmd /c` → `opaque`; bare `set`/`set PREFIX` → `env_dump`; `cwd` shadow binaries checked against `PATHEXT`. |
 
-The PowerShell host extracts `CommandAst` (name via `GetCommandName()`, null for dynamic names),
-`CommandParameterAst`, `InvokeMemberExpressionAst` (.NET calls), `VariableExpressionAst`
-(`$env:*` reads), `RedirectionAst`, `ScriptBlockAst`, and pipeline structure.
+The PowerShell host extracts `CommandAst` (via `GetCommandName()` against backtick obfuscation),
+`CommandParameterAst`, `InvokeMemberExpressionAst`, `VariableExpressionAst` (`$env:*`),
+`AssignmentStatementAst`, `RedirectionAst`, `ScriptBlockAst`, `nodeTypeCensus`, and `--%` stop-parsing spans.
 
 ### 7.3 Wrapper unwrapping
 
@@ -265,7 +268,11 @@ The PowerShell host extracts `CommandAst` (name via `GetCommandName()`, null for
 - The outer AST decides argument boundaries. In PowerShell, `wsl ls | grep x` pipes into a
   Windows-side `grep`; only `wsl "ls | grep x"` pipes inside Linux.
 - Options shape the child context: `-d` (distro), `-u` (user; root ⇒ `privilege`, home `/root`),
-  `--cd` (cwd, Windows or Linux path).
+  `--cd` (cwd, Windows or Linux path). Windows-side assignments and `WSLENV` secret/hijack exports
+  propagate across the boundary ([ADR-0006](./adr/0006-windows-env-classification-shell-hardening-and-static-cwd.md)).
+- Linear static literal `cwd` tracking resolves sequential `cd`/`pushd`/`popd` and single-command
+  flags (`env -C`, `git -C`, `npm --prefix`, `wsl --cd`) deterministically, falling back to `opaque`
+  on conditional/dynamic/drive changes ([ADR-0006](./adr/0006-windows-env-classification-shell-hardening-and-static-cwd.md)).
 - Management commands are classified separately: `--unregister` ⇒ deny (irreversible);
   `--mount`, `--import`, `--export`, `--set-default`, `--install`, `--shutdown`,
   `--terminate` ⇒ human.
@@ -310,23 +317,28 @@ documented in `commands/SAMPLE.toml`: `sub` (nested), `bare`, `bare_flags`, `sta
 - **Alias resolution** first (`rm`, `del`, `ri`, `iwr`, `irm`, `iex`, `gc`, `sc`, and in 5.1
   `curl`/`wget` → `Invoke-WebRequest`).
 - **Parameter prefix disambiguation & positional parameters**: Resolve PowerShell unique-prefix
-  abbreviations (e.g. `-Rec` → `-Recurse`, `-M` → `-Method`, `-Ep` → `-ExecutionPolicy`) for
-  known cmdlets; treat ambiguous or unrecognized abbreviated flags as `opaque`.
+  abbreviations (e.g. `-Rec` → `-Recurse`, `-Me` → `-Method`, `-Ep` → `-ExecutionPolicy`; note `-M`
+  on `Invoke-RestMethod` is ambiguous against `-MaximumRedirection` and safely triggers `opaque`)
+  via explicit per-cmdlet switch/valued parameter schemas; treat ambiguous, unrecognized, dynamic
+  colon/positional arguments, or unrecognized `.NET` member invocations as `opaque`.
 - **Verb taxonomy** as the baseline: `Get/Test/Measure/Select/Find/Resolve/Compare/Format/Out-Host`
   → read; `New/Set/Add/Copy/Move/Rename/Clear/Remove/Start/Stop/Restart/Invoke/Install/Uninstall/Register/Unregister/Enable/Disable`
   → write/exec, refined by noun, parameters and paths.
 - **High-risk constructs**: `Remove-Item -Recurse`; provider paths `HKLM:`/`HKCU:`/`Cert:`;
-  `Set-ExecutionPolicy`, `-ExecutionPolicy Bypass`; `Invoke-WebRequest`/`Invoke-RestMethod`
-  with `-Method Post/Put`, `-Body`, `-InFile`; .NET calls (`[IO.File]::Delete`,
-  `[Net.WebClient]`); `Start-Process -Verb RunAs`; credential cmdlets; `Get-ChildItem Env:` /
-  `$env:*` secret reads.
-- `-WhatIf` on cmdlets that honour it lowers the effect to a preview.
+  `Set-ExecutionPolicy` and `$env:PSExecutionPolicyPreference=Bypass|Unrestricted` (`L2`), `-ExecutionPolicy Bypass`;
+  `Invoke-WebRequest`/`Invoke-RestMethod` with `-Method Post/Put`, `-Body`, `-InFile`, `-UseDefaultCredentials`;
+  .NET calls (`[IO.File]::ReadAllText`/`Delete`, `[IO.Directory]`, `[Diagnostics.Process]::Start`, `[Microsoft.Win32.Registry]`, `[Reflection.Assembly]`, `[Net.WebClient]`, `[Environment]::SetEnvironmentVariable` User/Machine; any unrecognized call → `opaque`);
+  `Start-Process -Verb RunAs`; credential & `Win32_Process.CommandLine` queries; `Get-ChildItem Env:` /
+  `$env:*` secret reads ([ADR-0006](./adr/0006-windows-env-classification-shell-hardening-and-static-cwd.md)).
+- Explicit parameterless `-WhatIf` (or strictly `-WhatIf:$true`) on cmdlets that honour it lowers the effect to a preview (`$WhatIfPreference=$true` and dynamic `-WhatIf:$var` never lower effects).
 
 ### 8.3 Windows built-ins
 
-A small hand-written table for cmd and system tools: `del /s`, `rd /s`, `format`, `robocopy /MIR`,
+A hand-written table for cmd and system tools: `del /s`, `rd /s`, `format`, `robocopy /MIR`,
 `reg add/delete`, `sc`, `schtasks`, `net user`, `icacls`, `takeown`, `vssadmin`, `bcdedit`,
-`diskpart`, `cmdkey`, `setx`, `winget`, `choco`, `msiexec`.
+`diskpart`, `cmdkey`, `setx` (P7 persistent env write), `winget`, `choco`, `msiexec`, plus
+explicit `credential_dump` signatures (`procdump -ma lsass`, `rundll32 comsvcs.dll,MiniDump`,
+`reg save/export HKLM\{SAM,SECURITY,SYSTEM}`, `ntdsutil ... ifm`, shadow-copy SAM extraction).
 
 ## 9. Path model
 
@@ -334,10 +346,14 @@ Correct paths are the foundation of "inside the worktree?" and "credential store
 
 **Normalization**
 
-- Windows: case-insensitive comparison, drive letters, `/` vs `\`, `\\?\` prefixes, UNC paths,
-  8.3 short names (`PROGRA~1`), alternate data streams (`file:stream`), env expansion
-  (`%USERPROFILE%`, `$env:USERPROFILE`, `~`), PowerShell provider drives (`Env:`, `HKLM:`, `Cert:`
-  are not files).
+- Windows: case-insensitive comparison, drive letters, `/` vs `\`, `\\?\` prefixes, UNC/WebDAV paths
+  (remote UNC triggers automatic NTLM egress with path-boundary `inWorktree` checks, [ADR-0006](./adr/0006-windows-env-classification-shell-hardening-and-static-cwd.md)),
+  trailing dot/space stripping (except `\\?\`), reserved device names (`NUL`, `CON`),
+  8.3 short names (`PROGRA~1`), multi-segment alternate data streams (`file::$DATA`, intermediate `.git::$INDEX_ALLOCATION`, `Zone.Identifier` removal), shell-scoped
+  allowlisted env macro expansion (`%USERPROFILE%`, `$env:USERPROFILE`, `~`; arbitrary/secret env vars never expanded),
+  PowerShell provider drives (`Env:`, `HKLM:`, `Cert:` are not files). DrvFs (`/mnt/<drive>/`) and MSYS/Cygwin
+  (`/c/`, `/cygdrive/<drive>/`) paths match sensitive/protected catalogs case-insensitively regardless of host OS
+  when running under `bash`.
 - POSIX: `~`, `$HOME`, `..`, symlinks.
 - **Ancestor-resolved real paths** ([ADR-0004](./adr/0004-cross-platform-shell-and-path-strategy.md)):
   Use `fs.realpathSync.native` when the path exists; when the target does not yet exist (e.g.
@@ -372,19 +388,19 @@ plugin's own policy, settings, and data files.
 | Tag | Meaning |
 | --- | --- |
 | `read` | Reads ordinary files / metadata |
-| `read_secret` | Reads a sensitive path, credential store, or sensitive env vars (`env`, `printenv`, `$env:*_KEY/*_TOKEN/*_SECRET`) |
+| `read_secret` | Reads a sensitive path, credential store, or sensitive env vars / full env dumps / `WSLENV` secret exports / `Win32_Process.CommandLine` / literal credentials ([ADR-0005](./adr/0005-env-classification-and-bash-ast-hardening.md), [ADR-0006](./adr/0006-windows-env-classification-shell-hardening-and-static-cwd.md)) |
 | `write_worktree` | Creates/modifies files inside the worktree |
 | `write_outside` | Writes outside the worktree (excluding temp) |
-| `write_protected` | Writes a protected path |
+| `write_protected` | Writes a protected path or persistent environment target (P7: `setx`, `User`/`Machine` env, `Set-ExecutionPolicy`) |
 | `delete_worktree` / `delete_outside` | Deletes files |
 | `exec_project` | Runs project code (tests, builds, scripts) |
-| `exec_inline` / `exec_network_sourced` | Runs inline code / code fetched from the network |
+| `exec_inline` / `exec_network_sourced` | Runs inline code / env execution hijacks (P3) / code fetched from the network |
 | `pkg_install` | Installs dependencies (may run install scripts) |
-| `net_read` / `net_egress` | Fetches / sends data off the machine |
+| `net_read` / `net_egress` | Fetches / sends data off the machine (incl. remote UNC/WebDAV NTLM) |
 | `vcs_remote` | Push, force-push, remote branch deletion, releases |
 | `infra_read` / `infra_mutate` | Cloud, Kubernetes, IaC, databases (with target) |
 | `privilege` | sudo, `-u root`, RunAs, service/registry/system config |
-| `system_destructive` | Disk, boot, shadow copies, distro unregister |
+| `system_destructive` | Disk, boot, shadow copies, distro unregister, explicit `credential_dump` signatures (LSASS/SAM) |
 | `opaque` | Not statically understood |
 
 Each tag carries attributes: target (path, host, context), reversibility, and source layer.
@@ -416,7 +432,7 @@ See [ADR-0002](./adr/0002-session-context-taint-and-cache-invalidation.md) for r
 | --- | --- |
 | `read_secret` + `net_egress` anywhere in the call (any layer) | deny |
 | `secretTaint` active + `net_egress` in a later call | ask (or deny by policy) |
-| `net_read` piped into an interpreter (`curl \| sh`, `iwr \| iex`) | deny |
+| `net_read` piped into an interpreter (`curl \| sh`, `iwr \| iex`) or combined with `Invoke-Expression` / `[scriptblock]::Create` (`iex (iwr ...).Content`) | deny |
 | `infra_mutate` on a target not in `trusted.environments` | human |
 | `vcs_remote` force or to a protected branch | human |
 | `write_protected` | human (deny for this plugin's own files) |
@@ -548,8 +564,8 @@ notifications. Timeout ⇒ normal human flow. The plugin detects and prefers it 
 - Each record (keyed by `requestId` for `before`/`after` reconciliation): normalized action
   (secrets redacted), layers, effects, reasons, decision, mode, actor attribution, final
   resolution, latency, plugin and data versions.
-- Redaction: known token formats, `Authorization` headers, values of `*_KEY`/`*_TOKEN`/`*_SECRET`
-  env assignments, PEM blocks. Raw commands can be excluded entirely by policy.
+- Redaction: known token formats, `Authorization` headers, URL credentials, values of sensitive
+  env assignments, PEM blocks — applied to `action`, `decision`, and `warnings` ([ADR-0005](./adr/0005-env-classification-and-bash-ast-hardening.md)). Raw commands can be excluded entirely by policy.
 
 ### 13.2 Metrics
 
@@ -569,7 +585,7 @@ be ~0 before `act`), latency p50/p95, opaque rate per shell.
   decisions; any new allow on a previously human-denied action fails the run.
 - **Differential checks**: compare bash parse results against `bash -n` and PowerShell results
   across 5.1/7 where available.
-- **CI matrix**: Linux, macOS, Windows (PowerShell 5.1 and 7), Windows + WSL.
+- **CI matrix**: GitHub Actions `unit-and-os-matrix` across Linux, macOS, and Windows (PowerShell 5.1 & 7 AST host smoke, NTFS & boundary checks) plus `paseo-daemon-smoke` (installing into an ephemeral headless `@getpaseo/cli` daemon and verifying `guardian.status` RPC). Local Playwright UI E2E runs on demand with desktop app builds.
 
 ## 14. Security considerations
 
@@ -599,13 +615,13 @@ be ~0 before `act`), latency p50/p95, opaque rate per shell.
 
 Split P1 into P1a and P1b to validate shadow-mode accuracy early ([ADR-0004](./adr/0004-cross-platform-shell-and-path-strategy.md)):
 
-| Phase | Scope | Exit criteria |
-| --- | --- | --- |
-| P0 | Plugin scaffold (`paseo-plugin.json`, `OVERVIEW.md`), normalizers (Claude Code, ACP: Antigravity & Devin CLI), Paseo Settings, rotated JSONL audit store, shadow mode | Installs cleanly; records and reconciles `before`/`after` requests on macOS/Linux/Windows |
-| P1a | `bash` WASM parser, POSIX Path Model (incl. ancestor `realpath`), `safe-chains` interpreter + path sweep, effects/combination rules, same-turn taint & provenance (shadow only) | `safe-chains` conformance vectors + session/security vectors pass |
-| P1b | PowerShell 5.1/7 serialized host + prefix disambiguation, `cmd.exe` tokenizer, Windows built-ins, WSL layers & bidirectional path mapping | Windows vectors pass on PowerShell 5.1 & 7 and Windows + WSL |
-| P2 | `act` mode, shadow dashboard, compact timeline renderer, optional system-prompt guidance & mode policy | False-allow = 0 on replay corpus; agreement ≥ target |
-| P3 | Optional LLM judge (with epoch-keyed cache), Codex/OpenCode adapters, JS handlers for top handler-based commands, upstream waiting-hook PR | — |
+| Phase | Status | Scope | Exit criteria |
+| --- | --- | --- | --- |
+| P0 | Done | Plugin scaffold (`paseo-plugin.json`, `OVERVIEW.md`), normalizers (Claude Code, ACP: Antigravity & Devin CLI), Paseo Settings, rotated JSONL audit store, shadow mode | Installs cleanly; records and reconciles `before`/`after` requests on macOS/Linux/Windows |
+| P1a | Done | `bash` WASM parser, POSIX Path Model (incl. ancestor `realpath`), `safe-chains` interpreter + path sweep, effects/combination rules, same-turn taint & provenance (shadow only) | `safe-chains` conformance vectors + session/security vectors pass |
+| P1b | Done (WSL quoting passthrough still needs a manual check on a real WSL host) | PowerShell 5.1/7 serialized host + prefix disambiguation, `cmd.exe` tokenizer, Windows built-ins, WSL layers & bidirectional path mapping | Windows vectors pass on PowerShell 5.1 & 7 and Windows + WSL |
+| P2 | Next | `act` mode, shadow dashboard, compact timeline renderer, optional system-prompt guidance & mode policy | False-allow = 0 on replay corpus; agreement ≥ target |
+| P3 | Planned | Optional LLM judge (with epoch-keyed cache), Codex/OpenCode adapters, JS handlers for top handler-based commands, upstream waiting-hook PR | — |
 
 ## 17. Resolved design decisions
 
