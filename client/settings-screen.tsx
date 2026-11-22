@@ -16,7 +16,7 @@ import {
   SettingsSwitch,
 } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Text, View } from "react-native";
+import { Text, TextInput, View } from "react-native";
 import { gateAnnotate, gateReplay, getGuardianStatus } from "../shared/rpc.js";
 import { guardianSettings, type GuardianSettings } from "../shared/settings.js";
 import type {
@@ -26,13 +26,63 @@ import type {
 } from "../shared/types.js";
 import { messages } from "./i18n.js";
 
+function NumberField(props: {
+  label: string;
+  hint: string;
+  value: number;
+  min: number;
+  max: number;
+  disabled: boolean;
+  errorText: string;
+  textStyle: object;
+  onCommit: (n: number) => void;
+}) {
+  const { value, min, max, onCommit } = props;
+  const [text, setText] = useState(String(value));
+  const [invalid, setInvalid] = useState(false);
+  useEffect(() => {
+    setText(String(value));
+    setInvalid(false);
+  }, [value]);
+  const commit = () => {
+    const trimmed = text.trim();
+    const n = Number(trimmed);
+    if (trimmed !== "" && Number.isInteger(n) && n >= min && n <= max) {
+      setInvalid(false);
+      if (n !== value) onCommit(n);
+    } else {
+      setInvalid(true);
+    }
+  };
+  return (
+    <SettingsRow
+      label={props.label}
+      hint={props.hint}
+      error={invalid ? props.errorText : null}
+    >
+      <TextInput
+        style={props.textStyle}
+        value={text}
+        editable={!props.disabled}
+        keyboardType="numeric"
+        onChangeText={setText}
+        onBlur={commit}
+        onSubmitEditing={commit}
+      />
+    </SettingsRow>
+  );
+}
+
 export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
   const { t } = useTranslation(messages);
   const settings = useSettings(guardianSettings);
   const fetchStatus = useRpc(getGuardianStatus);
   const [status, setStatus] = useState<GuardianStatusSnapshot | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
-  const [confirmingOverride, setConfirmingOverride] = useState(false);
+  const [pendingFingerprint, setPendingFingerprint] = useState<string | null>(
+    null,
+  );
+  const [overrideChanged, setOverrideChanged] = useState(false);
   const [gateBusy, setGateBusy] = useState(false);
   const replayGate = useRpc(gateReplay);
   const annotateGate = useRpc(gateAnnotate);
@@ -119,6 +169,12 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
         color: theme.colors.statusDanger,
         fontSize: 13,
       },
+      input: {
+        color: theme.colors.foreground,
+        fontSize: 14,
+        minWidth: 80,
+        padding: 4,
+      },
       metricValue: {
         color: theme.colors.foreground,
         fontSize: 14,
@@ -160,16 +216,6 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
   const gate = status?.gate ?? null;
   const updateActGate = (patch: Partial<GuardianSettings["actGate"]>) =>
     update({ actGate: { ...values.actGate, ...patch } });
-  const numberField = (
-    text: string,
-    min: number,
-    max: number,
-    apply: (n: number) => void,
-  ): void => {
-    const n = Number(text.trim());
-    if (text.trim() !== "" && Number.isInteger(n) && n >= min && n <= max)
-      apply(n);
-  };
   const entryKindLabel = (entry: GateEntry) =>
     t(`act.entries.kind.${entry.kind}`);
   const overrideStatusLabel = !values.actOverride.accepted
@@ -291,27 +337,27 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
 
       <SettingsSection title={t("act.section.title")}>
         <SettingsCard>
-          <SettingsInput
+          <NumberField
             label={t("act.minSamples")}
             hint={t("act.minSamplesHint")}
-            initialValue={String(values.actGate.minSamples)}
+            value={values.actGate.minSamples}
+            min={20}
+            max={5000}
             disabled={settings.saving}
-            onChangeText={(text) =>
-              numberField(text, 20, 5000, (minSamples) =>
-                updateActGate({ minSamples }),
-              )
-            }
+            errorText={t("act.validation.range")}
+            textStyle={styles.input}
+            onCommit={(minSamples) => updateActGate({ minSamples })}
           />
-          <SettingsInput
+          <NumberField
             label={t("act.windowDays")}
             hint={t("act.windowDaysHint")}
-            initialValue={String(values.actGate.windowDays)}
+            value={values.actGate.windowDays}
+            min={1}
+            max={365}
             disabled={settings.saving}
-            onChangeText={(text) =>
-              numberField(text, 1, 365, (windowDays) =>
-                updateActGate({ windowDays }),
-              )
-            }
+            errorText={t("act.validation.range")}
+            textStyle={styles.input}
+            onCommit={(windowDays) => updateActGate({ windowDays })}
           />
           <SettingsSwitch
             label={t("act.autoFallback")}
@@ -340,7 +386,7 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
                   actionLabel={t("act.override.revoke")}
                   disabled={settings.saving}
                   onPress={() => {
-                    setConfirmingOverride(false);
+                    setPendingFingerprint(null);
                     update({
                       actOverride: {
                         accepted: false,
@@ -350,21 +396,26 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
                     });
                   }}
                 />
-              ) : confirmingOverride ? (
+              ) : pendingFingerprint !== null ? (
                 <>
                   <Text style={styles.notice}>{t("act.override.confirm")}</Text>
                   <SettingsAction
                     label={t("act.override.accept")}
                     actionLabel={t("act.override.confirmAction")}
-                    disabled={settings.saving || !gate}
+                    disabled={settings.saving || !gate?.fingerprint}
                     onPress={() => {
-                      if (!gate) return;
-                      setConfirmingOverride(false);
+                      const current = gate?.fingerprint;
+                      setPendingFingerprint(null);
+                      if (!current) return;
+                      if (current !== pendingFingerprint) {
+                        setOverrideChanged(true);
+                        return;
+                      }
                       update({
                         actOverride: {
                           accepted: true,
                           acceptedAt: new Date().toISOString(),
-                          fingerprint: gate.fingerprint,
+                          fingerprint: current,
                         },
                       });
                     }}
@@ -372,17 +423,28 @@ export function GuardianSettingsScreen({ theme, layout }: PluginSurfaceProps) {
                   <SettingsAction
                     label={t("act.override.cancel")}
                     actionLabel={t("act.override.cancel")}
-                    onPress={() => setConfirmingOverride(false)}
+                    onPress={() => setPendingFingerprint(null)}
                   />
                 </>
               ) : (
-                <SettingsAction
-                  label={t("act.override.accept")}
-                  hint={t("act.override.acceptHint")}
-                  actionLabel={t("act.override.accept")}
-                  disabled={settings.saving || !gate}
-                  onPress={() => setConfirmingOverride(true)}
-                />
+                <>
+                  {overrideChanged ? (
+                    <Text style={styles.errorText}>
+                      {t("act.override.changed")}
+                    </Text>
+                  ) : null}
+                  <SettingsAction
+                    label={t("act.override.accept")}
+                    hint={t("act.override.acceptHint")}
+                    actionLabel={t("act.override.accept")}
+                    disabled={settings.saving || !gate?.fingerprint}
+                    onPress={() => {
+                      if (!gate?.fingerprint) return;
+                      setOverrideChanged(false);
+                      setPendingFingerprint(gate.fingerprint);
+                    }}
+                  />
+                </>
               )}
             </>
           ) : null}

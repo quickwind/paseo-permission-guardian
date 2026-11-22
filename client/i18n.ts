@@ -87,6 +87,8 @@ export const messages = defineTranslations({
           confirm:
             "This skips only the sample-count requirement. False allows still fall back to shadow while auto-fallback is on. The override expires when the plugin or its rules change.",
           confirmAction: "Accept",
+          changed:
+            "The plugin or its rules changed while confirming. Review the status and try again.",
           cancel: "Cancel",
           status: "Override",
           active: "Accepted",
@@ -126,6 +128,9 @@ export const messages = defineTranslations({
         help: {
           pwshUnavailable:
             "On hosts without PowerShell, human denials of PowerShell commands cannot be re-evaluated and keep the gate unavailable until acknowledged.",
+        },
+        validation: {
+          range: "Enter a whole number within the allowed range (see hint).",
         },
         unconfirmed: "Unconfirmed automatic answers",
         integrity: "Audit integrity",
@@ -228,6 +233,7 @@ export const messages = defineTranslations({
           confirm:
             "这只会跳过样本数量要求。开启自动回退时，出现误放行仍会回退到影子模式。插件或其规则发生变化后，此设置将失效。",
           confirmAction: "接受",
+          changed: "确认期间插件或其规则发生了变化，请查看状态后重试。",
           cancel: "取消",
           status: "手动放行",
           active: "已接受",
@@ -268,6 +274,7 @@ export const messages = defineTranslations({
           pwshUnavailable:
             "在没有 PowerShell 的主机上，人工拒绝的 PowerShell 命令无法重新评估，在确认之前门槛会一直处于不可用状态。",
         },
+        validation: { range: "请输入允许范围内的整数（见提示）。" },
         unconfirmed: "未确认的自动应答",
         integrity: "审计完整性",
         integrityOk: "没有完整性问题",
