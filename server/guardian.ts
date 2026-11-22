@@ -35,6 +35,12 @@ export interface GuardianServiceOptions {
   gate?: GateController;
   /** Act responder. Absent ⇒ never answers; legacy plugin-mark attribution. */
   responder?: ActResponder;
+  /**
+   * When true the gate is NOT configured at construction (it stays unconfigured ⇒ shadow, no
+   * replay, no latch side effects) until `activateGate()` is called once the audit store and the
+   * first real settings read have completed (F7). Default false (configure immediately).
+   */
+  deferGateConfigure?: boolean;
 }
 
 export interface PermissionBeforeContext {
@@ -72,6 +78,7 @@ export class PermissionGuardianService {
   private settings: GuardianSettings;
   private settingsInvalid = false;
   private settingsInvalidReason: string | null = null;
+  private gateActive: boolean;
 
   constructor(options: GuardianServiceOptions) {
     this.auditStore = options.auditStore;
@@ -82,6 +89,14 @@ export class PermissionGuardianService {
     this.settings = options.initialSettings ?? DEFAULT_GUARDIAN_SETTINGS;
     this.gate = options.gate;
     this.responder = options.responder;
+    this.gateActive = options.deferGateConfigure !== true;
+    this.configureGate();
+  }
+
+  /** Configures the gate for the first time (see `deferGateConfigure`). Idempotent. */
+  activateGate(): void {
+    if (this.gateActive) return;
+    this.gateActive = true;
     this.configureGate();
   }
 
@@ -107,7 +122,7 @@ export class PermissionGuardianService {
   }
 
   private configureGate(): void {
-    if (!this.gate) return;
+    if (!this.gate || !this.gateActive) return;
     try {
       const dataDir = this.auditStore.getDataDir();
       const fingerprint = computeFingerprint({

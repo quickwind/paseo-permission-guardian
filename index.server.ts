@@ -47,17 +47,19 @@ export default function contribute(server: PluginServerContext) {
     }),
   });
   const responder = new ActResponder({ gate, store: auditStore, now: () => Date.now() });
-  // Constructing the guardian configures the gate (safe shadow defaults until settings load).
+  // F7: the gate stays unconfigured (⇒ shadow, no replay, no latch side effects) until BOTH the
+  // audit history and the first real settings read (ready or invalid) have completed; configuring
+  // with defaults first could clear a latch bound to the stored settings' fingerprint.
   const guardian = new PermissionGuardianService({
     auditStore,
     pluginVersion: PLUGIN_VERSION,
     initialSettings: DEFAULT_GUARDIAN_SETTINGS,
     gate,
     responder,
+    deferGateConfigure: true,
   });
 
-  // Load initial persisted settings asynchronously; keep safe shadow defaults until ready.
-  void settingsHandle
+  const settingsLoaded: Promise<void> = settingsHandle
     .read()
     .then((state) => {
       if (state.status === "ready") {
@@ -70,8 +72,11 @@ export default function contribute(server: PluginServerContext) {
       }
     })
     .catch((error) => {
+      // Fail to human: unknown stored settings ⇒ invalid ⇒ shadow.
+      guardian.markSettingsInvalid("read_failed");
       console.error("[paseo-permission-guardian] Failed to read initial settings:", error);
     });
+  void Promise.all([storeReady, settingsLoaded]).then(() => guardian.activateGate());
 
   const unsubscribeSettings = settingsHandle.subscribe((state) => {
     if (state.status === "ready") {

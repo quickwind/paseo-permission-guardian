@@ -470,3 +470,9 @@ Added 2026-11-22; earlier sections are unchanged.
   completes available. Automatic replays (reconciliation, configuration, annotation) and replays
   that throw or are unavailable never unpause. A `lost_race` whose human behavior equals the
   behavior the plugin sent (e.g. no `selectedActionId` echo) counts toward the unconfirmed streak.
+- **Startup ordering (F7).** The gate is not configured with default settings at construction. It
+  stays unconfigured (effective shadow, no replay, no latch side effects) until both the audit
+  history load and the first real settings read (ready, invalid, or a failed read, which counts as
+  invalid) have completed; then it is configured once. While settings are invalid the gate applies
+  no latch side effects (no clearing, suspension writes or latch writes), because the fingerprint
+  was derived from fallback settings.

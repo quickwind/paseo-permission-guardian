@@ -634,6 +634,10 @@ export class GateController {
     const s = this.settings;
     const fp = this.fingerprint;
     if (!s || !fp) return;
+    // Invalid settings: the real engine identity is unknown (the fingerprint was derived from
+    // fallback settings), so no latch side effects at all; the mode is shadow regardless. They are
+    // applied on the next configure with valid settings / the next replay (F7 ruling).
+    if (!this.settingsValid) return;
     const modeBefore = modeBeforeInput ?? this.safeCompute().mode;
 
     const f = this.file;
