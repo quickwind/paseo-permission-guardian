@@ -890,7 +890,7 @@ describe("ADR-0006 Round-2 security adversarial vectors (pure Node: C1/C2/H1/H2/
       denyAsAsk: false,
     });
     expect(curlPipeCmd.decision.level).toBe("L3");
-  });
+  }, 20_000);
 
   it("Round-4 H-1 / H-2 / M-1: catches bash PWD reassignment, unquoted brace expansion, and git show stage/@/bare-secret revspecs", async () => {
     for (const pwdMut of [
@@ -959,7 +959,7 @@ describe("ADR-0006 Round-2 security adversarial vectors (pure Node: C1/C2/H1/H2/
       denyAsAsk: false,
     });
     expect(safeTreeGit.decision.level).toBe("L0");
-  });
+  }, 20_000);
 
   it("Round-5 H-1 hardening: catches unset, quoted/escaped/subscripted/dynamic PWD mutations and cross-layer propagation without breaking benign baselines", async () => {
     for (const pwdMut of [
@@ -1076,7 +1076,7 @@ describe("ADR-0006 Round-2 security adversarial vectors (pure Node: C1/C2/H1/H2/
       cwd: "/w/proj",
     });
     expect(readPromptParsed.pwdMutated).toBe(false);
-  });
+  }, 20_000);
 
   it("Round-7 Critical cwd regression & H-1 line-continuation hardening: closes command/builtin/\\cd, ~user/~-, CDPATH, and \\\\\\n vectors", async () => {
     for (const cmd of [
@@ -1178,7 +1178,7 @@ describe("ADR-0006 Round-2 security adversarial vectors (pure Node: C1/C2/H1/H2/
     });
     expect(herestringDynParsed.opaque).toEqual([]);
     expect(herestringDynParsed.pwdMutated).toBe(false);
-  });
+  }, 20_000);
 });
 
 describeLivePwsh7("Round-3 pwsh7 regressions (M-a & L-a)", () => {

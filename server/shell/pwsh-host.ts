@@ -1,5 +1,7 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
+import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { win32 } from "node:path";
 
@@ -107,14 +109,19 @@ export interface PwshHostOptions {
 
 export const PS_HOST_BOOTSTRAP_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-$script:inReader = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), $utf8NoBom)
-$script:outWriter = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), $utf8NoBom)
-$script:outWriter.AutoFlush = $true
-$b64 = $script:inReader.ReadLine()
-if ($null -eq $b64) { exit 0 }
-$code = $utf8NoBom.GetString([Convert]::FromBase64String($b64))
-& ([scriptblock]::Create($code))
+try {
+  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+  $inR = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8NoBom)
+  $outW = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput(), $utf8NoBom)
+  $outW.AutoFlush = $true
+  $b64 = $inR.ReadLine()
+  if ($null -eq $b64) { exit 0 }
+  $code = $utf8NoBom.GetString([Convert]::FromBase64String($b64))
+  & ([scriptblock]::Create($code)) $inR $outW
+} catch {
+  [Console]::Error.WriteLine($_.Exception.GetType().FullName + ':' + $_.Exception.Message)
+  exit 2
+}
 `;
 
 export function getBootstrapEncodedCommandLength(): number {
@@ -123,12 +130,36 @@ export function getBootstrapEncodedCommandLength(): number {
 
 // Parse-only NDJSON script compatible with BOTH Windows PowerShell 5.1 (.NET 4.x) and PowerShell 7+
 const PS_HOST_SCRIPT = String.raw`
+param($inReader, $outWriter)
 $ErrorActionPreference = 'Stop'
+$script:inReader = $inReader
+$script:outWriter = $outWriter
 if ($null -eq $script:inReader) {
-  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-  $script:inReader = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), $utf8NoBom)
-  $script:outWriter = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), $utf8NoBom)
+  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+  $script:inReader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8NoBom)
+  $script:outWriter = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput(), $utf8NoBom)
   $script:outWriter.AutoFlush = $true
+}
+$script:isPs5 = ($PSVersionTable.PSVersion.Major -lt 6)
+$script:traceCold = $script:isPs5
+if ($script:traceCold) { $script:outWriter.WriteLine('__ST:host_enter') }
+$script:jsSer = $null
+if ($script:isPs5) {
+  [void][System.Reflection.Assembly]::Load('System.Web.Extensions, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35')
+  $script:jsSer = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
+  $script:jsSer.MaxJsonLength = 8388608
+  $script:jsSer.RecursionLimit = 100
+  if ($script:traceCold) { $script:outWriter.WriteLine('__ST:host_ser_ok') }
+}
+
+function Decode-HostJson([string]$json) {
+  if ($script:isPs5) { return $script:jsSer.DeserializeObject($json) }
+  return ($json | ConvertFrom-Json)
+}
+
+function Encode-HostJson($obj) {
+  if ($script:isPs5) { return $script:jsSer.Serialize($obj) }
+  return ($obj | ConvertTo-Json -Depth 12 -Compress)
 }
 
 $script:SAFE_STATIC_ENV_RX = '^(?:SystemRoot|WINDIR|USERPROFILE|APPDATA|LOCALAPPDATA|PROGRAMDATA|PROGRAMFILES|TEMP|TMP|HOMEDRIVE|HOMEPATH)$'
@@ -245,26 +276,57 @@ function Get-AncestorInfo($node) {
 }
 
 while ($true) {
+  if ($script:traceCold) { $script:outWriter.WriteLine('__ST:host_wait_req') }
   $line = $script:inReader.ReadLine()
   if ($null -eq $line) { break }
   if ($line.Length -eq 0) { continue }
+  if ($script:traceCold) { $script:outWriter.WriteLine('__ST:host_got_req') }
   $reqId = ''
   try {
-    $req = $line | ConvertFrom-Json
-    $reqId = [string]$req.id
-    $src = [string]$req.source
+    $req = Decode-HostJson $line
+    if ($req -is [System.Collections.IDictionary]) {
+      $reqId = [string]$req['id']
+      $src = [string]$req['source']
+    } else {
+      $reqId = [string]$req.id
+      $src = [string]$req.source
+    }
 
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
+    if ($script:traceCold) { $script:outWriter.WriteLine('__ST:host_parsed') }
 
     $allNodes = @($ast.FindAll({ $true }, $true))
-    $census = @($allNodes | ForEach-Object { $_.GetType().Name } | Sort-Object -Unique)
+    $censusSet = [System.Collections.Generic.HashSet[string]]::new()
+    $assignNodes = @()
+    $varNodes = @()
+    $convNodes = @()
+    $invokeNodes = @()
+    $pipeNodes = @()
+    $cmdNodes = @()
+    $fnNames = @()
+    $usingMods = @()
+    foreach ($nd in $allNodes) {
+      $nt = $nd.GetType().Name
+      [void]$censusSet.Add($nt)
+      if ($nt -eq 'AssignmentStatementAst') { $assignNodes += $nd }
+      elseif ($nt -eq 'VariableExpressionAst') { $varNodes += $nd }
+      elseif ($nt -eq 'ConvertExpressionAst') { $convNodes += $nd }
+      elseif ($nt -eq 'InvokeMemberExpressionAst' -or $nt -eq 'MemberExpressionAst') { $invokeNodes += $nd }
+      elseif ($nt -eq 'PipelineAst') { $pipeNodes += $nd }
+      elseif ($nt -eq 'CommandAst') { $cmdNodes += $nd }
+      elseif ($nt -eq 'FunctionDefinitionAst') { $fnNames += [string]$nd.Name }
+      elseif ($nt -eq 'UsingStatementAst') { $usingMods += "$($nd.UsingStatementKind):$($nd.Name.Value)" }
+    }
+    $census = [string[]]::new($censusSet.Count)
+    $censusSet.CopyTo($census)
+    [Array]::Sort($census)
 
     $errList = @()
     if ($errors) {
       foreach ($e in $errors) {
-        $errList += [PSCustomObject]@{
+        $errList += @{
           errorId = [string]$e.ErrorId
           startOffset = [int]$e.Extent.StartOffset
           endOffset = [int]$e.Extent.EndOffset
@@ -287,8 +349,7 @@ while ($true) {
     }
 
     # Build lookup of Equals-assignment LHS nodes so $env:X = 'val' is not counted as an envRead
-    $equalsLeftIds = New-Object System.Collections.Generic.HashSet[string]
-    $assignNodes = @($allNodes | Where-Object { $_.GetType().Name -eq 'AssignmentStatementAst' })
+    $equalsLeftIds = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($an in $assignNodes) {
       if ($an.Operator.ToString() -eq 'Equals') {
         $key = "$($an.Left.Extent.StartOffset):$($an.Left.Extent.EndOffset)"
@@ -299,7 +360,6 @@ while ($true) {
     $envReads = @()
     $hasSplatting = $false
     $charCastCount = 0
-    $varNodes = @($allNodes | Where-Object { $_.GetType().Name -eq 'VariableExpressionAst' })
     foreach ($vn in $varNodes) {
       if ($vn.Splatted) { $hasSplatting = $true }
       $vp = $vn.VariablePath
@@ -316,19 +376,18 @@ while ($true) {
             }
             $p = $p.Parent
           }
-          $envReads += [PSCustomObject]@{ name = $envName; site = $site }
+          $envReads += @{ name = $envName; site = $site }
         }
       }
     }
 
-    $convNodes = @($allNodes | Where-Object { $_.GetType().Name -eq 'ConvertExpressionAst' })
     foreach ($cn in $convNodes) {
       if ($cn.Type.TypeName.Name -ieq 'char') { $charCastCount++ }
     }
 
     $envWrites = @()
     $varWrites = @()
-    $memberAssignKeys = New-Object System.Collections.Generic.HashSet[string]
+    $memberAssignKeys = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($an in $assignNodes) {
       $left = $an.Left
       $lt = $left.GetType().Name
@@ -339,14 +398,14 @@ while ($true) {
 
       if ($lt -eq 'VariableExpressionAst' -and $left.VariablePath.IsDriveQualified -and $left.VariablePath.DriveName -ieq 'env') {
         $envName = $left.VariablePath.UserPath -replace '^[eE][nN][vV]:', ''
-        $envWrites += [PSCustomObject]@{
+        $envWrites += @{
           name = $envName
           operator = $op
           valueStatic = $valStatic
           isNull = $isNull
         }
       } elseif ($lt -eq 'VariableExpressionAst') {
-        $varWrites += [PSCustomObject]@{
+        $varWrites += @{
           varName = [string]$left.VariablePath.UserPath
           rootVarName = [string]$left.VariablePath.UserPath
           isIndexed = $false
@@ -356,7 +415,7 @@ while ($true) {
         }
       } elseif ($lt -eq 'IndexExpressionAst') {
         $rootName = if ($left.Target.GetType().Name -eq 'VariableExpressionAst') { [string]$left.Target.VariablePath.UserPath } else { [string]$left.Target.Extent.Text }
-        $varWrites += [PSCustomObject]@{
+        $varWrites += @{
           varName = [string]$left.Extent.Text
           rootVarName = $rootName
           isIndexed = $true
@@ -374,7 +433,7 @@ while ($true) {
         if (-not $memIsConst -and $mTypeInfo.isLit -and $typeNm -match '^(?:System\.)?Console$' -and $memName -match '^(?:OutputEncoding|InputEncoding)$') {
           if (Test-SafeEncodingExpr $an.Right) { $memIsConst = $true }
         }
-        $varWrites += [PSCustomObject]@{
+        $varWrites += @{
           varName = "$($typeNm)::$($memName)"
           rootVarName = $typeNm
           isIndexed = $false
@@ -386,7 +445,6 @@ while ($true) {
     }
 
     $memberCalls = @()
-    $invokeNodes = @($allNodes | Where-Object { $_.GetType().Name -eq 'InvokeMemberExpressionAst' -or $_.GetType().Name -eq 'MemberExpressionAst' })
     foreach ($mn in $invokeNodes) {
       $isInvoke = ($mn.GetType().Name -eq 'InvokeMemberExpressionAst')
       $mKey = "$($mn.Extent.StartOffset):$($mn.Extent.EndOffset)"
@@ -398,13 +456,13 @@ while ($true) {
       if ($isInvoke -and $mn.Arguments) {
         foreach ($arg in $mn.Arguments) {
           $av = Get-StaticVal $arg
-          $argList += [PSCustomObject]@{ isConstant = ($null -ne $av); staticValue = $av }
+          $argList += @{ isConstant = ($null -ne $av); staticValue = $av }
         }
       } elseif ($isAssign -and $mn.Parent.GetType().Name -eq 'AssignmentStatementAst') {
         $av = Get-StaticVal $mn.Parent.Right
-        $argList += [PSCustomObject]@{ isConstant = ($null -ne $av); staticValue = $av }
+        $argList += @{ isConstant = ($null -ne $av); staticValue = $av }
       }
-      $memberCalls += [PSCustomObject]@{
+      $memberCalls += @{
         static = [bool]$mn.Static
         typeName = $mTypeInfo.name
         isLiteralType = [bool]$mTypeInfo.isLit
@@ -418,7 +476,6 @@ while ($true) {
 
     $pipeIdMap = @{}
     $nextPipeId = 1
-    $pipeNodes = @($allNodes | Where-Object { $_.GetType().Name -eq 'PipelineAst' })
     foreach ($pn in $pipeNodes) {
       $pKey = "$($pn.Extent.StartOffset):$($pn.Extent.EndOffset)"
       $pipeIdMap[$pKey] = $nextPipeId
@@ -427,7 +484,6 @@ while ($true) {
 
     $cmdList = @()
     $backtickSkew = $false
-    $cmdNodes = @($allNodes | Where-Object { $_.GetType().Name -eq 'CommandAst' })
     foreach ($cm in $cmdNodes) {
       $cmdName = $cm.GetCommandName()
       $rawFirst = if ($cm.CommandElements.Count -gt 0) { [string]$cm.CommandElements[0].Extent.Text } else { '' }
@@ -454,7 +510,7 @@ while ($true) {
         $et = $el.GetType().Name
         if ($et -eq 'CommandParameterAst') {
           $argVal = Get-StaticVal $el.Argument
-          $outElems += [PSCustomObject]@{
+          $outElems += @{
             kind = 'parameter'
             parameterName = [string]$el.ParameterName
             hasColonArg = ($null -ne $el.Argument)
@@ -467,14 +523,14 @@ while ($true) {
             $kVal = Get-StaticVal $kv.Item1
             if ($null -eq $kVal) { $allStatic = $false; continue }
             $vVal = Get-StaticVal $kv.Item2
-            $entries += [PSCustomObject]@{
+            $entries += @{
               key = $kVal
               valueStatic = $vVal
               isNull = (Test-IsNullExpr $kv.Item2)
               isConstant = ($null -ne $vVal)
             }
           }
-          $outElems += [PSCustomObject]@{
+          $outElems += @{
             kind = 'arg'
             astType = $et
             isConstant = $false
@@ -500,7 +556,7 @@ while ($true) {
           if ($elemIdx -gt 0 -and $et -eq 'StringConstantExpressionAst') {
             if ($sv -eq '' -or ($null -ne $sv -and $sv.Contains('"'))) { $nativeQuirk = $true }
           }
-          $outElems += [PSCustomObject]@{
+          $outElems += @{
             kind = 'arg'
             astType = $et
             staticValue = $sv
@@ -517,19 +573,19 @@ while ($true) {
         $rt = $rd.GetType().Name
         if ($rt -eq 'FileRedirectionAst') {
           $opStr = if ($rd.Append) { "$($rd.FromStream)>>" } else { "$($rd.FromStream)>" }
-          $redirs += [PSCustomObject]@{
+          $redirs += @{
             operator = $opStr
             targetStatic = (Get-StaticVal $rd.Location)
           }
         } elseif ($rt -eq 'MergingRedirectionAst') {
-          $redirs += [PSCustomObject]@{
+          $redirs += @{
             operator = "$($rd.FromStream)>&$($rd.ToStream)"
             targetStatic = $null
           }
         }
       }
 
-      $cmdList += [PSCustomObject]@{
+      $cmdList += @{
         name = $cmdName
         rawName = $rawFirst
         invocationOperator = $cm.InvocationOperator.ToString()
@@ -543,10 +599,7 @@ while ($true) {
       }
     }
 
-    $fnNames = @($allNodes | Where-Object { $_.GetType().Name -eq 'FunctionDefinitionAst' } | ForEach-Object { [string]$_.Name })
-    $usingMods = @($allNodes | Where-Object { $_.GetType().Name -eq 'UsingStatementAst' } | ForEach-Object { "$($_.UsingStatementKind):$($_.Name.Value)" })
-
-    $payload = [PSCustomObject]@{
+    $payload = @{
       psEdition = [string]$PSVersionTable.PSEdition
       psVersion = [string]$PSVersionTable.PSVersion.ToString()
       languageMode = [string]$ExecutionContext.SessionState.LanguageMode
@@ -565,14 +618,16 @@ while ($true) {
       usingModules = $usingMods
     }
 
-    $resp = [PSCustomObject]@{ id = $reqId; ok = $true; payload = $payload }
-    $script:outWriter.WriteLine(($resp | ConvertTo-Json -Depth 12 -Compress))
+    $resp = @{ id = $reqId; ok = $true; payload = $payload }
+    $script:outWriter.WriteLine((Encode-HostJson $resp))
     $script:outWriter.Flush()
+    $script:traceCold = $false
   } catch {
     $errType = $_.Exception.GetType().Name
-    $errResp = [PSCustomObject]@{ id = $reqId; ok = $false; error = "host_exception:$errType" }
-    $script:outWriter.WriteLine(($errResp | ConvertTo-Json -Compress))
+    $errResp = @{ id = $reqId; ok = $false; error = "host_exception:$errType" }
+    $script:outWriter.WriteLine((Encode-HostJson $errResp))
     $script:outWriter.Flush()
+    $script:traceCold = $false
   }
 }
 `;
@@ -794,34 +849,86 @@ function normalizePayload(raw: Record<string, unknown>): PwshHostAstPayload {
 const MAX_HOST_LINE_BYTES = 2 * 1024 * 1024;
 const MAX_QUEUE_DEPTH = 64;
 
+function buildPwsh5PipeBootstrapScript(pipeName: string, authToken: string): string {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "try {",
+    "  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)",
+    `  $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', '${pipeName}', [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)`,
+    "  $pipe.Connect(15000)",
+    "  $inR = [System.IO.StreamReader]::new($pipe, $utf8NoBom)",
+    "  $outW = [System.IO.StreamWriter]::new($pipe, $utf8NoBom)",
+    "  $outW.AutoFlush = $true",
+    `  $outW.WriteLine('${authToken}')`,
+    "  $outW.WriteLine('__ST:boot_connected')",
+    "  $b64 = $inR.ReadLine()",
+    "  if ($null -eq $b64) { exit 0 }",
+    "  $code = $utf8NoBom.GetString([Convert]::FromBase64String($b64))",
+    "  $outW.WriteLine('__ST:boot_b64_ok')",
+    "  $sb = [scriptblock]::Create($code)",
+    "  $outW.WriteLine('__ST:boot_sb_created')",
+    "  & $sb $inR $outW",
+    "} catch {",
+    "  [Console]::Error.WriteLine($_.Exception.GetType().FullName + ':' + $_.Exception.Message)",
+    "  exit 2",
+    "}",
+  ].join("\n");
+}
+
+function appendBoundedTail(current: string, addition: string, maxLen = 1024): string {
+  const combined = current && addition ? `${current}${addition}` : current || addition;
+  return combined.length > maxLen ? combined.slice(-maxLen) : combined;
+}
+
 export class PwshParserHost {
   private readonly shell: PwshShellVariant;
   private readonly binaryPath: string;
   private readonly warmTimeoutMs: number;
   private readonly coldTimeoutMs: number;
-  private child: ChildProcessWithoutNullStreams | null = null;
+  private child: ChildProcess | null = null;
+  private pipeServer: Server | null = null;
+  private pipeSocket: Socket | null = null;
+  private pipeConnected = false;
+  private hadPipeConnectionForChild = false;
   private queue: Promise<void> = Promise.resolve();
   private queuedCount = 0;
   private pending: {
     id: string;
-    child: ChildProcessWithoutNullStreams;
+    child: ChildProcess;
     resolve: (res: PwshHostResult) => void;
     timer: ReturnType<typeof setTimeout>;
+    requestLine?: string;
   } | null = null;
   private nextReqId = 1;
   private isCold = true;
   private failureTimestamps: number[] = [];
   private circuitOpenUntil = 0;
+  private lastStderr = "";
+  private lastNonJsonStdout = "";
 
   constructor(shell: PwshShellVariant, binaryPath: string, options: PwshHostOptions = {}) {
     this.shell = shell;
     this.binaryPath = binaryPath;
     this.warmTimeoutMs = options.warmTimeoutMs ?? 1500;
-    this.coldTimeoutMs = options.coldTimeoutMs ?? 10000;
+    this.coldTimeoutMs = options.coldTimeoutMs ?? (shell === "pwsh5" ? 20_000 : 10_000);
   }
 
   getShell(): PwshShellVariant {
     return this.shell;
+  }
+
+  getLastDiagnostic(): {
+    pipeConnected: boolean;
+    stderr: string;
+    nonJsonStdout: string;
+    binaryPath: string;
+  } {
+    return {
+      binaryPath: this.binaryPath,
+      pipeConnected: this.hadPipeConnectionForChild,
+      stderr: this.lastStderr,
+      nonJsonStdout: this.lastNonJsonStdout,
+    };
   }
 
   async parse(source: string): Promise<PwshHostResult> {
@@ -857,7 +964,28 @@ export class PwshParserHost {
     }
   }
 
+  private cleanupTransport(): void {
+    if (this.pipeSocket) {
+      try {
+        this.pipeSocket.destroy();
+      } catch {
+        // ignore
+      }
+      this.pipeSocket = null;
+    }
+    if (this.pipeServer) {
+      try {
+        this.pipeServer.close();
+      } catch {
+        // ignore
+      }
+      this.pipeServer = null;
+    }
+    this.pipeConnected = false;
+  }
+
   private killChild(): void {
+    this.cleanupTransport();
     if (this.child) {
       try {
         this.child.kill("SIGKILL");
@@ -869,40 +997,125 @@ export class PwshParserHost {
     this.isCold = true;
   }
 
-  private ensureChild(): ChildProcessWithoutNullStreams {
+  private attachLineFraming(
+    stream: NodeJS.ReadableStream,
+    isActive: () => boolean,
+    onLine: (line: string) => void,
+    onOverflow: () => void,
+  ): void {
+    let chunks: Buffer[] = [];
+    let totalBytes = 0;
+
+    stream.on("data", (chunk: Buffer) => {
+      if (!isActive()) return;
+      chunks.push(chunk);
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_HOST_LINE_BYTES) {
+        chunks = [];
+        totalBytes = 0;
+        onOverflow();
+        return;
+      }
+
+      let combined = Buffer.concat(chunks, totalBytes);
+      let nlIdx = combined.indexOf(0x0a);
+      while (nlIdx >= 0) {
+        const lineBuf = combined.subarray(0, nlIdx);
+        const lineStr = lineBuf.toString("utf8").replace(/\r$/, "");
+        onLine(lineStr);
+        combined = combined.subarray(nlIdx + 1);
+        nlIdx = combined.indexOf(0x0a);
+      }
+      chunks = combined.length > 0 ? [combined] : [];
+      totalBytes = combined.length;
+    });
+  }
+
+  private async ensureChild(): Promise<ChildProcess> {
     if (this.child && this.child.exitCode === null && !this.child.killed) {
       return this.child;
     }
 
-    const encodedBootstrap = Buffer.from(PS_HOST_BOOTSTRAP_SCRIPT, "utf16le").toString("base64");
+    const useNamedPipe = this.shell === "pwsh5" && process.platform === "win32";
     const hostScriptB64 = Buffer.from(PS_HOST_SCRIPT, "utf8").toString("base64");
     const cwd =
       process.platform === "win32"
         ? win32.join(getValidatedWindowsSystemRoot(), "System32")
         : tmpdir();
 
-    const child = spawn(
-      this.binaryPath,
-      ["-NoProfile", "-NonInteractive", "-NoLogo", "-EncodedCommand", encodedBootstrap],
-      {
-        cwd,
-        env: buildSanitizedPwshEnv(),
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-      },
-    );
+    this.cleanupTransport();
+    this.hadPipeConnectionForChild = false;
+    this.lastStderr = "";
+    this.lastNonJsonStdout = "";
 
-    child.stdin.on("error", () => {
-      // Handled by exit/error/pending checks
+    let pipeServer: Server | null = null;
+    let authToken = "";
+    let spawnArgs: string[];
+
+    if (useNamedPipe) {
+      const pipeName = `paseo-pwsh5-${process.pid}-${randomBytes(12).toString("hex")}`;
+      const pipePath = `\\\\.\\pipe\\${pipeName}`;
+      authToken = randomBytes(16).toString("hex");
+      const pipeBootstrap = Buffer.from(
+        buildPwsh5PipeBootstrapScript(pipeName, authToken),
+        "utf16le",
+      ).toString("base64");
+      spawnArgs = ["-NoProfile", "-NonInteractive", "-NoLogo", "-EncodedCommand", pipeBootstrap];
+
+      pipeServer = createServer();
+      await new Promise<void>((resolve, reject) => {
+        const onError = (err: Error) => {
+          pipeServer?.off("listening", onListening);
+          reject(err);
+        };
+        const onListening = () => {
+          pipeServer?.off("error", onError);
+          resolve();
+        };
+        pipeServer!.once("error", onError);
+        pipeServer!.once("listening", onListening);
+        pipeServer!.listen(pipePath);
+      });
+      this.pipeServer = pipeServer;
+    } else {
+      const encodedBootstrap = Buffer.from(PS_HOST_BOOTSTRAP_SCRIPT, "utf16le").toString("base64");
+      spawnArgs = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-NoLogo",
+        "-InputFormat",
+        "None",
+        "-EncodedCommand",
+        encodedBootstrap,
+      ];
+    }
+
+    const child = spawn(this.binaryPath, spawnArgs, {
+      cwd,
+      env: {
+        ...buildSanitizedPwshEnv(),
+        POWERSHELL_TELEMETRY_OPTOUT: "1",
+        POWERSHELL_UPDATECHECK: "Off",
+      },
+      stdio: useNamedPipe ? ["ignore", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
 
-    // Feed full parse-only host script via stdin to bypass Windows 32,767-char CLI limit
-    child.stdin.write(`${hostScriptB64}\n`, "utf8");
+    this.child = child;
+    this.isCold = true;
+    const spawnedAt = Date.now();
 
-    let stdoutChunks: Buffer[] = [];
-    let stdoutBytes = 0;
+    const failActivePending = (reason: string) => {
+      if (this.pending && this.pending.child === child) {
+        const active = this.pending;
+        this.pending = null;
+        clearTimeout(active.timer);
+        this.recordFailure();
+        active.resolve({ ok: false, reason });
+      }
+    };
 
-    const handleLine = (line: string) => {
+    const handleJsonLine = (line: string) => {
       if (this.child !== child || !this.pending || this.pending.child !== child || !line.trim()) {
         return;
       }
@@ -928,75 +1141,150 @@ export class PwshParserHost {
           });
         }
       } catch {
-        // Ignore malformed non-JSON lines until timeout or exit
+        // Ignore malformed non-JSON lines; keep bounded tail for test diagnostics
+        const stamped = line.startsWith("__ST:") ? `${line}@${Date.now() - spawnedAt}ms` : line;
+        this.lastNonJsonStdout = appendBoundedTail(
+          this.lastNonJsonStdout,
+          this.lastNonJsonStdout ? `\n${stamped}` : stamped,
+        );
       }
     };
 
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stderr?.on("data", (chunk: Buffer) => {
       if (this.child !== child) return;
-      stdoutChunks.push(chunk);
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_HOST_LINE_BYTES) {
-        stdoutChunks = [];
-        stdoutBytes = 0;
-        if (this.pending && this.pending.child === child) {
-          const active = this.pending;
-          this.pending = null;
-          clearTimeout(active.timer);
-          this.recordFailure();
-          this.killChild();
-          active.resolve({ ok: false, reason: "pwsh_host_response_too_large" });
-        } else {
-          this.killChild();
-        }
-        return;
-      }
-
-      let combined = Buffer.concat(stdoutChunks, stdoutBytes);
-      let nlIdx = combined.indexOf(0x0a);
-      while (nlIdx >= 0) {
-        const lineBuf = combined.subarray(0, nlIdx);
-        const lineStr = lineBuf.toString("utf8").replace(/\r$/, "");
-        handleLine(lineStr);
-        combined = combined.subarray(nlIdx + 1);
-        nlIdx = combined.indexOf(0x0a);
-      }
-      stdoutChunks = combined.length > 0 ? [combined] : [];
-      stdoutBytes = combined.length;
+      this.lastStderr = appendBoundedTail(
+        this.lastStderr,
+        chunk
+          .toString("utf8")
+          .split(/\r?\n/)
+          .filter((l) => l.length > 0)
+          .map((l) => `${l}@${Date.now() - spawnedAt}ms`)
+          .join("\n") + "\n",
+      );
     });
 
+    if (useNamedPipe && pipeServer) {
+      pipeServer.on("error", () => {
+        if (this.child !== child) return;
+        this.killChild();
+        failActivePending("pwsh_host_pipe_error");
+      });
+
+      pipeServer.on("connection", (socket: Socket) => {
+        if (this.child !== child || this.pipeSocket !== null) {
+          socket.destroy();
+          return;
+        }
+
+        let authenticated = false;
+        this.attachLineFraming(
+          socket,
+          () => this.child === child && (!authenticated || this.pipeSocket === socket),
+          (lineStr) => {
+            if (!authenticated) {
+              if (lineStr !== authToken) {
+                socket.destroy();
+                return;
+              }
+              authenticated = true;
+              this.lastNonJsonStdout = appendBoundedTail(
+                this.lastNonJsonStdout,
+                `${this.lastNonJsonStdout ? "\n" : ""}__NODE:authed@${Date.now() - spawnedAt}ms`,
+              );
+              this.pipeSocket = socket;
+              this.pipeConnected = true;
+              this.hadPipeConnectionForChild = true;
+              try {
+                pipeServer?.close();
+              } catch {
+                // ignore
+              }
+              if (this.pipeServer === pipeServer) {
+                this.pipeServer = null;
+              }
+              try {
+                socket.write(`${hostScriptB64}\n`, "utf8");
+                if (this.pending && this.pending.child === child && this.pending.requestLine) {
+                  const reqLine = this.pending.requestLine;
+                  this.pending.requestLine = undefined;
+                  socket.write(reqLine, "utf8");
+                }
+              } catch {
+                this.killChild();
+                failActivePending("pwsh_host_stdin_error");
+              }
+              return;
+            }
+            handleJsonLine(lineStr);
+          },
+          () => {
+            this.killChild();
+            failActivePending("pwsh_host_response_too_large");
+          },
+        );
+
+        socket.on("error", () => {
+          if (this.child === child && this.pipeSocket === socket) {
+            this.killChild();
+            failActivePending("pwsh_host_pipe_closed");
+          } else {
+            socket.destroy();
+          }
+        });
+
+        socket.on("close", () => {
+          if (this.child === child && this.pipeSocket === socket) {
+            this.pipeSocket = null;
+            this.pipeConnected = false;
+            this.killChild();
+            failActivePending("pwsh_host_pipe_closed");
+          }
+        });
+      });
+
+      child.stdout?.on("data", (chunk: Buffer) => {
+        if (this.child !== child) return;
+        this.lastNonJsonStdout = appendBoundedTail(this.lastNonJsonStdout, chunk.toString("utf8"));
+      });
+    } else {
+      child.stdin?.on("error", () => {
+        // Handled by exit/error/pending checks
+      });
+
+      // Feed full parse-only host script via stdin to bypass Windows 32,767-char CLI limit
+      child.stdin?.write(`${hostScriptB64}\n`, "utf8");
+
+      if (child.stdout) {
+        this.attachLineFraming(
+          child.stdout,
+          () => this.child === child,
+          handleJsonLine,
+          () => {
+            this.killChild();
+            failActivePending("pwsh_host_response_too_large");
+          },
+        );
+      }
+    }
+
     child.once("exit", () => {
-      stdoutChunks = [];
-      stdoutBytes = 0;
       if (this.child === child) {
+        this.cleanupTransport();
         this.child = null;
         this.isCold = true;
       }
-      if (this.pending && this.pending.child === child) {
-        const active = this.pending;
-        this.pending = null;
-        clearTimeout(active.timer);
-        this.recordFailure();
-        active.resolve({ ok: false, reason: "pwsh_host_crashed" });
-      }
+      failActivePending("pwsh_host_crashed");
     });
 
     child.once("error", () => {
       if (this.child === child) {
+        this.cleanupTransport();
         this.child = null;
         this.isCold = true;
       }
-      if (this.pending && this.pending.child === child) {
-        const active = this.pending;
-        this.pending = null;
-        clearTimeout(active.timer);
-        this.recordFailure();
-        active.resolve({ ok: false, reason: "pwsh_host_spawn_error" });
-      }
+      failActivePending("pwsh_host_spawn_error");
     });
 
-    this.child = child;
-    this.isCold = true;
     return child;
   }
 
@@ -1005,16 +1293,18 @@ export class PwshParserHost {
       return { ok: false, reason: "pwsh_host_circuit_open" };
     }
 
-    let child: ChildProcessWithoutNullStreams;
+    let child: ChildProcess;
     try {
-      child = this.ensureChild();
+      child = await this.ensureChild();
     } catch {
       this.recordFailure();
       return { ok: false, reason: "pwsh_host_spawn_error" };
     }
 
+    const useNamedPipe = this.shell === "pwsh5" && process.platform === "win32";
     const reqId = `ps-${this.nextReqId++}`;
     const timeoutMs = this.isCold ? this.coldTimeoutMs : this.warmTimeoutMs;
+    const requestLine = `${JSON.stringify({ id: reqId, source })}\n`;
 
     return await new Promise<PwshHostResult>((resolve) => {
       const timer = setTimeout(() => {
@@ -1026,10 +1316,26 @@ export class PwshParserHost {
         }
       }, timeoutMs);
 
-      this.pending = { id: reqId, child, resolve, timer };
+      this.pending = {
+        id: reqId,
+        child,
+        resolve,
+        timer,
+        ...(useNamedPipe ? { requestLine } : {}),
+      };
 
       try {
-        child.stdin.write(`${JSON.stringify({ id: reqId, source })}\n`, "utf8");
+        if (useNamedPipe) {
+          if (this.pipeSocket && !this.pipeSocket.destroyed) {
+            this.pending.requestLine = undefined;
+            this.pipeSocket.write(requestLine, "utf8");
+          }
+        } else {
+          if (!child.stdin) {
+            throw new Error("missing stdin");
+          }
+          child.stdin.write(requestLine, "utf8");
+        }
       } catch {
         if (this.pending && this.pending.id === reqId && this.pending.child === child) {
           this.pending = null;
@@ -1069,6 +1375,23 @@ export function getSharedPwshHost(
     sharedHosts.set(key, host);
   }
   return host;
+}
+
+export function getSharedPwshHostDiagnostic(
+  shell: PwshShellVariant,
+  binaryPath?: string,
+): { pipeConnected: boolean; stderr: string; nonJsonStdout: string; binaryPath: string } | null {
+  // Hosts are keyed by `${shell}::${binaryPath}`; a test may legitimately create several hosts for
+  // the same shell variant with different binaries, so prefer the exact default binary.
+  const preferredBin = binaryPath ?? resolvePwshBinaryPath(shell);
+  const exact = preferredBin ? sharedHosts.get(`${shell}::${preferredBin}`) : undefined;
+  if (exact) return exact.getLastDiagnostic();
+  for (const [key, host] of sharedHosts.entries()) {
+    if (key.startsWith(`${shell}::`)) {
+      return host.getLastDiagnostic();
+    }
+  }
+  return null;
 }
 
 export async function disposeSharedPwshHost(): Promise<void> {

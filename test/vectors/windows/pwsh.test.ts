@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterAll, describe, expect, it } from "vitest";
 import { SessionContextStore } from "../../../server/context/session.js";
 import { decideAction } from "../../../server/decide.js";
@@ -5,6 +6,7 @@ import { parsePowerShell } from "../../../server/shell/pwsh.js";
 import {
   buildSanitizedPwshEnv,
   disposeSharedPwshHost,
+  getSharedPwshHostDiagnostic,
   resolvePwshBinaryPath,
 } from "../../../server/shell/pwsh-host.js";
 import type { Action } from "../../../shared/types.js";
@@ -114,7 +116,10 @@ describe("Windows PowerShell parser host & conformance vectors", () => {
           allowPosixPwshHost: true,
           denyAsAsk: false,
         });
-        expect(res.decision.level, `expected L0 for: ${cmd} (reasons: ${res.decision.reasons.join(",")})`).toBe("L0");
+        expect(
+          res.decision.level,
+          `expected L0 for: ${cmd} (reasons: ${res.decision.reasons.join(",")}, diag: ${JSON.stringify(getSharedPwshHostDiagnostic("pwsh7"))})`,
+        ).toBe("L0");
         expect(res.decision.verdict).toBe("allow");
       }
 
@@ -283,8 +288,21 @@ describe("Windows PowerShell parser host & conformance vectors", () => {
         pathCtx: pwshPathCtx,
         denyAsAsk: false,
       });
-      expect(res.decision.level).toBe("L2");
+      expect(
+        res.decision.level,
+        `pwsh5 unexpected decision: ${JSON.stringify({
+          decision: res.decision,
+          diag: getSharedPwshHostDiagnostic("pwsh5"),
+        })}`,
+      ).toBe("L2");
       expect(res.decision.effects?.some((e) => e.tag === "net_egress")).toBe(true);
-    });
+    }, 25_000);
+  });
+});
+
+describe("Windows PowerShell 5.1 cold-start regression guard", () => {
+  it("never uses the New-Object cmdlet in host scripts (autoloading Microsoft.PowerShell.Utility stalls powershell.exe 5.1 under the sanitized env)", () => {
+    const src = readFileSync(new URL("../../../server/shell/pwsh-host.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/New-Object/);
   });
 });

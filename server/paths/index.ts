@@ -161,36 +161,33 @@ export function resolveAncestorRealPath(absolutePath: string): string {
 }
 
 export function expandPosixPath(rawPath: string, cwd: string, home: string): string {
-  const usePosixRules =
-    isPosixStyleRoot(cwd) &&
-    !/^[A-Za-z]:/.test(rawPath.trim()) &&
-    !rawPath.includes("\\");
-  const pathJoin = isPosixStyleRoot(home) ? posix.join : join;
+  const cwdIsPosix = isPosixStyleRoot(cwd);
+  const homeJoin = isPosixStyleRoot(home) ? posix.join : join;
+  const cwdJoin = cwdIsPosix ? posix.join : join;
 
   let expanded = rawPath.trim();
   if (expanded === "~") {
     expanded = home;
   } else if (expanded.startsWith("~/")) {
-    expanded = pathJoin(home, expanded.slice(2));
+    expanded = homeJoin(home, expanded.slice(2));
   } else if (expanded.startsWith("$HOME/")) {
-    expanded = pathJoin(home, expanded.slice("$HOME/".length));
+    expanded = homeJoin(home, expanded.slice("$HOME/".length));
   } else if (expanded === "$HOME" || expanded === "${HOME}") {
     expanded = home;
   } else if (expanded.startsWith("${HOME}/")) {
-    expanded = pathJoin(home, expanded.slice("${HOME}/".length));
+    expanded = homeJoin(home, expanded.slice("${HOME}/".length));
   } else if (expanded === "$PWD" || expanded === "${PWD}") {
     expanded = cwd;
   } else if (expanded.startsWith("$PWD/")) {
-    expanded = pathJoin(cwd, expanded.slice("$PWD/".length));
+    expanded = cwdJoin(cwd, expanded.slice("$PWD/".length));
   } else if (expanded.startsWith("${PWD}/")) {
-    expanded = pathJoin(cwd, expanded.slice("${PWD}/".length));
+    expanded = cwdJoin(cwd, expanded.slice("${PWD}/".length));
   }
 
-  if (usePosixRules && isPosixStyleRoot(expanded)) {
-    return posix.resolve(expanded);
-  }
-  if (usePosixRules && !/^[A-Za-z]:/.test(expanded)) {
-    return posix.resolve(cwd, expanded);
+  if (cwdIsPosix && !/^[A-Za-z]:[\\/]/.test(expanded)) {
+    return posix.isAbsolute(expanded)
+      ? posix.resolve(expanded)
+      : posix.resolve(cwd, expanded);
   }
   return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
 }

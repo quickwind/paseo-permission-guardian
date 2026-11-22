@@ -742,13 +742,22 @@ function checkCmdCwdShadowBinary(
     : [".com", ".exe", ".bat", ".cmd"];
 
   const cwdFwd = cmdPathCtx.cwd.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
-  let realCwdFwd = cwdFwd;
+  const cwdVariantList = [cwdFwd];
   try {
-    realCwdFwd = realpathSync(cmdPathCtx.cwd).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+    cwdVariantList.push(
+      realpathSync.native(cmdPathCtx.cwd).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase(),
+    );
   } catch {
     // non-existent or virtual Windows CWD on POSIX host
   }
-  const cwdVariants = Array.from(new Set([cwdFwd, realCwdFwd]));
+  try {
+    cwdVariantList.push(
+      realpathSync(cmdPathCtx.cwd).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase(),
+    );
+  } catch {
+    // non-existent or virtual Windows CWD on POSIX host
+  }
+  const cwdVariants = Array.from(new Set(cwdVariantList));
 
   for (const ext of exts) {
     const modSet = session?.modifiedFiles ?? [];

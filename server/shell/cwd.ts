@@ -65,7 +65,7 @@ export function resolveStaticPosixCwd(
     return null;
   }
 
-  if (isPosixStylePath(currentCwd) && !/^[A-Za-z]:/.test(expanded) && !expanded.includes("\\")) {
+  if (isPosixStylePath(currentCwd) && !/^[A-Za-z]:[\\/]/.test(expanded)) {
     return posix.isAbsolute(expanded)
       ? posix.resolve(expanded)
       : posix.resolve(currentCwd, expanded);

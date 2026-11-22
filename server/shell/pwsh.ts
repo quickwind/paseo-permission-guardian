@@ -1,7 +1,12 @@
 import { win32 } from "node:path";
 import type { EffectTag } from "../../shared/types.js";
 import type { SessionState } from "../context/session.js";
-import { classifyPath, stripProviderDrive, type WindowsPathContext } from "../paths/index.js";
+import {
+  classifyPath,
+  resolveAncestorRealPath,
+  stripProviderDrive,
+  type WindowsPathContext,
+} from "../paths/index.js";
 import { isPersistentEnvTarget, isSensitiveEnvVarName } from "../secrets/patterns.js";
 import { scanCmdPercentExpansions } from "./cmd.js";
 import {
@@ -680,9 +685,13 @@ function isTrustedVenvActivation(
 
   // Ensure nothing under the venv directory was modified during this session
   const venvDirRel = rel.split("/")[0];
-  const venvPrefix = `${worktreeFwd}/${venvDirRel}/`;
+  const worktreeRealFwd = resolveAncestorRealPath(worktree).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  const venvPrefixes = Array.from(
+    new Set([`${worktreeFwd}/${venvDirRel}/`, `${worktreeRealFwd}/${venvDirRel}/`]),
+  );
   for (const modified of options.session?.modifiedFiles ?? []) {
-    if (modified.replaceAll("\\", "/").toLowerCase().startsWith(venvPrefix)) {
+    const modFwd = modified.replaceAll("\\", "/").toLowerCase();
+    if (venvPrefixes.some((prefix) => modFwd.startsWith(prefix))) {
       return false;
     }
   }
