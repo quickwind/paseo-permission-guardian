@@ -1,7 +1,7 @@
 # P2a: `act` Mode with Evidence Gate — Design
 
 - **Date**: 2026-11-22
-- **Status**: Draft v2 — builder check done; independent review (neon) incorporated; pending user approval
+- **Status**: Draft v3 — builder check done; two independent review rounds (neon) incorporated; pending user approval
 - **Milestone**: P2a (safety core). P2b (shadow dashboard screen, timeline rows, prompt guidance,
   mode policy) is a separate design.
 - **Related**: [DESIGN.md](../../DESIGN.md) §10.4, §12, §13, §14, §16;
@@ -87,27 +87,42 @@ fingerprint.
 | `failed_false_allow` | ≥1 unannotated false-allow in window |
 | `collecting` | No false-allow, `samples < minSamples`, not latched |
 | `passed` | No false-allow, `samples >= minSamples` (entry condition met) |
-| `latched` | Entered `act` under the current fingerprint; stays while false-allow = 0 |
+| `latched` | Entered `act` under the current fingerprint and `minSamples`; stays while false-allow = 0 |
+| `suspended` | Latched, but ≥1 unannotated false-allow appeared after latching (see Latch rules) |
 
 ```
-if settings invalid or mode == off            -> effective off/shadow (invalid ⇒ shadow)
-if mode == shadow                              -> shadow
-if mode == act:
-  state in {replaying, unavailable}            -> shadow                (override never applies)
-  state == failed_false_allow:
-       autoFallbackOnFalseAllow                -> shadow                (override does not help)
-       !autoFallback && overrideValid          -> act  + persistent warning
+settings invalid                               -> shadow
+mode == off                                    -> off
+mode == shadow                                 -> shadow
+mode == act:
+  state in {replaying, unavailable}            -> shadow   (nothing overrides this)
+  falseAllow > 0 && autoFallbackOnFalseAllow   -> shadow   (latched ⇒ suspended; override does not help)
+  falseAllow > 0 && !autoFallbackOnFalseAllow:
+       latchValid || overrideValid             -> act + persistent warning
        otherwise                               -> shadow
-  state in {passed, latched}                   -> act   (passed ⇒ write latch)
-  state == collecting && overrideValid         -> act   (override; no latch written)
-  otherwise                                    -> shadow
+  latchValid                                   -> act
+  samples >= minSamples                        -> act, write latch (state passed → latched)
+  overrideValid                                -> act      (no latch written)
+  otherwise                                    -> shadow   (collecting)
+
+latchValid    = gate-state.latched && gate-state.fingerprint == fingerprint
+                && minSamples <= gate-state.minSamplesAtLatch && !suspended
 overrideValid = allowOverride && actOverride.accepted && actOverride.fingerprint == fingerprint
 ```
 
+`autoFallbackOnFalseAllow = false` therefore means exactly one thing in every state: false-allows are
+reported but do not change the effective mode.
+
 - **Latch.** In `act` the plugin answers L0 itself, so new human allow samples stop arriving and the
   window would drain below N. Entering needs the full condition; staying needs only
-  false-allow = 0 (re-checked on every reconciliation and replay). The latch (`gate-state.json`) is
-  bound to the fingerprint.
+  false-allow = 0 (re-checked on every reconciliation and replay). The latch (`gate-state.json`)
+  records `fingerprint` and `minSamplesAtLatch`; raising `minSamples` above the latched value
+  invalidates it (lowering does not create one retroactively).
+- **Suspension, not deletion.** A false-allow while latched sets `suspendedBy: [requestId…]`.
+  Annotating all of them `not_safety` lifts the suspension and resumes `act` without re-earning
+  samples (so a mis-counted redirect/cancellation does not cost weeks). If a suspending record ages
+  out of the window unannotated, the latch is **cleared** and the full entry condition applies again
+  — a real disagreement never resolves itself by time.
 - **Fingerprint change** clears the latch **and invalidates the override**. A replay must pass the
   entry condition again, or the user must re-accept the override for the new fingerprint.
 - **Auto-deny gate.** L3 auto-deny additionally requires false-deny = 0 in window (a human allowed a
@@ -115,7 +130,8 @@ overrideValid = allowOverride && actOverride.accepted && actOverride.fingerprint
 
 `guardian.status` returns `effectiveMode: "off" | "shadow" | "act"` and a `gate` object (state,
 reason, samples x/N, false-allow and false-deny counts, unannotated false-allow entries (≤5),
-unclassified-deny count, last replay time, fingerprint short hash, override info).
+`unconfirmed` act-answer count, data-integrity issues (corrupt lines, orphan denials), last replay
+time, fingerprint short hash, override info).
 
 ### 3.3 Human vs. cancelled resolutions **[ADR]**
 
@@ -133,7 +149,14 @@ the agent closes, or the ACP transport exits (`acp-internal/connection.js` resol
 
 ### 3.4 Replay, samples and false-allows **[ADR]**
 
-Input: records with `requestedAt` in the window, a decision, a resolution, actor `human`.
+Input: records whose `requestedAt` (or, for orphan resolutions, `resolvedAt`) is in the window, with
+a resolution and actor `human`.
+
+- **Orphan human denial** (resolution without a decision, e.g. the `before` handler failed or crashed):
+  cannot be replayed ⇒ gate `unavailable`, listed as an integrity issue that the user can
+  acknowledge via annotation (`not_safety`), which excludes it.
+- **Corrupt line** anywhere in the window ⇒ `unavailable`, listed with file + line hash; the user can
+  acknowledge it (audited annotation keyed by `file#sha256(line)`).
 
 For each record compute `replayVerdict` with the current engine, using the stored
 `contextSnapshot` (§3.7) when present:
@@ -144,15 +167,17 @@ For each record compute `replayVerdict` with the current engine, using the store
 - **Sample** ⇔ human allow ∧ `replayVerdict == "allow"` ∧ (record has a context snapshot, or the
   recorded verdict was also `allow`). Legacy records without a snapshot can only *lose* sample
   status from missing context, never gain it.
-- **False-deny** ⇔ `replayVerdict == "deny"` ∧ human allow.
+- **False-deny** ⇔ `replayLevel == "L3"` ∧ human allow (by level, so it is measured even while
+  `denyAsAsk = true` maps L3 to `ask`).
 - **Skipped**: action missing/unknown kind/decide error. A skipped **human-denied** record makes the
   gate `unavailable` (it might be a false-allow); skipped allows are just not samples.
 - **Truncation**: replay is bounded (default 20 000 records in window). If the bound is hit the gate is
   `unavailable` — no partial result is used.
 - **Isolation**: replay uses its own PowerShell host instances (separate queue and circuit breaker)
   so it can neither starve nor be starved by live requests. A pwsh timeout during replay yields the
-  normal `opaque` result for that record; if that record is a human denial the gate is `unavailable`
-  until it can be evaluated.
+  normal `opaque` result for that record. Any parser-host failure on a **human-denied** record
+  (`timeout`, `circuit_open`, `crashed`, `spawn_error`, or any `opaque:pwsh_host_*` reason) makes the
+  gate `unavailable` until that record can be evaluated.
 - **Filesystem drift**: replay should not depend on the current state of paths that may no longer
   exist (deleted worktrees). The builder decides how (e.g. `skipHostRealpath` with stored resolved
   paths); the result must be deterministic for a given record and fingerprint.
@@ -164,9 +189,15 @@ For each record compute `replayVerdict` with the current engine, using the store
 
 In `handlePermissionBefore`, after normalization, context snapshot, `decideAction`, `recordBefore`:
 
+Gate counters are updated wherever `before` and `after` are merged in the audit store, in every mode
+— not inside this act path — so out-of-order events always reach the gate.
+
+`recordBefore` updates the in-memory record first and appends to disk asynchronously; the act path
+never waits for disk I/O.
+
 1. Effective mode must be `act`; otherwise stop.
-2. If the audit record for this `requestId` already has a resolution (the `after` event arrived
-   first), stop and evaluate it for false-allow immediately.
+2. If the in-memory record for this `requestId` already has a resolution (the `after` event arrived
+   first), stop.
 3. Stop if `decision.neverAutoAnswer` or kind ∈ {question, plan, mode}.
 4. Map verdict: `allow` (L0) → allow-once action (§3.8); `deny` (L3, `denyAsAsk = false`, auto-deny
    gate open) → deny-once action + message (reasons, redacted, ≤500 chars, no `interrupt`); `ask` →
@@ -183,11 +214,16 @@ slow disk beyond the existing write queue; the step 2 check uses the in-memory r
 
 ### 3.6 Attribution
 
-- `actor = "plugin"` only if the request is marked **and** the resolution matches what the plugin
-  sent (`behavior` equal and `selectedActionId` equal).
+- `actor = "plugin"` only if the request is marked, the resolution matches what the plugin sent
+  (`behavior` and `selectedActionId` equal), **and** it arrives within the attribution window
+  (15 s after `sentAt`). A matching resolution arriving later is attributed to the human (the
+  plugin's frame was evidently not applied).
 - Marked but different resolution → `actor = "human"`, `actOutcome = "lost_race"`; a human denial
   here is a false-allow candidate and triggers fallback immediately.
-- Marked but no `after` within the TTL (10 min) → `actOutcome = "unconfirmed"`, shown in status.
+- Marked but no `after` within the window → `actOutcome = "unconfirmed"`. Three consecutive
+  `unconfirmed` outcomes ⇒ act answering pauses (effective `shadow`, reason
+  `responder_unconfirmed`) until the next confirmed answer path check on daemon restart or a manual
+  replay. The mark itself is kept for the existing 10 min TTL only to recognise late events.
 - Residual: a human clicking the *same* option at the same instant is attributed to the plugin; both
   chose the same answer, so no false-allow is hidden.
 
@@ -232,14 +268,21 @@ Verified gaps that are harmless in `shadow` but would be wrong auto-allows in `a
    to permissions, and Paseo MCP tools with those effects (e.g. `respond_to_permission`, settings,
    plugin management, `send_agent_prompt` to other agents) are L2. MCP name parsing accepts the
    provider spellings actually observed; the single-underscore form (`mcp_<server>_<tool>`) is
-   **to be confirmed** from real payloads and added with fixtures if it exists.
-6. **Sandbox-bypass flags**: if a provider payload carries a sandbox-bypass flag (reported for agy as
-   `BypassSandbox`; not seen in local audit — **to be confirmed**), `true` ⇒ L2.
+   to be confirmed from real payloads, but the conservative rule ships in P2a regardless:
+   names matching `^mcp_[a-z0-9-]+_` are parsed as MCP (server = segment after `mcp_`), and any
+   `paseo` server tool is L2 unless explicitly listed read-only. `paseo` CLI detection skips leading
+   global options (`--home`, `--host`, `--json`, …) before matching subcommands.
+6. **Sandbox-bypass flags**: any input key matching `/^(bypass_?sandbox|dangerously.*|unsandboxed)$/i`
+   with a truthy value ⇒ L2. Reported for agy as `BypassSandbox` (not yet seen in local audit); the
+   rule ships in P2a regardless because it can only raise levels.
 7. **Entrypoints**: extend `isBuildOrScriptEntrypoint` with `build.rs`, `conftest.py`, `setup.py`,
    `setup.cfg`, `noxfile.py`, `tox.ini`, `Taskfile.yml`/`Taskfile.yaml`, `justfile`, `build.gradle`,
    `build.gradle.kts`, `settings.gradle(.kts)`, `pom.xml`, `CMakeLists.txt`, `meson.build`,
    `Rakefile`, `Gemfile`, `composer.json`, `deno.json(c)`, `bunfig.toml`, `.cargo/config.toml`,
    `Directory.Build.props`, `*.csproj`, and `.husky/**`/`.git/hooks/**` (already protected).
+8. **Unknown timeline items**: `syncFromTimeline` ignores ACP tool calls whose `detail.type` is
+   `unknown`. Such items (completed tool calls of unknown type) set `untrustedTaint` for the session,
+   since their output may carry untrusted content.
 
 ## 4. Settings (Paseo Settings, host scope)
 
@@ -304,8 +347,8 @@ an audit `gate` event when it observes override acceptance/revocation.
 Settings screen "Automatic answering" section: mode selector, gate parameters, override checkbox
 with confirmation dialog (shows what it skips and that it expires on upgrade), and a status card:
 state, reason, samples x/N, false-allow entries (command + per-sub-command effects + "not a safety
-issue" button), false-deny count, unclassified/unconfirmed counts, last replay, fingerprint short
-hash. React Native primitives only; strings in `client/i18n.ts` (en, zh-CN).
+issue" button), false-deny count, unconfirmed count, integrity issues with acknowledge buttons, last replay,
+fingerprint short hash. React Native primitives only; strings in `client/i18n.ts` (en, zh-CN).
 
 ## 7. Error handling (fail to human)
 
@@ -324,8 +367,14 @@ hash. React Native primitives only; strings in `client/i18n.ts` (en, zh-CN).
 
 - Action resolution per provider with real agy fixtures; always/session options, multiple
   candidates, missing ids, localized labels → no answer; devin/claude never answered.
-- Gate state machine: every row of §3.2 incl. override + fingerprint change, autoFallback on/off,
-  replaying/unavailable with override, auto-deny gate.
+- Gate state machine: every row of §3.2 incl. override + fingerprint change, autoFallback on/off in
+  latched/override/collecting states, replaying/unavailable with override, auto-deny gate,
+  `minSamples` raised after latching, suspension lifted by annotation, suspension aging out ⇒ latch
+  cleared.
+- Integrity: corrupt line ⇒ unavailable until acknowledged; orphan human denial ⇒ unavailable until
+  annotated; parser-host failure on a human denial ⇒ unavailable.
+- Responder: after-before ordering in shadow and act both reach the gate; matching resolution after
+  15 s ⇒ human; three unconfirmed ⇒ paused.
 - Replay: false-allow from replay verdict only; legacy sample rule; skipped human denial ⇒
   unavailable; truncation ⇒ unavailable; annotations; isolated pwsh host.
 - Attribution: lost race (human deny), same-option race, after-before ordering, unconfirmed TTL,
@@ -345,7 +394,7 @@ hash. React Native primitives only; strings in `client/i18n.ts` (en, zh-CN).
 - Synthetic history meeting the gate ⇒ L0 answered allow-once on agy fixtures only; one human-denied
   L0 in history ⇒ `failed_false_allow`, no auto-answers; annotating it ⇒ `passed`.
 - All §3.9 hardening items landed (items marked "to be confirmed" either confirmed with fixtures or
-  explicitly deferred with the conservative behaviour in place).
+  shipped with the conservative behaviour described there).
 - DESIGN.md (§10.4, §11, §12, §13, §14, §16) and ADR-0008 updated.
 
 ## 10. Left to the builder
@@ -383,3 +432,11 @@ would remove the edit→test loop that `act` exists to automate).
   cancellation payload shape (marked "to be confirmed"). All findings incorporated; #1 and #8
   decided by the user (count unclear denials until confirmed; no coverage requirement); the
   edit-then-run concern decided by the user (stay L0, document, extend entrypoints).
+- Independent review round 2 by neon (2026-11-22): round-1 items 1 and 7 resolved, 2–6 partially; 5 new
+  findings. Verified: ACP `detail.type: "unknown"` timeline items ignored by `session.ts`. Not found
+  in local data or SDK: `BypassSandbox`, `mcp_paseo_*` (rules shipped anyway as raise-only). v3 adds:
+  integrity rules (corrupt lines, orphan denials, all host failures ⇒ unavailable), latch bound to
+  `minSamplesAtLatch`, suspension instead of deletion (designer's call to keep the user's
+  "count until confirmed" choice from costing weeks), unified `autoFallbackOnFalseAllow` semantics,
+  gate updates at the merge point in every mode, memory-first `recordBefore`, 15 s attribution
+  window and unconfirmed pause, false-deny by level, mandatory raise-only MCP/sandbox rules.
