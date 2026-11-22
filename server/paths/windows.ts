@@ -7,6 +7,7 @@ import {
   type PathClassification,
   type PathContext,
 } from "./index.js";
+import { matchPaseoHomeRel, relUnder } from "./paseo-self.js";
 
 export interface WindowsPathContext extends PathContext {
   os?: HostOs;
@@ -17,6 +18,12 @@ export interface WindowsPathContext extends PathContext {
     automountRoot?: string;
   };
   envSnapshot?: Record<string, string | undefined>;
+  /**
+   * Test seam: resolve a Windows absolute path through junctions/symlinks. Defaults to
+   * `resolveAncestorRealPath` on win32 hosts and identity elsewhere. Ignored when
+   * `skipHostRealpath` is set.
+   */
+  windowsRealpath?: (absWinPath: string) => string;
 }
 
 export interface WindowsPathClassification extends PathClassification {
@@ -149,6 +156,7 @@ const REPO_PROTECTED_PREFIXES = [
   ".codex",
   ".cursor",
   ".github/workflows",
+  ".husky",
 ];
 
 const HOME_SENSITIVE_POSIX = [
@@ -311,6 +319,38 @@ function extractAdsStream(candidate: string): { base: string; adsStream?: string
   return { base: candidate };
 }
 
+function windowsRoots(values: Array<string | undefined>): string[] {
+  const out = new Set<string>();
+  for (const v of values) {
+    const t = v?.trim();
+    if (!t || !(/^[A-Za-z]:[\\/]/.test(t) || t.startsWith("\\\\"))) continue;
+    out.add(toForwardSlash(win32.normalize(t)).replace(/\/+$/, "").toLowerCase());
+  }
+  return Array.from(out);
+}
+
+/**
+ * Add the realpath of each root (when resolvable) so a junctioned/symlinked Paseo root
+ * also protects its target, mirroring the POSIX `resolveReal` root handling.
+ */
+function withRealRoots(roots: string[], ctx: WindowsPathContext): string[] {
+  if (ctx.skipHostRealpath) return roots;
+  const resolver =
+    ctx.windowsRealpath ?? (process.platform === "win32" ? resolveAncestorRealPath : undefined);
+  if (!resolver) return roots;
+  const out = new Set(roots);
+  for (const root of roots) {
+    let real: string;
+    try {
+      real = resolver(root.replaceAll("/", "\\"));
+    } catch {
+      continue;
+    }
+    for (const r of windowsRoots([real])) out.add(r);
+  }
+  return Array.from(out);
+}
+
 function isWinPathUnder(candidateFwdLower: string, rootFwdLower: string): boolean {
   const normCand = candidateFwdLower.replace(/\/+$/, "");
   const normRoot = rootFwdLower.replace(/\/+$/, "");
@@ -356,6 +396,12 @@ function expandWindowsMacros(
     PROGRAMFILES: getEnvInsensitive(env, "ProgramFiles") ?? "C:\\Program Files",
     "PROGRAMFILES(X86)": getEnvInsensitive(env, "ProgramFiles(x86)") ?? "C:\\Program Files (x86)",
   };
+  // Paseo roots are path-valued (never secrets); expand them so `%PASEO_HOME%\config.json` /
+  // `$env:PASEO_HOME\...` reach the plugin-self checks (ruling R11).
+  for (const name of ["PASEO_HOME", "PASEO_PLUGIN_DIR", "PASEO_GUARDIAN_DATA_DIR"]) {
+    const v = getEnvInsensitive(env, name);
+    if (v) macroMap[name] = v;
+  }
 
   let out = rawPath.trim();
   if (out === "~") {
@@ -612,7 +658,7 @@ export function classifyWindowsPath(
   canonical = canonical.replace(/^([a-z]):/, (_, d: string) => `${d.toUpperCase()}:`);
 
   let realPath = canonical;
-  if (process.platform === "win32" && !verbatim) {
+  if (process.platform === "win32" && !verbatim && !ctx.skipHostRealpath) {
     realPath = resolveAncestorRealPath(canonical);
   }
 
@@ -627,7 +673,7 @@ export function classifyWindowsPath(
   const homeFwdLower = toForwardSlash(win32.normalize(homeWin)).toLowerCase();
 
   const worktreeRaw = (ctx.worktreeRoot ?? ctx.cwd).replaceAll("/", "\\");
-  const worktreeReal = process.platform === "win32" ? resolveAncestorRealPath(worktreeRaw) : win32.normalize(worktreeRaw);
+  const worktreeReal = process.platform === "win32" && !ctx.skipHostRealpath ? resolveAncestorRealPath(worktreeRaw) : win32.normalize(worktreeRaw);
   const worktreeFwdLower = toForwardSlash(worktreeReal).toLowerCase();
   const realFwdLower = toForwardSlash(realPath).toLowerCase();
   const normFwdLower = toForwardSlash(canonical).toLowerCase();
@@ -699,11 +745,72 @@ export function classifyWindowsPath(
   const pluginDirRaw = (
     ctx.pluginDataDir ?? win32.join(homeWin, ".paseo", "permission-guardian")
   ).replaceAll("/", "\\");
-  const pluginFwdLower = toForwardSlash(win32.normalize(pluginDirRaw)).toLowerCase();
-  if (isWinPathUnder(realFwdLower, pluginFwdLower) || isWinPathUnder(normFwdLower, pluginFwdLower)) {
+  const pluginFwdLowers = withRealRoots(
+    [toForwardSlash(win32.normalize(pluginDirRaw)).replace(/\/+$/, "").toLowerCase()],
+    ctx,
+  );
+  if (
+    pluginFwdLowers.some(
+      (pluginFwdLower) =>
+        isWinPathUnder(realFwdLower, pluginFwdLower) || isWinPathUnder(normFwdLower, pluginFwdLower),
+    )
+  ) {
     isProtected = true;
     isPluginSelf = true;
     matchedRules.push("protected:plugin_self");
+  }
+
+  // Whole-root plugin-self roots (PASEO_PLUGIN_DIR, PASEO_GUARDIAN_DATA_DIR, data dir).
+  const wholeRoots = withRealRoots(
+    windowsRoots([
+      ...(ctx.paseoRoots ?? []),
+      getEnvInsensitive(ctx.envSnapshot, "PASEO_PLUGIN_DIR"),
+      getEnvInsensitive(ctx.envSnapshot, "PASEO_GUARDIAN_DATA_DIR"),
+    ]),
+    ctx,
+  );
+  for (const root of wholeRoots) {
+    if (candidates.some((c) => relUnder(c, root, true) !== null)) {
+      isProtected = true;
+      isPluginSelf = true;
+      matchedRules.push("protected:plugin_self");
+      const lowerBase = baseName.toLowerCase();
+      if (lowerBase === "config.json" || lowerBase === "settings.json") {
+        isSensitive = true;
+        matchedRules.push(`sensitive:paseo_self:${lowerBase}`);
+      }
+    }
+  }
+
+  // Paseo home roots: only specific control subpaths (ruling R11).
+  const homeRoots = withRealRoots(
+    windowsRoots([
+      win32.join(homeWin, ".paseo"),
+      getEnvInsensitive(ctx.envSnapshot, "PASEO_HOME"),
+      ...(ctx.paseoHomeRoots ?? []),
+    ]),
+    ctx,
+  );
+  for (const cand of candidates) {
+    const rels: string[] = [];
+    for (const root of homeRoots) {
+      const rel = relUnder(cand, root, true);
+      if (rel !== null) rels.push(rel);
+    }
+    const anyUser = cand.match(/^[a-z]:\/users\/[^/]+\/\.paseo(?:\/(.*))?$/);
+    if (anyUser) rels.push(anyUser[1] ?? "");
+    for (const rel of rels) {
+      const m = matchPaseoHomeRel(rel);
+      if (m.protected) {
+        isProtected = true;
+        isPluginSelf = true;
+        matchedRules.push("protected:plugin_self", `protected:paseo_home:${rel || "."}`);
+      }
+      if (m.secret) {
+        isSensitive = true;
+        matchedRules.push(`sensitive:paseo_self:${baseName.toLowerCase()}`);
+      }
+    }
   }
 
   for (const cand of candidates) {

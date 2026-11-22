@@ -1,3 +1,4 @@
+import { hasSandboxBypassFlag } from "./sandbox.js";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { Action, ActionKind } from "../../shared/types.js";
 import {
@@ -97,6 +98,7 @@ export function normalizeAcpRequest(
     host: { os: ctx.hostOs },
     cwd: asNonEmptyString(rawInput?.cwd) ?? asNonEmptyString(rawInput?.Cwd) ?? ctx.cwd,
     worktreeRoot: ctx.worktreeRoot,
+    ...(hasSandboxBypassFlag(rawInput) ? { sandboxBypass: true } : {}),
     ...(ctx.includeRaw ? { raw: request } : {}),
   };
 

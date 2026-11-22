@@ -182,7 +182,11 @@ describe("P1a deterministic engine", () => {
       },
     ];
 
-    const session = await sessions.syncFromTimeline("agent-1", defaultPathCtx, async () => timelineItems);
+    const { state: session } = await sessions.syncFromTimeline(
+      "agent-1",
+      defaultPathCtx,
+      async () => timelineItems,
+    );
     expect(session.untrustedTaint).toBe(true);
     expect(session.secretTaint).toBe(true);
 

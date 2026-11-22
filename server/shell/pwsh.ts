@@ -12,6 +12,7 @@ import { scanCmdPercentExpansions } from "./cmd.js";
 import {
   getSharedPwshHost,
   type PwshHostAstPayload,
+  type PwshHostProvider,
   type PwshHostCommand,
   type PwshHostOptions,
   type PwshShellVariant,
@@ -24,7 +25,14 @@ export interface PwshParseOptions extends PwshHostOptions {
   cwd: string;
   worktreeRoot?: string;
   home?: string;
+  /** Outer path-context fields carried into inner path classification (F2). */
+  pluginDataDir?: string;
+  paseoRoots?: string[];
+  paseoHomeRoots?: string[];
+  skipHostRealpath?: boolean;
   pwshHostMode?: PwshHostMode;
+  /** When set, used instead of the shared host (e.g. replay's isolated hosts). */
+  hostProvider?: PwshHostProvider;
   envSnapshot?: Record<string, string | undefined>;
   session?: SessionState;
 }
@@ -655,6 +663,15 @@ function normalizeStaticPwshCwd(currentCwd: string, target: string): string | nu
   return /^[A-Za-z]:/.test(cwdClean) ? win32.resolve(cwdClean, clean) : win32.resolve(cwdClean, clean);
 }
 
+function innerPathCtx(options: PwshParseOptions): Partial<WindowsPathContext> {
+  return {
+    ...(options.pluginDataDir ? { pluginDataDir: options.pluginDataDir } : {}),
+    ...(options.paseoRoots ? { paseoRoots: options.paseoRoots } : {}),
+    ...(options.paseoHomeRoots ? { paseoHomeRoots: options.paseoHomeRoots } : {}),
+    ...(options.skipHostRealpath ? { skipHostRealpath: true } : {}),
+  };
+}
+
 function isTrustedVenvActivation(
   scriptPathRaw: string,
   options: PwshParseOptions,
@@ -669,6 +686,7 @@ function isTrustedVenvActivation(
     worktreeRoot: worktree,
     home: options.home,
     envSnapshot: options.envSnapshot,
+    ...innerPathCtx(options),
   };
   const classified = classifyPath(scriptPathRaw, pathCtx);
   if (!classified.inWorktree) {
@@ -685,7 +703,7 @@ function isTrustedVenvActivation(
 
   // Ensure nothing under the venv directory was modified during this session
   const venvDirRel = rel.split("/")[0];
-  const worktreeRealFwd = resolveAncestorRealPath(worktree).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  const worktreeRealFwd = (options.skipHostRealpath ? worktree : resolveAncestorRealPath(worktree)).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
   const venvPrefixes = Array.from(
     new Set([`${worktreeFwd}/${venvDirRel}/`, `${worktreeRealFwd}/${venvDirRel}/`]),
   );
@@ -714,6 +732,7 @@ function classifyRegistryPathTarget(hiveTarget: string, shell: PwshShellVariant,
     worktreeRoot: options.worktreeRoot,
     home: options.home,
     envSnapshot: options.envSnapshot,
+    ...innerPathCtx(options),
   });
 }
 
@@ -744,12 +763,14 @@ export async function parsePowerShell(
     return { commands, pipelines, effects, opaque, envReads: [], assignments, unescapedSources, cwdChanged };
   }
 
-  const host = getSharedPwshHost(shell, {
-    allowPosixHost: options.allowPosixHost,
-    binaryPath: options.binaryPath,
-    warmTimeoutMs: options.warmTimeoutMs,
-    coldTimeoutMs: options.coldTimeoutMs,
-  });
+  const host = options.hostProvider
+    ? options.hostProvider(shell)
+    : getSharedPwshHost(shell, {
+        allowPosixHost: options.allowPosixHost,
+        binaryPath: options.binaryPath,
+        warmTimeoutMs: options.warmTimeoutMs,
+        coldTimeoutMs: options.coldTimeoutMs,
+      });
   if (!host) {
     opaque.push("pwsh_host_unavailable");
     return { commands, pipelines, effects, opaque, envReads: [], assignments, unescapedSources, cwdChanged };
@@ -988,6 +1009,7 @@ export async function parsePowerShell(
           worktreeRoot: options.worktreeRoot,
           home: options.home,
           envSnapshot: options.envSnapshot,
+          ...innerPathCtx(options),
         });
         if (p.isSensitive) {
           effects.push({ tag: "read_secret", layer: depth, target: p.realPath });
@@ -1027,6 +1049,7 @@ export async function parsePowerShell(
           worktreeRoot: options.worktreeRoot,
           home: options.home,
           envSnapshot: options.envSnapshot,
+          ...innerPathCtx(options),
         });
         const isDelete = memberLower === "delete";
         const isCopyOrMove = memberLower === "copy" || memberLower === "move" || memberLower === "replace";
@@ -1056,6 +1079,7 @@ export async function parsePowerShell(
               worktreeRoot: options.worktreeRoot,
               home: options.home,
               envSnapshot: options.envSnapshot,
+              ...innerPathCtx(options),
             });
             if (destP.isProtected || destP.isSensitive) {
               effects.push({ tag: "write_protected", layer: depth, target: destP.realPath, pluginSelf: destP.isPluginSelf });

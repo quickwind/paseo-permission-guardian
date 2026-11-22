@@ -281,6 +281,10 @@ const EXACT_EXEC_HIJACK_VARS = new Set([
   "CARGO_BUILD_RUSTC_WRAPPER",
   "NPM_CONFIG_SCRIPT_SHELL",
   "NPM_CONFIG_NODE_OPTIONS",
+  // Paseo / plugin self-location overrides
+  "PASEO_HOME",
+  "PASEO_PLUGIN_DIR",
+  "PASEO_GUARDIAN_DATA_DIR",
   // Windows / PowerShell / .NET / MSBuild (ADR-0006)
   "USERPROFILE",
   "APPDATA",

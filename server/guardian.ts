@@ -1,13 +1,25 @@
+import { homedir } from "node:os";
+import { emptyGateStatus } from "../shared/types.js";
 import type { PluginHookEvents } from "@getpaseo/plugin/server";
 import { DEFAULT_GUARDIAN_SETTINGS, type GuardianSettings } from "../shared/settings.js";
+import type { AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type {
+  AuditRecord,
+  ContextSnapshot,
   GuardianStatusSnapshot,
   GuardianVerdict,
+  OfferedAction,
   ResolutionActor,
 } from "../shared/types.js";
+import type { ActResponder, PermissionAnswerer } from "./act/responder.js";
 import { AuditStore } from "./audit/store.js";
-import { SessionContextStore, type TimelineFetcher } from "./context/session.js";
+import { createGitStateProvider, type GitStateProvider } from "./context/git-state.js";
+import { recoverOrphanContext, type TimelineEntriesFetcher } from "./context/orphan-context.js";
+import { SessionContextStore, type SessionState, type TimelineFetcher } from "./context/session.js";
 import { decideAction } from "./decide.js";
+import { buildDecideContext, buildDecidePathCtx } from "./decide-context.js";
+import { computeEnvDigest, computeFingerprint } from "./gate/fingerprint.js";
+import type { GateController } from "./gate/gate.js";
 import { detectHostOs, normalizePermissionRequest } from "./normalize/index.js";
 
 export interface PluginAnsweredEntry {
@@ -22,6 +34,50 @@ export interface GuardianServiceOptions {
   sessionStore?: SessionContextStore;
   answeredTtlMs?: number;
   now?: () => number;
+  /** Evidence gate (act mode). Absent ⇒ shadow-only behaviour. */
+  gate?: GateController;
+  /** Act responder. Absent ⇒ never answers; legacy plugin-mark attribution. */
+  responder?: ActResponder;
+  /**
+   * When true the gate is NOT configured at construction (it stays unconfigured ⇒ shadow, no
+   * replay, no latch side effects) until `activateGate()` is called once the audit store and the
+   * first real settings read have completed (F7). Default false (configure immediately).
+   */
+  deferGateConfigure?: boolean;
+  /** Git-clean lookup for non-recursive worktree deletes (ADR-0009). Default: the `git` binary. */
+  gitStateProvider?: GitStateProvider;
+}
+
+export interface PermissionBeforeContext {
+  answerer?: PermissionAnswerer;
+  signal?: AbortSignal;
+}
+
+export interface PermissionAfterContext {
+  /** Timeline (with timestamps) used to recover what an orphan human denial was about. */
+  fetchTimelineEntries?: TimelineEntriesFetcher;
+  signal?: AbortSignal;
+  /** Budget for the orphan timeline fetch (default 3000 ms). */
+  timeoutMs?: number;
+}
+
+/** Bounded once-per-id backfill of orphan contexts from the status path. */
+const MAX_BACKFILL_PER_CALL = 5;
+const MAX_BACKFILL_TRACKED = 1_000;
+
+const SNAPSHOT_MAX_MODIFIED_FILES = 200;
+
+/** Spec §3.7: session state as seen by the decision (taken before this request's own updates). */
+export function buildContextSnapshot(session: SessionState, contextUnavailable = false): ContextSnapshot {
+  const files = [...session.modifiedFiles];
+  return {
+    contextUnavailable,
+    secretTaint: session.secretTaint,
+    untrustedTaint: session.untrustedTaint,
+    modifiedEntrypoints: [...session.modifiedEntrypoints],
+    modifiedFiles: files.slice(0, SNAPSHOT_MAX_MODIFIED_FILES),
+    modifiedFilesTruncated: files.length > SNAPSHOT_MAX_MODIFIED_FILES,
+  };
 }
 
 const DEFAULT_ANSWERED_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -34,8 +90,22 @@ export class PermissionGuardianService {
   private readonly answeredTtlMs: number;
   private readonly now: () => number;
   private readonly answeredByPlugin = new Map<string, PluginAnsweredEntry>();
+  private readonly gate: GateController | undefined;
+  private readonly responder: ActResponder | undefined;
+  private readonly gitStateProvider: GitStateProvider;
+  private readonly backfillAttempted = new Set<string>();
+  /** Ids stored as `{ unavailable: true }` that backfill already retried once (this process). */
+  private readonly unavailableRetried = new Set<string>();
+  /** agentId -> in-flight or settled title lookup (null = unresolvable); one lookup per agent. */
+  private readonly agentTitles = new Map<string, Promise<string | null>>();
+  /** Budget for one agent title lookup. */
+  agentTitleTimeoutMs = 3_000;
+  private readonly pendingEnrichments = new Set<Promise<void>>();
 
   private settings: GuardianSettings;
+  private settingsInvalid = false;
+  private settingsInvalidReason: string | null = null;
+  private gateActive: boolean;
 
   constructor(options: GuardianServiceOptions) {
     this.auditStore = options.auditStore;
@@ -44,10 +114,25 @@ export class PermissionGuardianService {
     this.answeredTtlMs = options.answeredTtlMs ?? DEFAULT_ANSWERED_TTL_MS;
     this.now = options.now ?? (() => Date.now());
     this.settings = options.initialSettings ?? DEFAULT_GUARDIAN_SETTINGS;
+    this.gate = options.gate;
+    this.responder = options.responder;
+    this.gitStateProvider = options.gitStateProvider ?? createGitStateProvider();
+    this.gateActive = options.deferGateConfigure !== true;
+    this.configureGate();
+  }
+
+  /** Configures the gate for the first time (see `deferGateConfigure`). Idempotent. */
+  activateGate(): void {
+    if (this.gateActive) return;
+    this.gateActive = true;
+    this.configureGate();
   }
 
   updateSettings(next: GuardianSettings): void {
     this.settings = next;
+    this.settingsInvalid = false;
+    this.settingsInvalidReason = null;
+    this.configureGate();
   }
 
   getSettings(): GuardianSettings {
@@ -58,13 +143,55 @@ export class PermissionGuardianService {
     return this.sessionStore;
   }
 
+  markSettingsInvalid(reason: string): void {
+    this.settingsInvalid = true;
+    this.settingsInvalidReason = reason;
+    this.configureGate();
+  }
+
+  private configureGate(): void {
+    if (!this.gate || !this.gateActive) return;
+    try {
+      const dataDir = this.auditStore.getDataDir();
+      const fingerprint = computeFingerprint({
+        pluginVersion: this.pluginVersion,
+        policyHash: null,
+        denyAsAsk: this.settings.denyAsAsk,
+        windowsDefaultShell: this.settings.windowsDefaultShell,
+        envDigest: computeEnvDigest(process.env, homedir(), dataDir),
+      });
+      this.gate.configure({
+        settings: this.settings,
+        settingsValid: !this.settingsInvalid,
+        settingsInvalidReason: this.settingsInvalidReason,
+        fingerprint,
+      });
+    } catch (error) {
+      // The gate stays in its previous (or unconfigured ⇒ shadow) state.
+      console.error("[paseo-permission-guardian] gate configure failed:", error);
+    }
+  }
+
+  getSettingsInvalidReason(): string | null {
+    return this.settingsInvalid ? this.settingsInvalidReason : null;
+  }
+
+  getEffectiveBaseMode(): "off" | "shadow" | "act" {
+    return this.settingsInvalid ? "shadow" : this.settings.mode;
+  }
+
   getStatus(): GuardianStatusSnapshot {
     return {
       pluginVersion: this.pluginVersion,
       mode: this.settings.mode,
-      effectiveMode: this.settings.mode === "off" ? "off" : "shadow",
+      effectiveMode: this.gate
+        ? this.gate.effectiveMode()
+        : this.getEffectiveBaseMode() === "off"
+          ? "off"
+          : "shadow",
       dataDir: this.auditStore.getDataDir(),
       metrics: this.auditStore.getMetrics(),
+      gate: this.gate ? this.gate.status() : emptyGateStatus(),
     };
   }
 
@@ -86,8 +213,10 @@ export class PermissionGuardianService {
   async handlePermissionBefore(
     payload: PluginHookEvents["agent.permission.before"],
     fetchTimeline?: TimelineFetcher,
+    ctx?: PermissionBeforeContext,
   ): Promise<void> {
-    if (this.settings.mode === "off") {
+    // N4: invalid settings fall back to effective shadow, which still records.
+    if (this.getEffectiveBaseMode() === "off") {
       return;
     }
 
@@ -102,23 +231,47 @@ export class PermissionGuardianService {
         includeRaw: this.settings.includeRawInAudit,
       });
 
-      const pathCtx = {
-        cwd: normalized.action.cwd,
-        worktreeRoot: normalized.action.worktreeRoot ?? payload.agent.cwd,
-        pluginDataDir: this.auditStore.getDataDir(),
+      const ctxInput = {
+        action: normalized.action,
+        agentCwd: payload.agent.cwd,
+        dataDir: this.auditStore.getDataDir(),
+        home: homedir(),
+        env: process.env,
+        denyAsAsk: this.settings.denyAsAsk,
       };
+      const pathCtx = buildDecidePathCtx(ctxInput);
 
       // Incremental same-turn timeline sync for context-sensitive calls (ADR-0002)
-      const session = CONTEXT_SENSITIVE_KINDS.has(normalized.action.kind)
-        ? await this.sessionStore.syncFromTimeline(payload.agent.id, pathCtx, fetchTimeline)
-        : this.sessionStore.getOrCreate(payload.agent.id);
+      let contextUnavailable = false;
+      let session: SessionState;
+      if (CONTEXT_SENSITIVE_KINDS.has(normalized.action.kind)) {
+        const synced = await this.sessionStore.syncFromTimeline(
+          payload.agent.id,
+          pathCtx,
+          fetchTimeline,
+        );
+        session = synced.state;
+        contextUnavailable = !synced.contextAvailable;
+      } else {
+        session = this.sessionStore.getOrCreate(payload.agent.id);
+      }
 
-      const evaluated = await decideAction(normalized.action, {
-        pathCtx,
-        session,
-        denyAsAsk: this.settings.denyAsAsk,
-        envSnapshot: process.env,
-      });
+      // Spec §3.7: snapshot before decideAction and before this request's own taint updates.
+      const contextSnapshot = buildContextSnapshot(session, contextUnavailable);
+
+      const evaluated = await decideAction(
+        normalized.action,
+        buildDecideContext({
+          ...ctxInput,
+          session,
+          contextUnavailable,
+          gitStateProvider: this.gitStateProvider,
+          ...(ctx?.signal ? { signal: ctx.signal } : {}),
+        }),
+      );
+      if (evaluated.deleteTargetsClean) {
+        contextSnapshot.deleteTargetsClean = { ...evaluated.deleteTargetsClean };
+      }
 
       // Update live session context from this request's effects
       if (evaluated.touchedSecret) {
@@ -134,6 +287,8 @@ export class PermissionGuardianService {
       }
 
       const latencyMs = Math.max(0, this.now() - startedAt);
+      const offeredActions: OfferedAction[] =
+        payload.request.actions?.map((a) => ({ id: a.id, behavior: a.behavior })) ?? [];
 
       await this.auditStore.recordBefore({
         requestId: payload.request.id,
@@ -146,7 +301,22 @@ export class PermissionGuardianService {
         warnings: normalized.warnings,
         action: normalized.action,
         decision: evaluated.decision,
+        offeredActions,
+        contextSnapshot,
+        agentTitle: payload.agent.title,
       });
+
+      // Spec §3.5: act path (recordBefore above is memory-first; disk append is queued).
+      if (this.responder && ctx?.answerer) {
+        await this.responder.maybeAnswer({
+          agentId: payload.agent.id,
+          request: payload.request,
+          decision: evaluated.decision,
+          kind: normalized.action.kind,
+          answerer: ctx.answerer,
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+      }
     } catch (error) {
       // Fail-to-human invariant: never auto-allow, never auto-deny, never break Paseo hook delivery.
       console.error(
@@ -158,16 +328,19 @@ export class PermissionGuardianService {
 
   async handlePermissionAfter(
     payload: PluginHookEvents["agent.permission.after"],
+    ctx?: PermissionAfterContext,
   ): Promise<void> {
-    if (this.settings.mode === "off") {
+    // N4: invalid settings fall back to effective shadow, which still records.
+    if (this.getEffectiveBaseMode() === "off") {
       return;
     }
 
     try {
-      const actor = this.resolveActor(payload.requestId);
-      await this.auditStore.recordAfter({
+      const actor = this.resolveActor(payload.requestId, payload.resolution);
+      const merged = await this.auditStore.recordAfter({
         requestId: payload.requestId,
         agentId: payload.agent.id,
+        agentTitle: payload.agent.title,
         provider: payload.agent.provider,
         mode: this.settings.mode,
         resolution: {
@@ -179,12 +352,146 @@ export class PermissionGuardianService {
           actor,
         },
       });
+      // Display only: recover what an orphan human denial was about (never changes the gate).
+      if (ctx?.fetchTimelineEntries && this.isOrphanHumanDeny(merged)) {
+        this.backfillAttempted.add(merged.requestId);
+        // Background: the after hook must not wait for the timeline fetch.
+        this.trackEnrichment(
+          this.enrichOrphan(merged.requestId, merged.agentId, ctx.fetchTimelineEntries, {
+            allowUntimed: true,
+            // No hook signal: the hook returns before this finishes and Paseo may abort it then.
+            // The enrichment is bounded by its own timeout instead.
+            ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
+          }),
+          merged.requestId,
+        );
+      }
     } catch (error) {
       console.error(
         `[paseo-permission-guardian] Error handling agent.permission.after for ${payload.requestId}:`,
         error,
       );
     }
+  }
+
+  /**
+   * One-off best-effort backfill for orphan human denials that lack an orphan context (e.g. written
+   * before this feature) or whose recovery came back `{ unavailable: true }`. A missing context is
+   * attempted at most once per process, an unavailable one is retried at most once per process;
+   * at most 5 per call.
+   */
+  async backfillOrphanContexts(
+    requestIds: string[],
+    fetcher: TimelineEntriesFetcher,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    let started = 0;
+    for (const id of requestIds) {
+      if (started >= MAX_BACKFILL_PER_CALL) break;
+      if (!id) continue;
+      const record = this.auditStore.getRecord(id);
+      if (!record || !this.isOrphanHumanDeny(record)) continue;
+      const oc = record.orphanContext;
+      if (oc && oc.unavailable !== true) continue;
+      const attempts = oc ? this.unavailableRetried : this.backfillAttempted;
+      if (attempts.has(id)) continue;
+      if (attempts.size >= MAX_BACKFILL_TRACKED) attempts.clear();
+      attempts.add(id);
+      started += 1;
+      this.trackEnrichment(this.enrichOrphan(id, record.agentId, fetcher, signal ? { signal } : {}), id);
+    }
+    await this.whenEnrichmentsIdle();
+  }
+
+  /**
+   * Best-effort, bounded resolution of missing agent titles (display only). Each agent id is
+   * looked up at most once per process (successes and failures are both remembered); at most
+   * 5 new lookups per call.
+   */
+  async backfillAgentTitles(
+    requestIds: string[],
+    resolver: (agentId: string) => Promise<string | undefined>,
+  ): Promise<void> {
+    let started = 0;
+    for (const id of requestIds) {
+      if (!id) continue;
+      const record = this.auditStore.getRecord(id);
+      if (!record || record.agentTitle || !record.agentId) continue;
+      const agentId = record.agentId;
+      if (!this.agentTitles.has(agentId)) {
+        if (started >= MAX_BACKFILL_PER_CALL) continue;
+        started += 1;
+        if (this.agentTitles.size >= MAX_BACKFILL_TRACKED) this.agentTitles.clear();
+        // Marker first: overlapping/later calls reuse the in-flight lookup and never start another.
+        this.agentTitles.set(agentId, this.lookupAgentTitle(resolver, agentId));
+      }
+      const title = await this.agentTitles.get(agentId);
+      if (title) this.auditStore.setAgentTitle(id, title);
+    }
+  }
+
+  /** Bounded lookup; failure or timeout resolves to null (cached, not retried). */
+  private async lookupAgentTitle(
+    resolver: (agentId: string) => Promise<string | undefined>,
+    agentId: string,
+  ): Promise<string | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), this.agentTitleTimeoutMs);
+      });
+      const title = await Promise.race([resolver(agentId), timeout]);
+      return title?.trim() || null;
+    } catch {
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Resolves once every background orphan enrichment started so far has settled. */
+  async whenEnrichmentsIdle(): Promise<void> {
+    while (this.pendingEnrichments.size > 0) {
+      await Promise.all([...this.pendingEnrichments]);
+    }
+  }
+
+  private trackEnrichment(task: Promise<void>, requestId: string): void {
+    const tracked: Promise<void> = task
+      .catch((error) => {
+        console.error(`[paseo-permission-guardian] orphan enrichment failed for ${requestId}:`, error);
+        try {
+          this.auditStore.setOrphanContext(requestId, { unavailable: true });
+        } catch {
+          // display data only
+        }
+      })
+      .finally(() => {
+        this.pendingEnrichments.delete(tracked);
+      });
+    this.pendingEnrichments.add(tracked);
+  }
+
+  private isOrphanHumanDeny(record: AuditRecord): boolean {
+    return (
+      !record.decision &&
+      record.resolution?.behavior === "deny" &&
+      record.resolution.actor !== "plugin"
+    );
+  }
+
+  private async enrichOrphan(
+    requestId: string,
+    agentId: string,
+    fetcher: TimelineEntriesFetcher,
+    opts: { allowUntimed?: boolean; signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<void> {
+    const record = this.auditStore.getRecord(requestId);
+    const resolvedAtMs = Date.parse(record?.resolution?.resolvedAt ?? "");
+    const orphanContext = Number.isNaN(resolvedAtMs)
+      ? { unavailable: true }
+      : await recoverOrphanContext(fetcher, agentId, { resolvedAtMs, ...opts });
+    this.auditStore.setOrphanContext(requestId, orphanContext);
   }
 
   handleTurnAfter(agentId: string): void {
@@ -196,10 +503,12 @@ export class PermissionGuardianService {
   }
 
   async flush(): Promise<void> {
+    await this.whenEnrichmentsIdle();
     await this.auditStore.flush();
   }
 
-  private resolveActor(requestId: string): ResolutionActor {
+  private resolveActor(requestId: string, resolution: AgentPermissionResponse): ResolutionActor {
+    if (this.responder) return this.responder.attribute(requestId, resolution);
     this.evictExpiredAnswers();
     const entry = this.answeredByPlugin.get(requestId);
     if (entry) {

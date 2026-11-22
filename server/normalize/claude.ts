@@ -1,3 +1,4 @@
+import { hasSandboxBypassFlag } from "./sandbox.js";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { Action, ActionKind } from "../../shared/types.js";
 import {
@@ -40,6 +41,7 @@ export function normalizeClaudeRequest(
     host: { os: ctx.hostOs },
     cwd: ctx.cwd,
     worktreeRoot: ctx.worktreeRoot,
+    ...(hasSandboxBypassFlag(input) ? { sandboxBypass: true } : {}),
     ...(ctx.includeRaw ? { raw: request } : {}),
   };
 

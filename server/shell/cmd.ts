@@ -27,6 +27,12 @@ export const SAFE_CMD_SYSTEM_MACROS = new Set([
   "NUMBER_OF_PROCESSORS",
 ]);
 
+/**
+ * Paseo path macros: substituted only when the env snapshot provides a value (so the Path Model
+ * sees the real plugin-self root); unset ⇒ opaque `cmd_unknown_expansion` as before (N3).
+ */
+export const PASEO_PATH_ENV_MACROS = new Set(["PASEO_HOME", "PASEO_PLUGIN_DIR", "PASEO_GUARDIAN_DATA_DIR"]);
+
 export interface CmdPercentScanOptions {
   isCommandName?: boolean;
   inControlBlock?: boolean;
@@ -149,9 +155,11 @@ export function scanCmdPercentExpansions(
           const varName = varMatch[1].trim().toUpperCase();
           envReads.push(varName);
 
-          const isSafeMacro = SAFE_CMD_SYSTEM_MACROS.has(varName);
           const reassigned = opts.reassignedVars?.has(varName) ?? false;
           const snapVal = getEnvValueInsensitive(opts.envSnapshot, varName);
+          const isSafeMacro =
+            SAFE_CMD_SYSTEM_MACROS.has(varName) ||
+            (PASEO_PATH_ENV_MACROS.has(varName) && snapVal !== undefined && snapVal.trim() !== "");
 
           let safeSnapshot = true;
           if (snapVal !== undefined) {

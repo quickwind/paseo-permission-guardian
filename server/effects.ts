@@ -24,6 +24,7 @@ import {
 } from "./secrets/patterns.js";
 import { analyzeShellLayers } from "./shell/layers.js";
 import type { PwshHostMode } from "./shell/pwsh.js";
+import type { PwshHostProvider } from "./shell/pwsh-host.js";
 import type { AssignmentFact, CommandFact, PipelineFact } from "./shell/types.js";
 
 export interface EffectAnalysisResult {
@@ -41,9 +42,13 @@ export interface EffectAnalysisOptions {
   trustedDomains?: string[];
   session?: SessionState;
   pwshHost?: PwshHostMode;
+  /** When set, PowerShell parsing uses these hosts instead of the shared host (replay isolation). */
+  pwshHostProvider?: PwshHostProvider;
   allowPosixPwshHost?: boolean;
   pwshBinaryPath?: string;
   envSnapshot?: Record<string, string | undefined>;
+  /** Session timeline could not be synced; context-sensitive calls must not be auto-allowed. */
+  contextUnavailable?: boolean;
 }
 
 const DEFAULT_TRUSTED_DOMAINS = [
@@ -159,6 +164,56 @@ const LOLBIN_COMMANDS = new Set([
 
 const WINDOWS_PRIVILEGE_TOOLS = new Set(["sc", "schtasks", "net", "icacls", "takeown", "assoc", "ftype"]);
 const WINDOWS_PKG_INSTALL_TOOLS = new Set(["winget", "choco", "msiexec"]);
+
+export const PASEO_READONLY_MCP_TOOLS: ReadonlySet<string> = new Set([
+  "list_agents",
+  "get_agent_status",
+  "get_agent_activity",
+  "read_agent_conversation",
+  "list_workspaces",
+  "list_terminals",
+  "list_providers",
+  "list_models",
+  "list_hosts",
+  "list_pending_permissions",
+  "list_schedules",
+  "list_events",
+  "get_run",
+  "list_runs",
+  "inspect_provider",
+  "inspect_schedule",
+  "schedule_logs",
+  "list_gates",
+  "list_subscriptions",
+  "get_analytics",
+  "capture_terminal",
+  "list_workspace_scripts",
+]);
+
+const PASEO_CONTROL_SUBCOMMANDS = new Set([
+  "plugin",
+  "permit",
+  "permission",
+  "agent",
+  "settings",
+  "config",
+  "daemon",
+  "schedule",
+  "workspace",
+  "run",
+]);
+const PASEO_VALUE_FLAGS = new Set(["--home", "--host", "--server"]);
+
+function isPaseoControlCommand(bin: string, argv: string[]): boolean {
+  if (bin !== "paseo") return false;
+  // argv may or may not include the command name itself.
+  let i = argv[0] !== undefined && normalizeBin(argv[0]) === "paseo" ? 1 : 0;
+  while (i < argv.length && argv[i].startsWith("--")) {
+    const flag = argv[i];
+    i += !flag.includes("=") && PASEO_VALUE_FLAGS.has(flag) ? 2 : 1;
+  }
+  return i < argv.length && PASEO_CONTROL_SUBCOMMANDS.has(argv[i].toLowerCase());
+}
 
 function normalizeBin(name: string): string {
   const base = (name.split(/[\\/]/).pop() ?? name).toLowerCase();
@@ -307,6 +362,8 @@ function emitWindowsPathAlerts(
   }
 }
 
+const PASEO_ROOT_ENV_VARS = new Set(["PASEO_HOME", "PASEO_PLUGIN_DIR", "PASEO_GUARDIAN_DATA_DIR"]);
+
 function evaluateAssignments(
   assignments: AssignmentFact[],
   effects: EffectTag[],
@@ -319,6 +376,15 @@ function evaluateAssignments(
     const dedupKey = `${a.name}\u0000${a.value}\u0000${a.standalone}\u0000${a.depth}`;
     if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
+
+    if (PASEO_ROOT_ENV_VARS.has(a.name.trim().toUpperCase())) {
+      effects.push({
+        tag: "privilege",
+        layer: a.depth,
+        target: a.name,
+        detail: `paseo_env_override:${a.name.trim().toUpperCase()}`,
+      });
+    }
 
     for (const kind of detectCredentialLiterals(a.value)) {
       effects.push({
@@ -565,10 +631,23 @@ const SAFE_PATH_ENV_MACROS = new Set([
 const WINDOWS_DESTRUCTIVE_ROOT_REGEX =
   /^[A-Za-z]:\\(?:windows(?:\\system32|\\syswow64)?|program files(?: \(x86\))?|users|programdata)?$/i;
 
+/** Paseo path vars are safe macros only when the env snapshot provides a value (N3). */
+const PASEO_PATH_ENV_MACROS = new Set(["PASEO_HOME", "PASEO_PLUGIN_DIR", "PASEO_GUARDIAN_DATA_DIR"]);
+
+function isSafePathMacro(name: string, env?: Record<string, string | undefined>): boolean {
+  if (SAFE_PATH_ENV_MACROS.has(name)) return true;
+  if (!PASEO_PATH_ENV_MACROS.has(name) || !env) return false;
+  for (const [k, v] of Object.entries(env)) {
+    if (k.toUpperCase() === name) return typeof v === "string" && v.trim() !== "";
+  }
+  return false;
+}
+
 function isDynamicOrUnexpandedPath(
   target: string,
   shell?: Shell,
   explicitDynamic?: boolean,
+  env?: Record<string, string | undefined>,
 ): boolean {
   if (explicitDynamic || target === "<dynamic>" || target === "[hashtable]") {
     return true;
@@ -580,7 +659,7 @@ function isDynamicOrUnexpandedPath(
     const percentVars = target.matchAll(/%([^%\r\n=]+)%/g);
     for (const m of percentVars) {
       const varName = m[1].trim().toUpperCase();
-      if (!SAFE_PATH_ENV_MACROS.has(varName)) {
+      if (!isSafePathMacro(varName, env)) {
         return true;
       }
     }
@@ -589,12 +668,20 @@ function isDynamicOrUnexpandedPath(
     const envRefs = target.matchAll(/\$env:([A-Za-z0-9_]+)|\$\{env:([^}]+)\}/gi);
     for (const m of envRefs) {
       const name = (m[1] ?? m[2] ?? "").trim().toUpperCase();
-      if (!SAFE_PATH_ENV_MACROS.has(name)) {
+      if (!isSafePathMacro(name, env)) {
         return true;
       }
     }
   }
   return false;
+}
+
+/**
+ * ADR-0009: a `..` segment in the raw delete path is resolved lexically by the path model but by
+ * the kernel after following symlinks, so the git-clean check could look at a different file.
+ */
+function hasDotDotSegment(rawPath: string): boolean {
+  return /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rawPath);
 }
 
 function classifyDeleteTargets(
@@ -614,7 +701,7 @@ function classifyDeleteTargets(
     const target = typeof entry === "string" ? entry : entry.value;
     const isDyn = typeof entry === "string" ? false : Boolean(entry.dynamic);
 
-    if (isDynamicOrUnexpandedPath(target, cmd.layer, isDyn)) {
+    if (isDynamicOrUnexpandedPath(target, cmd.layer, isDyn, pathCtx.envSnapshot)) {
       effects.push({
         tag: "opaque",
         layer: cmd.depth,
@@ -678,6 +765,8 @@ function classifyDeleteTargets(
           tag: "delete_worktree",
           layer: cmd.depth,
           target: p.realPath,
+          lexicalTarget: p.normalized,
+          ...(hasDotDotSegment(target) ? { rawDotDot: true } : {}),
           recursive,
           reversibility: "irreversible",
         });
@@ -1015,7 +1104,7 @@ function classifyPowerShellCmdlet(
 
     for (const item of targets) {
       const target = item.value;
-      if (isDynamicOrUnexpandedPath(target, cmd.layer, item.dynamic)) {
+      if (isDynamicOrUnexpandedPath(target, cmd.layer, item.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         continue;
@@ -1070,7 +1159,7 @@ function classifyPowerShellCmdlet(
             : [];
 
     for (const src of srcItems) {
-      if (isDynamicOrUnexpandedPath(src.value, cmd.layer, src.dynamic)) {
+      if (isDynamicOrUnexpandedPath(src.value, cmd.layer, src.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         continue;
@@ -1102,7 +1191,7 @@ function classifyPowerShellCmdlet(
     }
 
     for (const dest of destItems) {
-      if (isDynamicOrUnexpandedPath(dest.value, cmd.layer, dest.dynamic)) {
+      if (isDynamicOrUnexpandedPath(dest.value, cmd.layer, dest.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         continue;
@@ -1152,7 +1241,7 @@ function classifyPowerShellCmdlet(
 
     for (const wtItem of writeTargets) {
       const wt = wtItem.value;
-      if (isDynamicOrUnexpandedPath(wt, cmd.layer, wtItem.dynamic)) {
+      if (isDynamicOrUnexpandedPath(wt, cmd.layer, wtItem.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         continue;
@@ -1227,7 +1316,7 @@ function classifyPowerShellCmdlet(
       }
     }
     for (const outItem of collectPwshTargetsWithDynamic(cmd, ["OutFile"])) {
-      if (isDynamicOrUnexpandedPath(outItem.value, cmd.layer, outItem.dynamic)) {
+      if (isDynamicOrUnexpandedPath(outItem.value, cmd.layer, outItem.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({
           tag: "opaque",
@@ -1494,7 +1583,7 @@ function classifyWindowsBuiltins(
     const pos = cmd.argv.filter((a) => !a.startsWith("/"));
     const dest = pos[1];
     if (dest) {
-      if (isDynamicOrUnexpandedPath(dest, cmd.layer)) {
+      if (isDynamicOrUnexpandedPath(dest, cmd.layer, undefined, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
         return true;
@@ -1517,7 +1606,7 @@ function classifyWindowsBuiltins(
     if (bin === "dir" || bin === "type") {
       const targets = cmd.argv.filter((a) => !a.startsWith("/"));
       for (const target of targets) {
-        if (isDynamicOrUnexpandedPath(target, cmd.layer)) {
+        if (isDynamicOrUnexpandedPath(target, cmd.layer, undefined, cmdPathCtx.envSnapshot)) {
           opaqueReasons.push("dynamic_or_unexpanded_path");
           effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
           continue;
@@ -1543,7 +1632,7 @@ function classifyWindowsBuiltins(
     if (bin === "copy" || bin === "move" || bin === "ren" || bin === "rename") {
       const pos = cmd.argv.filter((a) => !a.startsWith("/"));
       for (const target of pos) {
-        if (isDynamicOrUnexpandedPath(target, cmd.layer)) {
+        if (isDynamicOrUnexpandedPath(target, cmd.layer, undefined, cmdPathCtx.envSnapshot)) {
           opaqueReasons.push("dynamic_or_unexpanded_path");
           effects.push({ tag: "opaque", layer: cmd.depth, target: "<dynamic>", detail: "dynamic_or_unexpanded_path" });
           continue;
@@ -1556,11 +1645,16 @@ function classifyWindowsBuiltins(
         }
         const p = classifyPath(target, cmdPathCtx);
         emitWindowsPathAlerts(p, cmd.depth, effects, opaqueReasons);
+        // N3: sensitive and protected are judged independently (a positional may be the destination);
+        // plugin-self destinations must carry pluginSelf so they reach L3 like the pwsh path.
         if (p.isSensitive) effects.push({ tag: "read_secret", layer: cmd.depth, target: p.realPath });
-        else if (p.isProtected) effects.push({ tag: "write_protected", layer: cmd.depth, target: p.realPath });
-        else if (p.inWorktree) {
-          if (!uncertainRelative) effects.push({ tag: "write_worktree", layer: cmd.depth, target: p.realPath });
-        } else effects.push({ tag: "write_outside", layer: cmd.depth, target: p.realPath });
+        if (p.isProtected) {
+          effects.push({ tag: "write_protected", layer: cmd.depth, target: p.realPath, pluginSelf: p.isPluginSelf });
+        } else if (!p.isSensitive) {
+          if (p.inWorktree) {
+            if (!uncertainRelative) effects.push({ tag: "write_worktree", layer: cmd.depth, target: p.realPath });
+          } else effects.push({ tag: "write_outside", layer: cmd.depth, target: p.realPath });
+        }
       }
       return true;
     }
@@ -1596,6 +1690,13 @@ export async function analyzeActionEffects(
   let pipelines: PipelineFact[] = [];
   let commands: CommandFact[] = [];
   let touchedUntrusted = false;
+  if (action.sandboxBypass) {
+    effects.push({ tag: "privilege", layer: 0, detail: "sandbox_bypass" });
+  }
+  if (options.contextUnavailable) {
+    effects.push({ tag: "opaque", layer: 0, detail: "context_unavailable" });
+    opaqueReasons.push("context_unavailable");
+  }
 
   const basePathCtx: WindowsPathContext = {
     ...options.pathCtx,
@@ -1620,7 +1721,8 @@ export async function analyzeActionEffects(
       }
     }
     if ((action.paths ?? []).length === 0) {
-      effects.push({ tag: "read", layer: 0 });
+      effects.push({ tag: "opaque", layer: 0, detail: "read_without_path" });
+      opaqueReasons.push("read_without_path");
     }
     return finalizeResult(effects, opaqueReasons, pipelines, commands, touchedUntrusted);
   }
@@ -1667,7 +1769,13 @@ export async function analyzeActionEffects(
           pluginSelf: p.isPluginSelf,
         });
       } else if (p.inWorktree || p.isTemp) {
-        effects.push({ tag: "delete_worktree", layer: 0, target: p.realPath });
+        effects.push({
+          tag: "delete_worktree",
+          layer: 0,
+          target: p.realPath,
+          lexicalTarget: p.normalized,
+          ...(hasDotDotSegment(rawPath) ? { rawDotDot: true } : {}),
+        });
       } else {
         effects.push({ tag: "delete_outside", layer: 0, target: p.realPath });
       }
@@ -1706,6 +1814,17 @@ export async function analyzeActionEffects(
   }
 
   if (action.kind === "mcp") {
+    if (
+      action.mcp?.server.toLowerCase() === "paseo" &&
+      !PASEO_READONLY_MCP_TOOLS.has(action.mcp.tool)
+    ) {
+      effects.push({
+        tag: "infra_mutate",
+        layer: 0,
+        target: `paseo:${action.mcp.tool}`,
+        detail: "paseo_control",
+      });
+    }
     effects.push({
       tag: "opaque",
       layer: 0,
@@ -1737,8 +1856,13 @@ export async function analyzeActionEffects(
     cwd: action.cwd,
     worktreeRoot: action.worktreeRoot,
     home: options.pathCtx.home,
+    ...(options.pathCtx.pluginDataDir ? { pluginDataDir: options.pathCtx.pluginDataDir } : {}),
+    ...(options.pathCtx.paseoRoots ? { paseoRoots: options.pathCtx.paseoRoots } : {}),
+    ...(options.pathCtx.paseoHomeRoots ? { paseoHomeRoots: options.pathCtx.paseoHomeRoots } : {}),
+    ...(options.pathCtx.skipHostRealpath ? { skipHostRealpath: true } : {}),
     depth: 0,
     pwshHost: options.pwshHost,
+    pwshHostProvider: options.pwshHostProvider,
     allowPosixPwshHost: options.allowPosixPwshHost,
     pwshBinaryPath: options.pwshBinaryPath,
     envSnapshot: options.envSnapshot ?? options.pathCtx.envSnapshot,
@@ -1822,7 +1946,7 @@ export async function analyzeActionEffects(
 
     for (const redir of cmd.redirections) {
       if (redir.target === "/dev/null" || redir.target.toUpperCase() === "NUL") continue;
-      if (isDynamicOrUnexpandedPath(redir.target, cmd.layer, redir.dynamic)) {
+      if (isDynamicOrUnexpandedPath(redir.target, cmd.layer, redir.dynamic, cmdPathCtx.envSnapshot)) {
         opaqueReasons.push("dynamic_or_unexpanded_path");
         effects.push({
           tag: "opaque",
@@ -1885,6 +2009,15 @@ export async function analyzeActionEffects(
     }
 
     evaluateCliSecretFlags(cmd, bin, effects, opaqueReasons);
+
+    if (isPaseoControlCommand(bin, cmd.argv)) {
+      effects.push({
+        tag: "infra_mutate",
+        layer: cmd.depth,
+        target: "paseo",
+        detail: "paseo_control",
+      });
+    }
 
     // Explicit Windows credential dump signatures -> L3 system_destructive
     if (isExplicitCredentialDumpSignature(cmd, bin)) {
@@ -2108,7 +2241,7 @@ export async function analyzeActionEffects(
           if (outCandidate === "-" || outCandidate === "/dev/null" || outCandidate.toUpperCase() === "NUL") {
             continue;
           }
-          if (isDynamicOrUnexpandedPath(outCandidate, cmd.layer, outIsDyn)) {
+          if (isDynamicOrUnexpandedPath(outCandidate, cmd.layer, outIsDyn, cmdPathCtx.envSnapshot)) {
             opaqueReasons.push("dynamic_or_unexpanded_path");
             effects.push({
               tag: "opaque",
@@ -2151,7 +2284,7 @@ export async function analyzeActionEffects(
           !/^https?:\/\//i.test(candidate)
         ) {
           if (
-            isDynamicOrUnexpandedPath(candidate, cmd.layer, isDynArg) &&
+            isDynamicOrUnexpandedPath(candidate, cmd.layer, isDynArg, cmdPathCtx.envSnapshot) &&
             (arg.startsWith("@") || egress)
           ) {
             opaqueReasons.push("dynamic_or_unexpanded_path");

@@ -10,6 +10,7 @@ import {
   type WindowsPathClassification,
   type WindowsPathContext,
 } from "./windows.js";
+import { matchPaseoHomeRel, relUnder } from "./paseo-self.js";
 
 export {
   classifyWindowsPath,
@@ -29,6 +30,14 @@ export interface PathContext {
   extraSensitivePatterns?: string[];
   extraProtectedPatterns?: string[];
   skipHostRealpath?: boolean;
+  /** Whole-root plugin-self roots (already resolved); see resolvePaseoSelfRoots. */
+  paseoRoots?: string[];
+  /**
+   * Paseo home roots (`~/.paseo`, `$PASEO_HOME`) where only specific control subpaths are
+   * plugin-self (ruling R11); see resolvePaseoHomeRoots / matchPaseoHomeRel.
+   */
+  paseoHomeRoots?: string[];
+  envSnapshot?: Record<string, string | undefined>;
 }
 
 export interface PathClassification {
@@ -82,6 +91,7 @@ const REPO_PROTECTED_PREFIXES = [
   ".codex",
   ".cursor",
   ".github/workflows",
+  ".husky",
 ];
 
 const SENSITIVE_BASENAME_PATTERNS: readonly RegExp[] = [
@@ -113,7 +123,61 @@ const ENTRYPOINT_BASENAMES = new Set([
   "justfile",
   "taskfile.yml",
   "taskfile.yaml",
+  "build.rs",
+  "conftest.py",
+  "noxfile.py",
+  "tox.ini",
+  "build.gradle",
+  "build.gradle.kts",
+  "settings.gradle",
+  "settings.gradle.kts",
+  "pom.xml",
+  "cmakelists.txt",
+  "meson.build",
+  "rakefile",
+  "gemfile",
+  "composer.json",
+  "deno.json",
+  "deno.jsonc",
+  "bunfig.toml",
+  "directory.build.props",
+  "directory.build.targets",
 ]);
+
+function absoluteRoots(candidates: Array<string | undefined>): string[] {
+  const roots: string[] = [];
+  for (const c of candidates) {
+    if (!c) continue;
+    const t = c.trim();
+    if (t && (posix.isAbsolute(t) || isAbsolute(t))) roots.push(t);
+  }
+  return Array.from(new Set(roots));
+}
+
+/**
+ * Whole-root plugin-self roots: everything below them belongs to Paseo plugins or this plugin
+ * (`PASEO_PLUGIN_DIR`, `PASEO_GUARDIAN_DATA_DIR`, the plugin data dir). Only defined, absolute
+ * values are returned. Paseo home roots are separate (ruling R11): see resolvePaseoHomeRoots.
+ */
+export function resolvePaseoSelfRoots(
+  env: Record<string, string | undefined>,
+  _home: string,
+  pluginDataDir?: string,
+): string[] {
+  return absoluteRoots([env.PASEO_PLUGIN_DIR, env.PASEO_GUARDIAN_DATA_DIR, pluginDataDir]);
+}
+
+/**
+ * Paseo home roots (`~/.paseo`, `$PASEO_HOME`). Only the control subpaths listed in
+ * `matchPaseoHomeRel` are plugin-self below them; `worktrees/**` (Paseo's default worktree
+ * location) is ordinary (ruling R11).
+ */
+export function resolvePaseoHomeRoots(
+  env: Record<string, string | undefined>,
+  home: string,
+): string[] {
+  return absoluteRoots([joinAware(home, ".paseo"), env.PASEO_HOME]);
+}
 
 function toPosixSlash(value: string): string {
   return value.replaceAll("\\", "/");
@@ -235,6 +299,9 @@ export function isBuildOrScriptEntrypoint(filePath: string, worktreeRoot?: strin
     }
   }
   const relLower = rel.toLowerCase();
+  if (base.endsWith(".csproj") || relLower === ".cargo/config.toml" || relLower.endsWith("/.cargo/config.toml")) {
+    return true;
+  }
   if (relLower.startsWith("scripts/") || relLower.includes("/scripts/")) {
     return true;
   }
@@ -248,7 +315,18 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
   const resolveReal = (p: string): string => (ctx.skipHostRealpath ? p : resolveAncestorRealPath(p));
   const home = ctx.home ?? homedir();
   const realHome = resolveReal(home);
-  const normalized = expandPosixPath(rawPath, ctx.cwd, home);
+  const paseoRoots = ctx.paseoRoots ?? resolvePaseoSelfRoots(ctx.envSnapshot ?? {}, home, ctx.pluginDataDir);
+  const paseoHomeRoots = ctx.paseoHomeRoots ?? resolvePaseoHomeRoots(ctx.envSnapshot ?? {}, home);
+  let pathInput = rawPath;
+  const varMatch = /^\$(?:\{(PASEO_HOME|PASEO_PLUGIN_DIR|PASEO_GUARDIAN_DATA_DIR)\}|(PASEO_HOME|PASEO_PLUGIN_DIR|PASEO_GUARDIAN_DATA_DIR))(?=\/|$)/.exec(
+    rawPath.trim(),
+  );
+  if (varMatch) {
+    const varName = varMatch[1] ?? varMatch[2];
+    const varValue = ctx.envSnapshot?.[varName]?.trim();
+    if (varValue) pathInput = varValue + rawPath.trim().slice(varMatch[0].length);
+  }
+  const normalized = expandPosixPath(pathInput, ctx.cwd, home);
   const realPath = resolveReal(normalized);
 
   const worktreeBase = ctx.worktreeRoot ?? ctx.cwd;
@@ -312,6 +390,42 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
     isProtected = true;
     isPluginSelf = true;
     matchedRules.push("protected:plugin_self");
+  }
+
+  for (const root of paseoRoots) {
+    const realRoot = resolveReal(root);
+    if (
+      candidates.some((c) => isPathUnder(c, root) || isPathUnder(c, realRoot))
+    ) {
+      isProtected = true;
+      isPluginSelf = true;
+      if (!matchedRules.includes("protected:plugin_self")) matchedRules.push("protected:plugin_self");
+      if (base === "config.json" || base === "settings.json") {
+        isSensitive = true;
+        matchedRules.push(`sensitive:paseo_self:${base}`);
+      }
+    }
+  }
+
+  // Paseo home roots: only specific control subpaths (ruling R11).
+  for (const root of paseoHomeRoots) {
+    const realRoot = resolveReal(root);
+    for (const c of candidates) {
+      for (const r of new Set([root, realRoot])) {
+        const rel = relUnder(c, r, false);
+        if (rel === null) continue;
+        const m = matchPaseoHomeRel(rel);
+        if (m.protected) {
+          isProtected = true;
+          isPluginSelf = true;
+          matchedRules.push("protected:plugin_self", `protected:paseo_home:${rel || "."}`);
+        }
+        if (m.secret) {
+          isSensitive = true;
+          matchedRules.push(`sensitive:paseo_self:${base}`);
+        }
+      }
+    }
   }
 
   for (const candidate of candidates) {

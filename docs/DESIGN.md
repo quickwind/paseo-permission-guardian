@@ -161,6 +161,7 @@ paseo-permission-guardian/
     types.ts               # shared DTOs (no Node / RN imports)
   client/
     settings-screen.tsx    # SettingsCard/SettingsSection UI
+    gate-view.ts           # pure gate-status view helpers (labels, integrity)
     dashboard.tsx          # Shadow dashboard & disagreements view
     timeline-row.tsx       # Compact risk/verdict timeline renderer
   server/
@@ -176,13 +177,16 @@ paseo-permission-guardian/
       pwsh-verbs.ts        # verb taxonomy, alias table, parameter prefix disambiguation
       windows-builtins.ts  # del, rd, reg, sc, schtasks, robocopy, icacls, …
       handlers/            # JS ports for commands needing code (curl, …)
-    paths/                 # normalization, ancestor realpath, WSL mapping, sensitive/protected catalogs
+    paths/                 # normalization, ancestor realpath, WSL mapping, sensitive/protected catalogs, Paseo self subpaths (R11)
     secrets/               # stateless credential literal patterns & env var classifiers (ADR-0005)
-    context/               # incremental timeline sync, taint, secretTaint, provenance, scope grants
+    context/               # incremental timeline sync, taint, secretTaint, provenance, scope grants,
+                           # git-state.ts (tracked+clean lookup for deletes, ADR-0009)
     effects.ts             # effect vocabulary + combination rules
     policy/                # layered YAML loading, schema, project sha256 pinning
     decide.ts              # levels, LLM grey zone, epoch-keyed LLM cache, actor tracking
-    audit/                 # rotated JSONL store, redaction, in-memory metrics index, replay
+    audit/                 # rotated JSONL store, redaction, in-memory metrics index, window reader
+    gate/                  # evidence gate: fingerprint, replay, latch/suspension state machine
+    act/                   # act responder (allow-once/deny-once mapping, attribution marks)
   test/
     vectors/safe-chains/   # extracted conformance cases
     vectors/windows/       # PowerShell, cmd, WSL cases
@@ -444,8 +448,8 @@ See [ADR-0002](./adr/0002-session-context-taint-and-cache-invalidation.md) for r
 
 | Level | Typical effects | Decision |
 | --- | --- | --- |
-| L0 | `read`, `write_worktree`, `exec_project` (allow-listed, entrypoints unmodified), `net_read` to trusted domains | allow (select the provider's **allow-once** option; never "always") |
-| L1 | unknown commands, opaque, `pkg_install`, `write_outside` to temp-like dirs, unlisted MCP tools | grey zone → LLM judge (if enabled) may return allow or ask; default ask |
+| L0 | `read`, `write_worktree`, `exec_project` (allow-listed, entrypoints unmodified), `net_read` to trusted domains, non-recursive `delete_worktree` of git-tracked files with no uncommitted changes | allow (select the provider's **allow-once** option; never "always") |
+| L1 | unknown commands, opaque, `pkg_install`, `write_outside` to temp-like dirs, unlisted MCP tools, recursive `delete_worktree`, non-recursive `delete_worktree` of an uncommitted/untracked/ignored target (`delete_uncommitted:<path>`) | grey zone → LLM judge (if enabled) may return allow or ask; default ask |
 | L2 | `vcs_remote`, `infra_mutate`, `privilege`, `write_protected`, untrusted egress, `secretTaint` egress | ask (human) |
 | L3 | combination-rule denies, `system_destructive` | deny with an explanatory message the agent can act on |
 
@@ -458,6 +462,30 @@ Rules:
   every request. Only LLM judge responses may be cached, keyed by
   `(normalizedActionHash, policyVersion, taintEpoch, worktreeMutationEpoch, scopeGrantVersion)`.
 - Deny can be downgraded to ask globally by policy for teams that prefer no auto-deny.
+- **Uncommitted deletes** ([ADR-0009](./adr/0009-uncommitted-delete-requires-human.md)): a
+  non-recursive `delete_worktree` (bash `rm`, PowerShell `Remove-Item`, cmd `del`/`erase`, provider
+  `delete`) is L0 only if every target is a regular tracked git entry with no worktree/index
+  changes. `server/context/git-state.ts` asks `git` (`execFile`, no shell, inherited `GIT_*`
+  removed, `GIT_OPTIONAL_LOCKS=0`, literal pathspecs, fsmonitor/untracked cache off, 1500 ms
+  budget, hook signal) about the entry `rm` removes (parent realpath + kept basename, so a symlink
+  is judged as the link). A raw target with a `..` segment is never clean (no git call).
+  On Windows hosts, bash-layer deletes are mapped via WSL and therefore always go to a human. Anything else — untracked, ignored, modified,
+  staged, outside the worktree or repository, not a repo, git error/timeout — is L1
+  `delete_uncommitted:<path>`. The provider is injected (`gitStateProvider`); `decideAction` never
+  spawns git itself. Replay uses the recorded `contextSnapshot.deleteTargetsClean` and never calls
+  git; keys are the redacted lexical target paths (no host realpath), which replay reproduces
+  exactly. A missing entry (e.g. legacy records) is not clean.
+
+**What `act` answers** ([ADR-0008](./adr/0008-act-mode-evidence-gate.md)): only when the effective
+mode is `act` (the evidence gate is open, see §12.1/§13.2). L0 `allow` is answered with the
+provider's allow-once option. L3 `deny` is answered with a deny-once option and an explanatory
+message only when `denyAsAsk` is off and the gate shows zero false-denies in the window; otherwise
+L3 stays with the human. L1/L2, `neverAutoAnswer` decisions, and question/plan/mode requests are
+never answered. Options are chosen by explicit per-provider id mapping (`server/act/actions.ts`);
+persistent-looking options, ambiguous or missing ids, and providers without a mapping produce no
+answer. The persistence-option pattern treats `all` as a standalone word only (so agy's `allow`
+is not mistaken for it). Only provider `agy` is auto-answered in this version.
+`updatedInput`/`updatedPermissions` are never sent.
 
 ### 10.5 Optional LLM judge
 
@@ -478,6 +506,13 @@ Clear Source of Truth ([ADR-0003](./adr/0003-paseo-integration-and-config-source
 - **Paseo Settings (`defineSettings`, host scope)**: Stores runtime controls edited in the UI —
   `mode` (`off | shadow | act`), `denyAsAsk`, `llm` enable/provider/model, local policy file
   paths, pinned project sha256 hashes, and timeline verbosity (`off | notable | all`).
+- **Act gate settings** (P2a): `actGate.minSamples` (default 200, 20-5000), `actGate.windowDays`
+  (default 30, 1-365), `actGate.autoFallbackOnFalseAllow` (default on; when off, false-allows are
+  reported but never change the effective mode), `actGate.allowOverride` (default on), and
+  `actOverride { accepted, acceptedAt, fingerprint }`. The settings screen fills the fingerprint
+  from `guardian.status` when the user accepts the override; the override skips only the sample
+  count, is bound to the current engine fingerprint, never applies while the gate is
+  `replaying`/`unavailable`, and is audited. Invalid settings keep the plugin in `shadow`.
 - **Layered YAML Policy**: Stores declarative rules; later layers override earlier ones, and
   deny/human rules from any layer cannot be relaxed by a later layer. The UI never rewrites YAML
   files:
@@ -522,13 +557,28 @@ PowerShell versions.
 
 ### 12.1 Hooks
 
-- `agent.permission.before`: run the pipeline; in `act` mode record `requestId` in an in-memory
-  `answeredByPlugin` map and call `respondToPermission` for allow/deny; in `shadow` mode only
-  record. Tolerate "already resolved" errors (a human was faster) and remove from
-  `answeredByPlugin` on failure.
-- `agent.permission.after`: reconcile by `requestId` (upsert/merge to handle out-of-order
-  delivery); attribute actor via `answeredByPlugin` vs. external/human resolution; compute
-  agreement metrics.
+- `agent.permission.before`: await the audit history load (so gate state is known), take a context
+  snapshot, run the pipeline, record the request in memory first (disk append is asynchronous), and
+  in `act` mode answer through the responder (`server/act/responder.ts`): stop if an `after` event
+  already resolved the request, re-check the effective mode and `context.signal` immediately before
+  sending, then the responder marks the request in its own in-memory mark table (behavior,
+  `selectedActionId`, send time) and records `actOutcome: "sent"`, then calls
+  `respondToPermission` with the mapped allow-once/deny-once option. The call is fire-and-forget
+  (the daemon client only sends a frame), so success is inferred from `after`, never from the call;
+  a thrown error unmarks the request and records `actOutcome: "error"`. In `shadow` mode only record.
+  `PermissionGuardianService.markAnsweredByPlugin` and its `answeredByPlugin` map are legacy: they
+  are used for attribution only when no responder is configured, and are unused in the shipped
+  wiring (which always has a responder).
+- `agent.permission.after`: also awaits history load; reconcile by `requestId` (upsert/merge to
+  handle out-of-order delivery). **Attribution window**: the actor is `plugin` only if the request
+  was marked, `behavior` and `selectedActionId` equal what was sent, and the event arrives within
+  15 s of sending; a matching event later than that is attributed to the human. A marked request
+  with a different resolution is `human` with `actOutcome: "lost_race"`; no `after` in the window is
+  `unconfirmed`. Three consecutive `unconfirmed` outcomes (a `lost_race` whose behavior equals the
+  sent behavior also counts) pause answering (effective `shadow`, reason `responder_unconfirmed`).
+  The pause clears only on daemon start or a manual replay (`guardian.gate.replay`) that completes
+  available; automatic replays never clear it. Gate counters update at the audit merge point in every mode.
+  Live decisions and replay share one decide context (`server/decide-context.ts`).
 - `agent.open.before` (optional, opt-in): append system-prompt guidance — one action per
   command, avoid chaining and inline scripts, prefer PowerShell over cmd on Windows, canonical
   WSL form. **Known limitation**: ignored by Paseo's ACP adapter; requires Codex ≥ 0.121.0.
@@ -541,7 +591,10 @@ Built with React Native primitives (`theme.colors`, `layout.compact`) and Paseo 
 components (`SettingsSection`, `SettingsCard`, `SettingsSwitch`, `SettingsSelect`, etc.):
 
 - **Settings screen** (`addSettingsScreen`): mode, `denyAsAsk`, LLM toggle/backend, policy file
-  locations, team policy load status, project pin status, timeline verbosity.
+  locations, team policy load status, project pin status, timeline verbosity, and an "Automatic
+  answering" section: gate status (state, reason, samples x/N, false-allow/false-deny counts,
+  unconfirmed answers), gate parameters, the override toggle, replay, and per-entry annotation
+  ("not a safety issue") and acknowledgement actions.
 - **Shadow dashboard** (`addScreen` + sidebar item): would-allow rate, agreement with humans,
   false-allow count, disagreements list (the most important view before switching to `act`).
 - **Timeline row** (`timeline.append` + `addTimelineRenderer`): compact row for notable events
@@ -563,7 +616,24 @@ notifications. Timeout ⇒ normal human flow. The plugin detects and prefers it 
   SQLite addon; [ADR-0003](./adr/0003-paseo-integration-and-config-source-of-truth.md)).
 - Each record (keyed by `requestId` for `before`/`after` reconciliation): normalized action
   (secrets redacted), layers, effects, reasons, decision, mode, actor attribution, final
-  resolution, latency, plugin and data versions.
+  resolution, latency, plugin and data versions. P2a adds `offeredActions` (the provider's offered
+  options), `contextSnapshot` (taint flags, modified entrypoints/files before the decision, paths
+  redacted, files capped at 200 with a truncation flag, `contextUnavailable` when the timeline
+  could not be synced, and `deleteTargetsClean` — per non-recursive worktree delete target, keyed
+  by the redacted lexical target path, whether it was tracked and clean in git at decision time, ADR-0009),
+  `agentTitle` (from the hook payload, redacted, on both `before` and `after` records),
+  `orphanContext` (display-only timeline recovery for orphan human denials, see §13.2), and `actOutcome` (`sent | answered | unconfirmed | lost_race | error`;
+  `skipped` exists in the type but is never written). Lines for the same `requestId` merge
+  field-wise: a later line's defined values win and missing fields never erase earlier ones.
+  Every unparsable line is a corrupt line, including a crash-truncated final line.
+- Besides `before`/`after`/`update` lines the file holds `gate` events (override accepted/revoked,
+  latch changes) and `annotation` events (latest wins), written only via `guardian.gate.annotate`.
+  Annotations are keyed by `key`: a request id, `file#sha256` (corrupt line), or
+  `persist_failure#<firstAt>`.
+- **Audit append failures** are persisted in `persist-failure.json`; the gate is `unavailable`
+  until the user acknowledges the failure in the settings screen. Gate state (`gate-state.json`:
+  latch, fingerprint, `minSamplesAtLatch`, suspending request ids) is schema-validated and written
+  atomically; unreadable or mismatched state means not latched.
 - Redaction: known token formats, `Authorization` headers, URL credentials, values of sensitive
   env assignments, PEM blocks — applied to `action`, `decision`, and `warnings` ([ADR-0005](./adr/0005-env-classification-and-bash-ast-hardening.md)). Raw commands can be excluded entirely by policy.
 
@@ -571,6 +641,44 @@ notifications. Timeout ⇒ normal human flow. The plugin detects and prefers it 
 
 Would-allow rate, agreement rate, **false-allow count** (plugin would allow, human denied — must
 be ~0 before `act`), latency p50/p95, opaque rate per shell.
+
+**Gate metrics (P2a).** `guardian.status` returns `effectiveMode` and a `gate` object: state
+(`replaying | unavailable | failed_false_allow | collecting | passed | latched | suspended`), reason,
+samples x/`minSamples`, false-allow and false-deny counts, up to 5 unannotated entries, unconfirmed
+act-answer count, integrity issues, last replay time, short fingerprint, override info. Each entry
+carries enough to judge it (`server/gate/entry.ts`, display fields re-read from the latest record
+on every status): requested/resolved time, provider, agent id and title, tool name, a summary (exec
+source ≤200 chars, paths, URL, or MCP `server:tool`), per-sub-command effects, and the human's
+resolution (behavior, selected option, message). For an orphan human denial the `after` hook
+best-effort recovers the matching tool call from the agent timeline (same tail/wholeTurns query as
+the `before` hook, run in the background, 3 s budget, hook signal; prefers a denied, then failed/canceled, then running
+call nearest before `resolvedAt` within 10 minutes) and stores `orphanContext: { toolName,
+summary, callId, matchedBy }` (redacted, then truncated) or `{ unavailable: true }` via an
+`update` event; it is dropped if the request's `before` arrives later (also when re-merging
+from disk) and is only shown on `orphan_deny` entries. The background enrichment does not use the
+hook signal (bounded by its own timeout). This is display
+data only: it never notifies the gate, and orphans keep the gate `unavailable` until annotated.
+`guardian.status` also triggers a non-blocking backfill for orphans without `orphanContext`
+(once per id per process, plus one retry of an `{ unavailable: true }` result; at most 5 per
+call; untimed timeline items are not used). Over the last
+`windowDays`, a sample is a human-resolved request the current engine judges `allow`; a false-allow
+is a human denial of such a request (any non-plugin `deny` counts unless it matches a confirmed
+cancellation signature, initially none); a false-deny is a human allow of a request the engine
+would deny at L3 (judged by level, independent of `denyAsAsk`). Metrics come from replaying the
+recorded history with the current engine (at most 20 000 records in the window; more ⇒
+`replay_truncated` ⇒ `unavailable`); the engine fingerprint is `sha256(pluginVersion,
+ENGINE_DATA_VERSION, policy hash, denyAsAsk, windowsDefaultShell, env digest of the Paseo roots and
+whether CDPATH is set)` (`ENGINE_DATA_VERSION` is 2 since ADR-0009), and a fingerprint change clears the latch and invalidates the override.
+Replay never counts a human-attributed allow whose `actOutcome` is `sent`/`unconfirmed`/`lost_race`
+as a sample, and treats a snapshot taken with `contextUnavailable` like a missing snapshot.
+A human denial that cannot be re-evaluated is listed as an `unevaluable_deny` entry so it can be
+acknowledged. Truncation, a corrupt line, an orphan human denial, a human denial that cannot be
+re-evaluated, an audit persist failure, or a failing gate-state write make the gate `unavailable`
+(effective `shadow`). A suspension (latched, then a false-allow) lifts only through a "not a
+safety issue" annotation of every suspending record; if a suspending record ages out of the window
+unannotated, the latch is cleared and the full entry condition applies again. On hosts without
+PowerShell, human denials of PowerShell commands cannot be re-evaluated and keep the gate
+unavailable until acknowledged.
 
 ### 13.3 Tests
 
@@ -592,11 +700,29 @@ be ~0 before `act`), latency p50/p95, opaque rate per shell.
 - Paseo plugins are trusted, unsandboxed code running with the daemon user's permissions. Keep
   dependencies minimal and pinned; publish provenance for npm releases.
 - The plugin never auto-allows writes to its own policy, settings, data, or pin files, nor to
-  agent config or `.git/`.
+  agent config or `.git/`. Paseo self paths (ruling R11): under `~/.paseo` and `$PASEO_HOME` only
+  the root itself, `config.json`, `settings.json`, `plugin-settings/**`, `plugins/**`,
+  `permission-guardian/**`, `state/**` and root-level `*.key`, `*.pem`, `daemon*.json` are
+  plugin-self (writes L3; reads of `config.json`, `settings.json` and `plugin-settings/**/*.json`
+  are secret reads); `worktrees/**` is ordinary. `PASEO_PLUGIN_DIR`, `PASEO_GUARDIAN_DATA_DIR` and
+  the plugin data dir are plugin-self as a whole. Act on Windows uses the same R11 set
+  (`%USERPROFILE%\.paseo`, `%PASEO_HOME%`, `$env:PASEO_HOME`), including paths classified inside
+  PowerShell layers. On both POSIX and Windows each root is also matched by its realpath, so the
+  target of a junctioned/symlinked root is protected the same way; `%PASEO_*%` in cmd expands
+  only when the variable is set in the env snapshot (otherwise the path stays opaque).
 - The PowerShell host is parse-only; it must never evaluate input. Inputs are passed as JSON
   data over UTF-8 stdin, never interpolated into scripts.
 - Event delivery is best-effort; the plugin is a prompt reducer, not an enforcement point.
   Document clearly that red lines belong in provider-native deny rules and OS isolation.
+- **Not a security boundary in `act`.** Editing ordinary code (L0) and then running a project
+  command (L0) is allowed and stays outside the plugin's guarantees; use a sandbox for isolation.
+  Entrypoint detection covers several ecosystems and the plugin's own and Paseo's control surface
+  (data/settings/policy paths, env, CLI, MCP tools including `mcp_<server>_<tool>` spellings,
+  sandbox-bypass flags) is raised to L2 or above, but plugin RPCs and local gate files remain
+  reachable by any same-user process.
+- **Parked residual.** If gate-state writes fail continuously while a suspending false-allow ages
+  out, and the daemon then restarts with fewer than `minSamples` samples, a stale latch on disk
+  could re-enable `act`. The gate is `shadow` throughout the write failure.
 - Under WDAC with PowerShell Constrained Language Mode (or EDR restrictions), the parser host
   may be blocked unless signed; the plugin detects this (or honors `pwshHost: "disabled"`) and
   falls back (§7.2).
@@ -620,7 +746,8 @@ Split P1 into P1a and P1b to validate shadow-mode accuracy early ([ADR-0004](./a
 | P0 | Done | Plugin scaffold (`paseo-plugin.json`, `OVERVIEW.md`), normalizers (Claude Code, ACP: Antigravity & Devin CLI), Paseo Settings, rotated JSONL audit store, shadow mode | Installs cleanly; records and reconciles `before`/`after` requests on macOS/Linux/Windows |
 | P1a | Done | `bash` WASM parser, POSIX Path Model (incl. ancestor `realpath`), `safe-chains` interpreter + path sweep, effects/combination rules, same-turn taint & provenance (shadow only) | `safe-chains` conformance vectors + session/security vectors pass |
 | P1b | Done (WSL quoting passthrough still needs a manual check on a real WSL host) | PowerShell 5.1/7 serialized host + prefix disambiguation, `cmd.exe` tokenizer, Windows built-ins, WSL layers & bidirectional path mapping | Windows vectors pass on PowerShell 5.1 & 7 and Windows + WSL |
-| P2 | Next | `act` mode, shadow dashboard, compact timeline renderer, optional system-prompt guidance & mode policy | False-allow = 0 on replay corpus; agreement ≥ target |
+| P2a | Done | `act` mode behind an evidence gate (replay with current engine, latch, fingerprint-bound override, annotations), provider allow-once / L3 deny-once mapping (agy first), prerequisite classification hardening ([ADR-0008](./adr/0008-act-mode-evidence-gate.md)) | Fresh install stays `shadow`; synthetic history meeting the gate auto-answers L0 allow-once; any unannotated false-allow ⇒ `shadow` |
+| P2b | Planned | Shadow dashboard screen, compact timeline renderer, optional system-prompt guidance & mode policy | False-allow = 0 on replay corpus; agreement ≥ target |
 | P3 | Planned | Optional LLM judge (with epoch-keyed cache), Codex/OpenCode adapters, JS handlers for top handler-based commands, upstream waiting-hook PR | — |
 
 ## 17. Resolved design decisions

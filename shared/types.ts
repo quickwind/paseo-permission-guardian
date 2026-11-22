@@ -62,6 +62,13 @@ export interface EffectTag {
   recursive?: boolean;
   pluginSelf?: boolean;
   detail?: string;
+  /**
+   * Engine-internal (ADR-0009): the lexically resolved path (no host realpath) of a delete target,
+   * reproducible by replay. Stripped from recorded decisions.
+   */
+  lexicalTarget?: string;
+  /** Engine-internal (ADR-0009): the raw delete path had a `..` segment ⇒ never git-clean. */
+  rawDotDot?: boolean;
 }
 
 export interface ActionHost {
@@ -102,6 +109,7 @@ export interface Action {
   paths?: string[];
   url?: ActionUrl;
   mcp?: ActionMcp;
+  sandboxBypass?: boolean;
   raw?: unknown;
 }
 
@@ -122,11 +130,26 @@ export interface AuditResolution {
   actor: ResolutionActor;
 }
 
+/**
+ * Display-only context for an orphan human denial (an `after` without a `before`), recovered
+ * best-effort from the agent timeline. `unavailable` ⇒ recovery failed. Never affects the gate.
+ */
+export interface OrphanContext {
+  unavailable?: boolean;
+  toolName?: string;
+  summary?: string;
+  callId?: string;
+  /** How the tool call was matched (e.g. `permission_denied`, `failed_or_canceled`). */
+  matchedBy?: string;
+}
+
 export interface AuditRecord {
   version: 1;
   pluginVersion: string;
   requestId: string;
   agentId: string;
+  /** Agent title from the hook payload (redacted), for display. */
+  agentTitle?: string;
   provider: string;
   mode: GuardianMode;
   requestedAt?: string;
@@ -138,6 +161,10 @@ export interface AuditRecord {
   resolution?: AuditResolution;
   agreement: AgreementOutcome;
   outOfOrder?: boolean;
+  offeredActions?: OfferedAction[];
+  contextSnapshot?: ContextSnapshot;
+  actOutcome?: ActOutcome;
+  orphanContext?: OrphanContext;
 }
 
 export interface AuditMetricsSummary {
@@ -159,7 +186,105 @@ export interface AuditMetricsSummary {
 export interface GuardianStatusSnapshot {
   pluginVersion: string;
   mode: GuardianMode;
-  effectiveMode: "off" | "shadow";
+  effectiveMode: "off" | "shadow" | "act";
   dataDir: string;
   metrics: AuditMetricsSummary;
+  gate: GateStatus;
+}
+
+export type GateState =
+  | "replaying"
+  | "unavailable"
+  | "failed_false_allow"
+  | "collecting"
+  | "passed"
+  | "latched"
+  | "suspended";
+
+/** `sent` is written at mark time (before the send); a later `after` replaces it. */
+export type ActOutcome = "sent" | "answered" | "lost_race" | "unconfirmed" | "error" | "skipped";
+
+export interface OfferedAction {
+  id: string;
+  behavior: "allow" | "deny";
+}
+
+export interface ContextSnapshot {
+  secretTaint: boolean;
+  untrustedTaint: boolean;
+  modifiedEntrypoints: string[];
+  modifiedFiles: string[];
+  modifiedFilesTruncated: boolean;
+  /**
+   * True when the timeline could not be synced for this decision (context unavailable). Always
+   * written by the live path; absent on records written before it existed. Replay treats such a
+   * snapshot as no snapshot.
+   */
+  contextUnavailable?: boolean;
+  /**
+   * ADR-0009: per non-recursive worktree delete target (redacted effect target) ⇒ tracked in git
+   * with no uncommitted changes at decision time. Replay uses it instead of calling git; a missing
+   * key ⇒ not clean.
+   */
+  deleteTargetsClean?: Record<string, boolean>;
+}
+
+export interface GateEntryResolution {
+  behavior: "allow" | "deny";
+  selectedActionId?: string;
+  message?: string;
+}
+
+export interface GateEntry {
+  requestId: string;
+  requestedAt?: string;
+  command?: string;
+  effects: string[];
+  kind: "false_allow" | "orphan_deny" | "corrupt_line" | "unevaluable_deny";
+  key: string;
+  // Display fields (optional, backward compatible): enough for a human to judge the entry.
+  resolvedAt?: string;
+  provider?: string;
+  agentId?: string;
+  agentTitle?: string;
+  toolName?: string;
+  /** Exec source (≤200 chars), paths, URL, or MCP `server:tool`. */
+  summary?: string;
+  resolution?: GateEntryResolution;
+  orphanContext?: OrphanContext;
+}
+
+export interface GateStatus {
+  state: GateState;
+  reason: string;
+  samples: number;
+  minSamples: number;
+  falseAllowCount: number;
+  falseDenyCount: number;
+  entries: GateEntry[];
+  unconfirmedCount: number;
+  lastReplayAt: string | null;
+  fingerprint: string;
+  override: { valid: boolean; accepted: boolean; acceptedAt: string | null };
+  latched: boolean;
+  suspended: boolean;
+}
+
+/** Temporary placeholder until the gate is wired in (Task 8). */
+export function emptyGateStatus(): GateStatus {
+  return {
+    state: "collecting",
+    reason: "gate_not_initialized",
+    samples: 0,
+    minSamples: 200,
+    falseAllowCount: 0,
+    falseDenyCount: 0,
+    entries: [],
+    unconfirmedCount: 0,
+    lastReplayAt: null,
+    fingerprint: "",
+    override: { valid: false, accepted: false, acceptedAt: null },
+    latched: false,
+    suspended: false,
+  };
 }

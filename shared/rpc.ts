@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import type { GateStatus } from "./types.js";
 
 export const AuditMetricsSummarySchema = z.object({
   totalRequests: z.number().int().nonnegative(),
@@ -17,16 +18,93 @@ export const AuditMetricsSummarySchema = z.object({
   lastUpdatedAt: z.string().nullable(),
 });
 
+export const GateEntrySchema = z.object({
+  requestId: z.string(),
+  requestedAt: z.string().optional(),
+  command: z.string().optional(),
+  effects: z.array(z.string()),
+  kind: z.enum(["false_allow", "orphan_deny", "corrupt_line", "unevaluable_deny"]),
+  key: z.string(),
+  resolvedAt: z.string().optional(),
+  provider: z.string().optional(),
+  agentId: z.string().optional(),
+  agentTitle: z.string().optional(),
+  toolName: z.string().optional(),
+  summary: z.string().optional(),
+  resolution: z
+    .object({
+      behavior: z.enum(["allow", "deny"]),
+      selectedActionId: z.string().optional(),
+      message: z.string().optional(),
+    })
+    .optional(),
+  orphanContext: z
+    .object({
+      unavailable: z.boolean().optional(),
+      toolName: z.string().optional(),
+      summary: z.string().optional(),
+      callId: z.string().optional(),
+      matchedBy: z.string().optional(),
+    })
+    .optional(),
+});
+
+export const GateStatusSchema = z.object({
+  state: z.enum([
+    "replaying",
+    "unavailable",
+    "failed_false_allow",
+    "collecting",
+    "passed",
+    "latched",
+    "suspended",
+  ]),
+  reason: z.string(),
+  samples: z.number().int().nonnegative(),
+  minSamples: z.number().int().nonnegative(),
+  falseAllowCount: z.number().int().nonnegative(),
+  falseDenyCount: z.number().int().nonnegative(),
+  entries: z.array(GateEntrySchema),
+  unconfirmedCount: z.number().int().nonnegative(),
+  lastReplayAt: z.string().nullable(),
+  fingerprint: z.string(),
+  override: z.object({
+    valid: z.boolean(),
+    accepted: z.boolean(),
+    acceptedAt: z.string().nullable(),
+  }),
+  latched: z.boolean(),
+  suspended: z.boolean(),
+});
+
+// Compile-time check: the Zod schema and the GateStatus interface stay mutually assignable.
+type _SchemaToType = z.infer<typeof GateStatusSchema> extends GateStatus ? true : never;
+type _TypeToSchema = GateStatus extends z.infer<typeof GateStatusSchema> ? true : never;
+export const _gateStatusConsistent: [_SchemaToType, _TypeToSchema] = [true, true];
+
 export const getGuardianStatus = defineRpc({
   name: "guardian.status",
   input: z.object({}),
   output: z.object({
     pluginVersion: z.string(),
     mode: z.enum(["off", "shadow", "act"]),
-    effectiveMode: z.enum(["off", "shadow"]),
+    effectiveMode: z.enum(["off", "shadow", "act"]),
     dataDir: z.string(),
     metrics: AuditMetricsSummarySchema,
+    gate: GateStatusSchema,
   }),
+});
+
+export const gateReplay = defineRpc({
+  name: "guardian.gate.replay",
+  input: z.object({}),
+  output: GateStatusSchema,
+});
+
+export const gateAnnotate = defineRpc({
+  name: "guardian.gate.annotate",
+  input: z.object({ key: z.string(), annotation: z.enum(["not_safety"]).nullable() }),
+  output: GateStatusSchema,
 });
 
 export const evaluateGuardianDryRun = defineRpc({

@@ -15,6 +15,9 @@ import {
 } from "../server/secrets/patterns.js";
 import type { Action } from "../shared/types.js";
 
+/** ADR-0009: these baselines test cwd tracking, so every delete target is reported tracked+clean. */
+const allCleanGit = async (req: { targets: string[] }) => Object.fromEntries(req.targets.map((t) => [t, true]));
+
 function bashAction(command: string): Action {
   return {
     provider: "claude",
@@ -392,6 +395,7 @@ describe("ADR-0006 Stage 1 hardening", () => {
       const subshell = await decideAction(bashAction("(cd /tmp && rm -f foo) && cat README.md"), {
         pathCtx: defaultPathCtx,
         denyAsAsk: false,
+        gitStateProvider: allCleanGit,
       });
       expect(subshell.decision.level).toBe("L0");
       expect(subshell.decision.verdict).toBe("allow");

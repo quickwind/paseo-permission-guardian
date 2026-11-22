@@ -2,14 +2,28 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { evaluateGuardianDryRun, getGuardianStatus } from "./shared/rpc.js";
+import { PLUGIN_VERSION } from "./shared/version.js";
 import { DEFAULT_GUARDIAN_SETTINGS, guardianSettings } from "./shared/settings.js";
+import { ActResponder, type PermissionAnswerer } from "./server/act/responder.js";
 import { AuditStore } from "./server/audit/store.js";
 import type { TimelineFetcher } from "./server/context/session.js";
-import { decideAction } from "./server/decide.js";
-import { PermissionGuardianService } from "./server/guardian.js";
-import { disposeSharedPwshHost } from "./server/shell/pwsh-host.js";
+import { createGitStateProvider } from "./server/context/git-state.js";
+import type { TimelineEntriesFetcher } from "./server/context/orphan-context.js";
+import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 
-const PLUGIN_VERSION = "0.1.0";
+type PaseoApi = PluginHandlerContext["paseo"];
+import { decideAction } from "./server/decide.js";
+import { GateController } from "./server/gate/gate.js";
+import { createReplayDecide } from "./server/gate/replay.js";
+import { PermissionGuardianService } from "./server/guardian.js";
+import { registerGateRpcs } from "./server/rpc-handlers.js";
+import { createIsolatedPwshHost, disposeSharedPwshHost } from "./server/shell/pwsh-host.js";
+
+/**
+ * Derived from package.json (F10) via the generated `shared/version.ts` (`npm run sync:version`,
+ * also run by `npm version`); Paseo's bundler rejects importing package.json directly.
+ */
+export { PLUGIN_VERSION };
 
 function resolveAuditDataDir(): string {
   const override = process.env.PASEO_GUARDIAN_DATA_DIR?.trim();
@@ -19,43 +33,98 @@ function resolveAuditDataDir(): string {
   return join(homedir(), ".paseo", "permission-guardian", "audit");
 }
 
+/** Latest turn(s) with timestamps — the same query as the before-hook timeline fetcher. */
+function timelineEntriesFetcher(paseo: PaseoApi): TimelineEntriesFetcher {
+  return async (agentId) => {
+    const res = await paseo.agents.ref(agentId).timeline.refetch({
+      direction: "tail",
+      limit: 1,
+      wholeTurns: true,
+    });
+    return res.entries.map((entry) => ({ item: entry.item, timestamp: entry.timestamp }));
+  };
+}
+
+/** Agent title from the Paseo API (cached snapshot first, then one refresh). */
+function agentTitleResolver(paseo: PaseoApi): (agentId: string) => Promise<string | undefined> {
+  return async (agentId) => {
+    const ref = paseo.agents.ref(agentId);
+    const cached = ref.current()?.title;
+    if (cached) return cached;
+    await ref.refresh();
+    return ref.current()?.title ?? undefined;
+  };
+}
+
 export default function contribute(server: PluginServerContext) {
   const settingsHandle = server.registerSettings(guardianSettings);
+  const dataDir = resolveAuditDataDir();
   const auditStore = new AuditStore({
-    dataDir: resolveAuditDataDir(),
+    dataDir,
     pluginVersion: PLUGIN_VERSION,
   });
+  // The contribution must return its cleanup synchronously, so permission hooks are registered now
+  // but every permission handler awaits this load first (in-memory history before any merge).
+  const storeReady: Promise<void> = auditStore.loadFromDisk().catch((error) => {
+    console.error("[paseo-permission-guardian] Failed to load audit history:", error);
+  });
+  // The gate subscribes to auditStore.onMerged itself.
+  const gate = new GateController({
+    store: auditStore,
+    dataDir,
+    replayDecide: createReplayDecide({
+      pwshHostFactory: (shell) => createIsolatedPwshHost(shell),
+      env: process.env,
+      home: homedir(),
+      dataDir,
+    }),
+  });
+  const responder = new ActResponder({ gate, store: auditStore, now: () => Date.now() });
+  // F7: the gate stays unconfigured (⇒ shadow, no replay, no latch side effects) until BOTH the
+  // audit history and the first real settings read (ready or invalid) have completed; configuring
+  // with defaults first could clear a latch bound to the stored settings' fingerprint.
+  const gitStateProvider = createGitStateProvider();
   const guardian = new PermissionGuardianService({
+    gitStateProvider,
     auditStore,
     pluginVersion: PLUGIN_VERSION,
     initialSettings: DEFAULT_GUARDIAN_SETTINGS,
+    gate,
+    responder,
+    deferGateConfigure: true,
   });
 
-  // Load initial persisted settings asynchronously; keep safe shadow defaults until ready.
-  void settingsHandle
+  const settingsLoaded: Promise<void> = settingsHandle
     .read()
     .then((state) => {
       if (state.status === "ready") {
         guardian.updateSettings(state.values);
       } else {
+        guardian.markSettingsInvalid(state.error ?? "invalid");
         console.error(
           `[paseo-permission-guardian] Stored settings invalid (${state.error}); using defaults.`,
         );
       }
     })
     .catch((error) => {
+      // Fail to human: unknown stored settings ⇒ invalid ⇒ shadow.
+      guardian.markSettingsInvalid("read_failed");
       console.error("[paseo-permission-guardian] Failed to read initial settings:", error);
     });
+  void Promise.all([storeReady, settingsLoaded]).then(() => guardian.activateGate());
 
   const unsubscribeSettings = settingsHandle.subscribe((state) => {
     if (state.status === "ready") {
       guardian.updateSettings(state.values);
+    } else {
+      guardian.markSettingsInvalid(state.error ?? "invalid");
     }
   });
 
   const removeBeforeHook = server.addHook(
     "agent.permission.before",
     async (payload, context) => {
+      await storeReady;
       const fetchTimeline: TimelineFetcher = async (agentId) => {
         const res = await context.paseo.agents.ref(agentId).timeline.refetch({
           direction: "tail",
@@ -64,12 +133,22 @@ export default function contribute(server: PluginServerContext) {
         });
         return res.entries.map((entry) => entry.item);
       };
-      await guardian.handlePermissionBefore(payload, fetchTimeline);
+      const answerer: PermissionAnswerer = {
+        respond: (agentId, requestId, response) =>
+          context.paseo.agents.ref(agentId).respondToPermission({ requestId, response }),
+      };
+      await guardian.handlePermissionBefore(payload, fetchTimeline, {
+        answerer,
+        signal: context.signal,
+      });
     },
   );
 
-  const removeAfterHook = server.addHook("agent.permission.after", async (payload) => {
-    await guardian.handlePermissionAfter(payload);
+  const removeAfterHook = server.addHook("agent.permission.after", async (payload, context) => {
+    await storeReady;
+    await guardian.handlePermissionAfter(payload, {
+      fetchTimelineEntries: timelineEntriesFetcher(context.paseo),
+    });
   });
 
   const removeTurnAfterHook = server.addHook("agent.turn.after", async (payload) => {
@@ -84,7 +163,27 @@ export default function contribute(server: PluginServerContext) {
     guardian.handleAgentClosed(payload.agent.id);
   });
 
-  server.handle(getGuardianStatus, async () => guardian.getStatus());
+  server.handle(getGuardianStatus, async (_input, context) => {
+    const status = guardian.getStatus();
+    // One-off, bounded, non-blocking backfill of orphan denials that lack recovered context.
+    const orphanIds = status.gate.entries
+      .filter((e) => e.kind === "orphan_deny" && (!e.orphanContext || e.orphanContext.unavailable === true))
+      .map((e) => e.requestId);
+    if (orphanIds.length > 0) {
+      void storeReady
+        .then(() => guardian.backfillOrphanContexts(orphanIds, timelineEntriesFetcher(context.paseo)))
+        .catch((error) => console.error("[paseo-permission-guardian] orphan backfill failed:", error));
+    }
+    // Same for missing agent titles (resolved once per agent; never blocks the response).
+    const untitled = status.gate.entries.filter((e) => e.agentId && !e.agentTitle && e.requestId).map((e) => e.requestId);
+    if (untitled.length > 0) {
+      void storeReady
+        .then(() => guardian.backfillAgentTitles(untitled, agentTitleResolver(context.paseo)))
+        .catch((error) => console.error("[paseo-permission-guardian] agent title backfill failed:", error));
+    }
+    return status;
+  });
+  registerGateRpcs(server, { gate, storeReady });
 
   server.handle(evaluateGuardianDryRun, async (input) => {
     const res = await decideAction(
@@ -107,6 +206,7 @@ export default function contribute(server: PluginServerContext) {
           home: input.home ?? (input.hostOs === "windows" ? "C:\\Users\\user" : homedir()),
         },
         denyAsAsk: guardian.getSettings().denyAsAsk,
+        gitStateProvider,
       },
     );
     return {
@@ -124,6 +224,8 @@ export default function contribute(server: PluginServerContext) {
     removeCloseAfterHook();
     removeArchiveAfterHook();
     await unsubscribeSettings();
+    responder.dispose();
+    await gate.dispose();
     await guardian.flush();
     await disposeSharedPwshHost();
   };

@@ -116,23 +116,26 @@ export class SessionContextStore {
     agentId: string,
     pathCtx: PathContext,
     fetchTimeline?: TimelineFetcher,
-  ): Promise<SessionState> {
+  ): Promise<{ state: SessionState; contextAvailable: boolean }> {
     const state = this.getOrCreate(agentId);
     if (!fetchTimeline) {
-      return state;
+      return { state, contextAvailable: true };
     }
 
     let items: AgentTimelineItem[];
     try {
       items = await fetchTimeline(agentId);
     } catch {
-      return state;
+      return { state, contextAvailable: false };
     }
 
     for (const item of items) {
       if (item.type !== "tool_call") continue;
       if (state.seenCallIds.has(item.callId)) continue;
       if (item.status === "failed" || item.status === "canceled") continue;
+      // Spec §3.9.8: an unknown tool call taints only once it completed; until then it is not
+      // marked seen, so a later sync re-examines it.
+      if (item.detail.type === "unknown" && item.status !== "completed") continue;
       state.seenCallIds.add(item.callId);
 
       const detail = item.detail;
@@ -153,10 +156,13 @@ export class SessionContextStore {
         if (SENSITIVE_SHELL_SECRET_REGEX.test(detail.command)) {
           this.markSecretTaint(agentId);
         }
+      } else if (detail.type === "unknown") {
+        // Unknown tool-call types may have consumed untrusted content (fail safe).
+        this.markUntrustedTaint(agentId);
       }
     }
 
-    return state;
+    return { state, contextAvailable: true };
   }
 
   /**

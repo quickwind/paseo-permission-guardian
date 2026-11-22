@@ -24,7 +24,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check:boundaries": "node scripts/check-boundaries.mjs",
-    "smoke:daemon": "node scripts/smoke-paseo-daemon.mjs"
+    "smoke:daemon": "node scripts/smoke-paseo-daemon.mjs",
+    "sync:version": "node scripts/sync-version.mjs",
+    "version": "node scripts/sync-version.mjs && git add shared/version.ts"
   },
   "devDependencies": {
     "@getpaseo/client": "0.16.2",

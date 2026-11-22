@@ -74,7 +74,8 @@ export function defaultExecShell(ctx: NormalizeContext, hint?: string): Shell | 
 
 export function parseMcpToolName(name: string): { server: string; tool: string } | null {
   if (!name.startsWith("mcp__")) {
-    return null;
+    const single = /^mcp_([a-z0-9-]+)_(.+)$/i.exec(name);
+    return single ? { server: single[1], tool: single[2] } : null;
   }
   const rest = name.slice("mcp__".length);
   const separatorIndex = rest.indexOf("__");
@@ -94,6 +95,7 @@ export function collectPathsFromObject(input: Record<string, unknown> | undefine
     "file_path",
     "filePath",
     "path",
+    "Path",
     "target_file",
     "targetFile",
     "TargetFile",

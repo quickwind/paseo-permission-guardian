@@ -74,6 +74,16 @@ async function main() {
   await mkdir(paseoHome, { recursive: true });
   await mkdir(auditData, { recursive: true });
 
+  // Pre-seed host-scope plugin settings inside the EPHEMERAL Paseo home (never the user's real
+  // home): Paseo stores them at <home>/plugin-settings/<pluginId>/<settingsId>.json.
+  const settingsDir = join(paseoHome, "plugin-settings", PLUGIN_ID);
+  await mkdir(settingsDir, { recursive: true });
+  await writeFile(
+    join(settingsDir, "guardian.json"),
+    JSON.stringify({ version: 1, values: { mode: "act" } }),
+    "utf8",
+  );
+
   const port = await getFreePort();
   const listen = `127.0.0.1:${port}`;
   await writeFile(
@@ -148,8 +158,13 @@ async function main() {
 
     const status = await client.invokePluginRpc(PLUGIN_ID, "guardian.status", {});
     assert.equal(status.pluginVersion, "0.1.0");
-    assert.equal(status.mode, "shadow");
+    // Requested mode is act, but a fresh install has no evidence: the gate must hold it in shadow.
+    assert.equal(status.mode, "act");
     assert.equal(status.effectiveMode, "shadow");
+    assert.ok(
+      ["replaying", "collecting"].includes(status.gate?.state),
+      `Expected gate.state replaying|collecting, got ${JSON.stringify(status.gate)}`,
+    );
     assert.equal(status.metrics.totalRequests, 0);
 
     // Verify bundled bash WASM & deterministic engine execute inside live Paseo daemon
@@ -199,7 +214,7 @@ async function main() {
     );
 
     console.log(
-      `Paseo daemon smoke passed (${listen}): plugin=${PLUGIN_ID} status=${pluginEntry.status} mode=${status.effectiveMode}`,
+      `Paseo daemon smoke passed (${listen}): plugin=${PLUGIN_ID} status=${pluginEntry.status} mode=${status.mode} effective=${status.effectiveMode} gate=${status.gate.state}`,
     );
   } catch (err) {
     console.error("Daemon smoke test failed. Collected daemon output:");

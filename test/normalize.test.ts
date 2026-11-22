@@ -186,4 +186,25 @@ describe("normalizePermissionRequest", () => {
     expect(res.action.kind).toBe("other");
     expect(res.warnings).toContain("unsupported_provider:custom-agent");
   });
+
+  it("M2: generic fallback carries sandboxBypass from the request input", () => {
+    const res = normalizePermissionRequest(
+      {
+        id: "u-2",
+        provider: "custom-agent",
+        name: "run",
+        kind: "tool",
+        input: { dangerouslyDisableSandbox: true },
+        detail: { type: "shell", command: "ls" },
+      } as AgentPermissionRequest,
+      { ...baseCtx, provider: "custom-agent" },
+    );
+    expect(res.normalizedBy).toBe("generic-detail");
+    expect(res.action.sandboxBypass).toBe(true);
+    const plain = normalizePermissionRequest(
+      { id: "u-3", provider: "custom-agent", name: "x", kind: "tool", input: { foo: 1 } },
+      { ...baseCtx, provider: "custom-agent" },
+    );
+    expect(plain.action.sandboxBypass).toBeUndefined();
+  });
 });
