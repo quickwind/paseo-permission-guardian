@@ -124,8 +124,10 @@ describe("F7 startup ordering", () => {
 });
 
 describe("F10 plugin version", () => {
-  it("PLUGIN_VERSION is read from package.json", async () => {
+  it("PLUGIN_VERSION matches package.json (shared/version.ts is in sync)", async () => {
     const mod = await import("../index.server.js");
+    const shared = await import("../shared/version.js");
+    expect(shared.PLUGIN_VERSION).toBe(pkg.version);
     expect(mod.PLUGIN_VERSION).toBe(pkg.version);
   });
 });

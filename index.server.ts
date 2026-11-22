@@ -1,8 +1,8 @@
-import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { evaluateGuardianDryRun, getGuardianStatus } from "./shared/rpc.js";
+import { PLUGIN_VERSION } from "./shared/version.js";
 import { DEFAULT_GUARDIAN_SETTINGS, guardianSettings } from "./shared/settings.js";
 import { ActResponder, type PermissionAnswerer } from "./server/act/responder.js";
 import { AuditStore } from "./server/audit/store.js";
@@ -14,21 +14,11 @@ import { PermissionGuardianService } from "./server/guardian.js";
 import { registerGateRpcs } from "./server/rpc-handlers.js";
 import { createIsolatedPwshHost, disposeSharedPwshHost } from "./server/shell/pwsh-host.js";
 
-/** Derived from package.json so the engine fingerprint follows releases (F10). */
-export const PLUGIN_VERSION: string = readPluginVersion();
-
-function readPluginVersion(): string {
-  try {
-    const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as {
-      version?: unknown;
-    };
-    if (typeof pkg.version === "string" && pkg.version) return pkg.version;
-  } catch (error) {
-    console.error("[paseo-permission-guardian] Failed to read package.json version:", error);
-  }
-  // Unknown version: a distinct value so a fingerprint never matches a real release's latch.
-  return "0.0.0-unknown";
-}
+/**
+ * Derived from package.json (F10) via the generated `shared/version.ts` (`npm run sync:version`,
+ * also run by `npm version`); Paseo's bundler rejects importing package.json directly.
+ */
+export { PLUGIN_VERSION };
 
 function resolveAuditDataDir(): string {
   const override = process.env.PASEO_GUARDIAN_DATA_DIR?.trim();
