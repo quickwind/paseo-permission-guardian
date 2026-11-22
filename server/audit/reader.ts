@@ -11,7 +11,7 @@ export interface AuditWindow {
 }
 
 export interface AuditDirContents {
-  /** Merged records in chronological first-seen order (latest line per requestId wins). */
+  /** Merged records in order of most recent line (latest before/after/update line per requestId wins). */
   records: Map<string, AuditRecord>;
   annotations: Map<string, "not_safety">;
   corruptLines: { key: string; file: string }[];
@@ -80,9 +80,10 @@ export async function readAuditDir(
         continue;
       }
       const ev = parsed?.event;
-      if (ev === "before" || ev === "after") {
+      if (ev === "before" || ev === "after" || ev === "update") {
         const rec = parsed.record;
-        if (!rec || typeof rec.requestId !== "string") {
+        const badDate = (v: unknown) => v !== undefined && v !== null && (typeof v !== "string" || Number.isNaN(Date.parse(v)));
+        if (!rec || typeof rec.requestId !== "string" || badDate(rec.requestedAt) || badDate(rec.resolution?.resolvedAt)) {
           corruptLines.push({
             key: `${file.name}#${createHash("sha256").update(raw).digest("hex")}`,
             file: file.name,
@@ -106,7 +107,7 @@ export async function readAuditDir(
 export async function readAuditWindow(
   dataDir: string,
   sinceMs: number,
-  opts: { maxRecords?: number; now?: () => number } = {},
+  opts: { maxRecords?: number } = {},
 ): Promise<AuditWindow> {
   const minDate = new Date(sinceMs).toISOString().slice(0, 10);
   const { records, annotations, corruptLines } = await readAuditDir(dataDir, { minDate });

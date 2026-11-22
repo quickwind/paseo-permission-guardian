@@ -222,3 +222,89 @@ describe("readAuditWindow", () => {
     expect(w.records).toHaveLength(2);
   });
 });
+
+describe("fix round 1", () => {
+  const failing = async () => {
+    throw new Error("disk full");
+  };
+
+  it("surfaces persist failures, persists marker, clears", async () => {
+    const dir = await tmp();
+    const s = new AuditStore({ dataDir: dir, pluginVersion: "0", now: () => new Date(T), writeFn: failing });
+    expect(s.getPersistFailure()).toBeNull();
+    await s.recordBefore(before("f1"));
+    await s.recordBefore(before("f2"));
+    await s.flush();
+    const f = s.getPersistFailure();
+    expect(f?.count).toBe(2);
+    expect(f?.firstAt).toBe(T);
+    expect(f?.lastError).toContain("disk full");
+    const s2 = new AuditStore({ dataDir: dir, pluginVersion: "0", now: () => new Date(T) });
+    await s2.loadFromDisk();
+    expect(s2.getPersistFailure()?.firstAt).toBe(T);
+    await s2.clearPersistFailure();
+    expect(s2.getPersistFailure()).toBeNull();
+    const s3 = new AuditStore({ dataDir: dir, pluginVersion: "0" });
+    await s3.loadFromDisk();
+    expect(s3.getPersistFailure()).toBeNull();
+  });
+
+  it("setActOutcome appends update line; unresolved on reload; later after keeps outcome; unknown id no-ops", async () => {
+    const dir = await tmp();
+    const s = new AuditStore({ dataDir: dir, pluginVersion: "0", now: () => new Date(T) });
+    await s.recordBefore(before("u1"));
+    s.setActOutcome("u1", "answered");
+    s.setActOutcome("nope", "answered");
+    await s.flush();
+    const disk = (await readFile(join(dir, "audit-2026-11-20.jsonl"), "utf8")).trim().split("\n");
+    expect(disk.map((l) => JSON.parse(l).event)).toEqual(["before", "update"]);
+    const s2 = new AuditStore({ dataDir: dir, pluginVersion: "0", now: () => new Date(T) });
+    await s2.loadFromDisk();
+    expect(s2.getRecord("u1")?.resolution).toBeUndefined();
+    expect(s2.getRecord("u1")?.actOutcome).toBe("answered");
+    expect(s2.getRecord("nope")).toBeUndefined();
+    const after = await s2.recordAfter({
+      requestId: "u1", agentId: "a", provider: "claude", mode: "act",
+      resolution: { behavior: "deny", resolvedAt: T, actor: "human" },
+    });
+    expect(after.actOutcome).toBe("answered");
+    await s2.flush();
+  });
+
+  it("writes a newline before appending to a crash-truncated file", async () => {
+    const dir = await tmp();
+    await writeFile(join(dir, "audit-2026-11-20.jsonl"), '{"event":"bef');
+    const s = new AuditStore({ dataDir: dir, pluginVersion: "0", now: () => new Date(T) });
+    await s.recordBefore(before("n1"));
+    await s.flush();
+    const lines = (await readFile(join(dir, "audit-2026-11-20.jsonl"), "utf8")).split("\n");
+    expect(lines[0]).toBe('{"event":"bef');
+    expect(JSON.parse(lines[1]!).record.requestId).toBe("n1");
+  });
+
+  it("loadFromDisk keeps records merged while it was in flight", async () => {
+    const dir = await tmp();
+    const s1 = new AuditStore({ dataDir: dir, pluginVersion: "0", now: () => new Date(T) });
+    await s1.recordBefore(before("d1"));
+    await s1.flush();
+    const s2 = new AuditStore({ dataDir: dir, pluginVersion: "0", now: () => new Date(T) });
+    const p = s2.loadFromDisk();
+    await s2.recordBefore(before("live"));
+    await p;
+    await s2.flush();
+    expect(s2.getRecord("d1")).toBeDefined();
+    expect(s2.getRecord("live")).toBeDefined();
+    expect(s2.getMetrics().totalRequests).toBe(2);
+  });
+
+  it("reports lines with unparsable dates as corrupt", async () => {
+    const dir = await tmp();
+    await writeFile(
+      join(dir, "audit-2026-11-20.jsonl"),
+      `${line("before", rec("bad", "not-a-date"))}\n${line("before", rec("ok", "2026-11-20T01:00:00.000Z"))}\n`,
+    );
+    const w = await readAuditWindow(dir, Date.parse("2026-11-20T00:00:00.000Z"));
+    expect(w.records.map((r) => r.requestId)).toEqual(["ok"]);
+    expect(w.corruptLines).toHaveLength(1);
+  });
+});

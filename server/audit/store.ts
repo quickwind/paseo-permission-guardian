@@ -1,4 +1,4 @@
-import { mkdir, appendFile, stat, writeFile, rename } from "node:fs/promises";
+import { mkdir, appendFile, stat, writeFile, rename, readFile, rm, open } from "node:fs/promises";
 import { join } from "node:path";
 import type {
   Action,
@@ -50,6 +50,7 @@ export interface RecordAfterInput {
   resolution: AuditResolution;
 }
 
+const PERSIST_FAILURE_FILE = "persist-failure.json";
 const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024; // 10 MiB
 const DEFAULT_MAX_IN_MEMORY_RECORDS = 5_000;
 
@@ -116,6 +117,9 @@ export class AuditStore {
   private activeFileIndex = 0;
 
   private metrics: AuditMetricsSummary = emptyMetrics();
+  private persistFailure: { count: number; firstAt: string; lastError: string } | null = null;
+  private touched: Set<string> | null = null;
+  private readonly checkedFiles = new Set<string>();
 
   constructor(options: AuditStoreOptions) {
     this.dataDir = options.dataDir;
@@ -135,26 +139,63 @@ export class AuditStore {
 
   setActOutcome(requestId: string, outcome: ActOutcome): void {
     const existing = this.records.get(requestId);
-    if (!existing) return;
+    if (!existing) {
+      console.error(`[paseo-permission-guardian] setActOutcome: unknown requestId ${requestId}`);
+      return;
+    }
     const next: AuditRecord = { ...existing, actOutcome: outcome };
     this.records.set(requestId, next);
-    this.enqueueAppend({ event: "after", record: next }).catch(() => {});
+    this.touched?.add(requestId);
+    void this.enqueueAppend({ event: "update", record: next }).catch(() => {});
   }
 
   async appendEvent(event: { event: "gate" | "annotation"; [k: string]: unknown }): Promise<void> {
     await this.enqueueAppend(event);
   }
 
+  getPersistFailure(): { count: number; firstAt: string; lastError: string } | null {
+    return this.persistFailure ? { ...this.persistFailure } : null;
+  }
+
+  async clearPersistFailure(): Promise<void> {
+    this.persistFailure = null;
+    await rm(join(this.dataDir, PERSIST_FAILURE_FILE), { force: true });
+  }
+
   async loadFromDisk(): Promise<void> {
-    const { records, lastWrittenAt } = await readAuditDir(this.dataDir);
-    this.records.clear();
-    this.metrics = { ...this.metrics, ...emptyMetrics() };
-    for (const rec of records.values()) {
-      this.adjustMetrics(rec, 1);
+    this.touched = new Set();
+    try {
+      const { records, lastWrittenAt } = await readAuditDir(this.dataDir);
+      // Memory wins for records merged after load started.
+      for (const id of this.touched) {
+        const mem = this.records.get(id);
+        if (mem) {
+          records.delete(id);
+          records.set(id, mem);
+        }
+      }
+      this.metrics = emptyMetrics();
+      for (const rec of records.values()) this.adjustMetrics(rec, 1);
+      this.records.clear();
+      for (const rec of [...records.values()].slice(-this.maxInMemoryRecords)) {
+        this.records.set(rec.requestId, rec);
+      }
+      this.metrics.lastUpdatedAt = this.touched.size > 0 ? this.now().toISOString() : lastWrittenAt;
+    } finally {
+      this.touched = null;
     }
-    const kept = [...records.values()].slice(-this.maxInMemoryRecords);
-    for (const rec of kept) this.records.set(rec.requestId, rec);
-    this.metrics.lastUpdatedAt = lastWrittenAt;
+    try {
+      const marker = JSON.parse(await readFile(join(this.dataDir, PERSIST_FAILURE_FILE), "utf8"));
+      if (marker && typeof marker.firstAt === "string") {
+        this.persistFailure = {
+          count: Number(marker.count) || 1,
+          firstAt: marker.firstAt,
+          lastError: String(marker.lastError ?? ""),
+        };
+      }
+    } catch {
+      // no marker
+    }
   }
 
   private notifyMerged(record: AuditRecord, previous: AuditRecord | undefined): void {
@@ -209,7 +250,7 @@ export class AuditStore {
     };
 
     this.upsertAndUpdateMetrics(existing, merged);
-    this.enqueueAppend({ event: "before", record: merged }).catch(() => {});
+    void this.enqueueAppend({ event: "before", record: merged }).catch(() => {});
     this.notifyMerged(merged, existing);
     return merged;
   }
@@ -241,7 +282,7 @@ export class AuditStore {
     };
 
     this.upsertAndUpdateMetrics(existing, merged);
-    this.enqueueAppend({ event: "after", record: merged }).catch(() => {});
+    void this.enqueueAppend({ event: "after", record: merged }).catch(() => {});
     this.notifyMerged(merged, existing);
     return merged;
   }
@@ -255,6 +296,7 @@ export class AuditStore {
       this.adjustMetrics(previous, -1);
     }
     this.records.set(next.requestId, next);
+    this.touched?.add(next.requestId);
     this.adjustMetrics(next, 1);
     this.metrics.lastUpdatedAt = this.now().toISOString();
 
@@ -299,17 +341,65 @@ export class AuditStore {
 
   private enqueueAppend(entry: { event: string; [k: string]: unknown }): Promise<void> {
     const task = this.writeQueue.then(async () => {
-      await this.ensureDir();
-      const targetPath = await this.resolveActiveLogFile();
-      const line = `${JSON.stringify({ ...entry, writtenAt: this.now().toISOString() })}\n`;
-      await this.writeFn(targetPath, line);
-      await this.writeSummarySnapshot();
+      try {
+        await this.ensureDir();
+        const targetPath = await this.resolveActiveLogFile();
+        await this.repairTrailingNewline(targetPath);
+        const line = `${JSON.stringify({ ...entry, writtenAt: this.now().toISOString() })}\n`;
+        await this.writeFn(targetPath, line);
+      } catch (error) {
+        await this.notePersistFailure(error);
+        throw error;
+      }
+      try {
+        await this.writeSummarySnapshot();
+      } catch (error) {
+        console.error("[paseo-permission-guardian] Failed to write audit summary:", error);
+      }
     });
     // Keep queue alive even if one write fails
     this.writeQueue = task.catch((error) => {
       console.error("[paseo-permission-guardian] Failed to write audit entry:", error);
     });
     return task;
+  }
+
+  private async repairTrailingNewline(path: string): Promise<void> {
+    if (this.checkedFiles.has(path)) return;
+    try {
+      const info = await stat(path);
+      if (info.size > 0) {
+        const fh = await open(path, "r");
+        try {
+          const buf = Buffer.alloc(1);
+          await fh.read(buf, 0, 1, info.size - 1);
+          if (buf[0] !== 0x0a) await this.writeFn(path, "\n");
+        } finally {
+          await fh.close();
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+    }
+    this.checkedFiles.add(path);
+  }
+
+  private async notePersistFailure(error: unknown): Promise<void> {
+    const lastError = error instanceof Error ? error.message : String(error);
+    const prev = this.persistFailure;
+    this.persistFailure = {
+      count: (prev?.count ?? 0) + 1,
+      firstAt: prev?.firstAt ?? this.now().toISOString(),
+      lastError,
+    };
+    try {
+      await mkdir(this.dataDir, { recursive: true });
+      const tmp = join(this.dataDir, `${PERSIST_FAILURE_FILE}.tmp.${process.pid}`);
+      await writeFile(tmp, JSON.stringify(this.persistFailure), "utf8");
+      await rename(tmp, join(this.dataDir, PERSIST_FAILURE_FILE));
+    } catch (markerError) {
+      console.error("[paseo-permission-guardian] Failed to write persist-failure marker:", markerError);
+    }
   }
 
   private async ensureDir(): Promise<void> {
