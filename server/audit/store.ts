@@ -4,11 +4,15 @@ import type {
   Action,
   AgreementOutcome,
   AuditMetricsSummary,
+  ActOutcome,
+  ContextSnapshot,
+  OfferedAction,
   AuditRecord,
   AuditResolution,
   GuardianDecision,
   GuardianMode,
 } from "../../shared/types.js";
+import { readAuditDir } from "./reader.js";
 import { redactValue } from "./redact.js";
 
 export interface AuditStoreOptions {
@@ -17,6 +21,8 @@ export interface AuditStoreOptions {
   maxFileBytes?: number;
   maxInMemoryRecords?: number;
   now?: () => Date;
+  /** Injectable append function (tests simulate slow filesystems). */
+  writeFn?: (path: string, line: string) => Promise<void>;
 }
 
 export interface RecordBeforeInput {
@@ -30,7 +36,11 @@ export interface RecordBeforeInput {
   warnings: string[];
   action: Action;
   decision: GuardianDecision;
+  offeredActions?: OfferedAction[];
+  contextSnapshot?: ContextSnapshot;
 }
+
+export type MergeListener = (record: AuditRecord, previous: AuditRecord | undefined) => void;
 
 export interface RecordAfterInput {
   requestId: string;
@@ -72,20 +82,8 @@ export function computeAgreement(
   return "unknown";
 }
 
-export class AuditStore {
-  private readonly dataDir: string;
-  private readonly pluginVersion: string;
-  private readonly maxFileBytes: number;
-  private readonly maxInMemoryRecords: number;
-  private readonly now: () => Date;
-
-  private readonly records = new Map<string, AuditRecord>();
-  private writeQueue: Promise<void> = Promise.resolve();
-  private dirReady = false;
-  private activeDateKey = "";
-  private activeFileIndex = 0;
-
-  private metrics: AuditMetricsSummary = {
+function emptyMetrics(): AuditMetricsSummary {
+  return {
     totalRequests: 0,
     reconciledCount: 0,
     pendingCount: 0,
@@ -100,6 +98,24 @@ export class AuditStore {
     outOfOrderCount: 0,
     lastUpdatedAt: null,
   };
+}
+
+export class AuditStore {
+  private readonly dataDir: string;
+  private readonly pluginVersion: string;
+  private readonly maxFileBytes: number;
+  private readonly maxInMemoryRecords: number;
+  private readonly now: () => Date;
+  private readonly writeFn: (path: string, line: string) => Promise<void>;
+  private readonly listeners = new Set<MergeListener>();
+
+  private readonly records = new Map<string, AuditRecord>();
+  private writeQueue: Promise<void> = Promise.resolve();
+  private dirReady = false;
+  private activeDateKey = "";
+  private activeFileIndex = 0;
+
+  private metrics: AuditMetricsSummary = emptyMetrics();
 
   constructor(options: AuditStoreOptions) {
     this.dataDir = options.dataDir;
@@ -107,6 +123,48 @@ export class AuditStore {
     this.maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
     this.maxInMemoryRecords = options.maxInMemoryRecords ?? DEFAULT_MAX_IN_MEMORY_RECORDS;
     this.now = options.now ?? (() => new Date());
+    this.writeFn = options.writeFn ?? ((path, line) => appendFile(path, line, "utf8"));
+  }
+
+  onMerged(listener: MergeListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  setActOutcome(requestId: string, outcome: ActOutcome): void {
+    const existing = this.records.get(requestId);
+    if (!existing) return;
+    const next: AuditRecord = { ...existing, actOutcome: outcome };
+    this.records.set(requestId, next);
+    this.enqueueAppend({ event: "after", record: next }).catch(() => {});
+  }
+
+  async appendEvent(event: { event: "gate" | "annotation"; [k: string]: unknown }): Promise<void> {
+    await this.enqueueAppend(event);
+  }
+
+  async loadFromDisk(): Promise<void> {
+    const { records, lastWrittenAt } = await readAuditDir(this.dataDir);
+    this.records.clear();
+    this.metrics = { ...this.metrics, ...emptyMetrics() };
+    for (const rec of records.values()) {
+      this.adjustMetrics(rec, 1);
+    }
+    const kept = [...records.values()].slice(-this.maxInMemoryRecords);
+    for (const rec of kept) this.records.set(rec.requestId, rec);
+    this.metrics.lastUpdatedAt = lastWrittenAt;
+  }
+
+  private notifyMerged(record: AuditRecord, previous: AuditRecord | undefined): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(record, previous);
+      } catch (error) {
+        console.error("[paseo-permission-guardian] onMerged listener failed:", error);
+      }
+    }
   }
 
   getDataDir(): string {
@@ -144,11 +202,15 @@ export class AuditStore {
       decision: redactedDecision,
       resolution: existing?.resolution,
       agreement: computeAgreement(redactedDecision, existing?.resolution),
+      ...(input.offeredActions ? { offeredActions: input.offeredActions.map((o) => ({ ...o })) } : {}),
+      ...(input.contextSnapshot ? { contextSnapshot: redactValue(input.contextSnapshot) } : {}),
+      ...(existing?.actOutcome ? { actOutcome: existing.actOutcome } : {}),
       ...(hadResolutionFirst || existing?.outOfOrder ? { outOfOrder: true } : {}),
     };
 
     this.upsertAndUpdateMetrics(existing, merged);
-    await this.enqueueAppend({ event: "before", record: merged });
+    this.enqueueAppend({ event: "before", record: merged }).catch(() => {});
+    this.notifyMerged(merged, existing);
     return merged;
   }
 
@@ -172,11 +234,15 @@ export class AuditStore {
       decision: existing?.decision,
       resolution: redactedResolution,
       agreement: computeAgreement(existing?.decision, redactedResolution),
+      ...(existing?.offeredActions ? { offeredActions: existing.offeredActions } : {}),
+      ...(existing?.contextSnapshot ? { contextSnapshot: existing.contextSnapshot } : {}),
+      ...(existing?.actOutcome ? { actOutcome: existing.actOutcome } : {}),
       ...(arrivedBeforeRequest || existing?.outOfOrder ? { outOfOrder: true } : {}),
     };
 
     this.upsertAndUpdateMetrics(existing, merged);
-    await this.enqueueAppend({ event: "after", record: merged });
+    this.enqueueAppend({ event: "after", record: merged }).catch(() => {});
+    this.notifyMerged(merged, existing);
     return merged;
   }
 
@@ -231,12 +297,12 @@ export class AuditStore {
     }
   }
 
-  private enqueueAppend(entry: { event: "before" | "after"; record: AuditRecord }): Promise<void> {
+  private enqueueAppend(entry: { event: string; [k: string]: unknown }): Promise<void> {
     const task = this.writeQueue.then(async () => {
       await this.ensureDir();
       const targetPath = await this.resolveActiveLogFile();
       const line = `${JSON.stringify({ ...entry, writtenAt: this.now().toISOString() })}\n`;
-      await appendFile(targetPath, line, "utf8");
+      await this.writeFn(targetPath, line);
       await this.writeSummarySnapshot();
     });
     // Keep queue alive even if one write fails
