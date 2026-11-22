@@ -161,6 +161,7 @@ paseo-permission-guardian/
     types.ts               # shared DTOs (no Node / RN imports)
   client/
     settings-screen.tsx    # SettingsCard/SettingsSection UI
+    gate-view.ts           # pure gate-status view helpers (labels, integrity)
     dashboard.tsx          # Shadow dashboard & disagreements view
     timeline-row.tsx       # Compact risk/verdict timeline renderer
   server/
@@ -176,13 +177,15 @@ paseo-permission-guardian/
       pwsh-verbs.ts        # verb taxonomy, alias table, parameter prefix disambiguation
       windows-builtins.ts  # del, rd, reg, sc, schtasks, robocopy, icacls, …
       handlers/            # JS ports for commands needing code (curl, …)
-    paths/                 # normalization, ancestor realpath, WSL mapping, sensitive/protected catalogs
+    paths/                 # normalization, ancestor realpath, WSL mapping, sensitive/protected catalogs, Paseo self subpaths (R11)
     secrets/               # stateless credential literal patterns & env var classifiers (ADR-0005)
     context/               # incremental timeline sync, taint, secretTaint, provenance, scope grants
     effects.ts             # effect vocabulary + combination rules
     policy/                # layered YAML loading, schema, project sha256 pinning
     decide.ts              # levels, LLM grey zone, epoch-keyed LLM cache, actor tracking
-    audit/                 # rotated JSONL store, redaction, in-memory metrics index, replay
+    audit/                 # rotated JSONL store, redaction, in-memory metrics index, window reader
+    gate/                  # evidence gate: fingerprint, replay, latch/suspension state machine
+    act/                   # act responder (allow-once/deny-once mapping, attribution marks)
   test/
     vectors/safe-chains/   # extracted conformance cases
     vectors/windows/       # PowerShell, cmd, WSL cases
