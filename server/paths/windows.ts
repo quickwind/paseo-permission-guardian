@@ -18,6 +18,12 @@ export interface WindowsPathContext extends PathContext {
     automountRoot?: string;
   };
   envSnapshot?: Record<string, string | undefined>;
+  /**
+   * Test seam: resolve a Windows absolute path through junctions/symlinks. Defaults to
+   * `resolveAncestorRealPath` on win32 hosts and identity elsewhere. Ignored when
+   * `skipHostRealpath` is set.
+   */
+  windowsRealpath?: (absWinPath: string) => string;
 }
 
 export interface WindowsPathClassification extends PathClassification {
@@ -319,6 +325,28 @@ function windowsRoots(values: Array<string | undefined>): string[] {
     const t = v?.trim();
     if (!t || !(/^[A-Za-z]:[\\/]/.test(t) || t.startsWith("\\\\"))) continue;
     out.add(toForwardSlash(win32.normalize(t)).replace(/\/+$/, "").toLowerCase());
+  }
+  return Array.from(out);
+}
+
+/**
+ * Add the realpath of each root (when resolvable) so a junctioned/symlinked Paseo root
+ * also protects its target, mirroring the POSIX `resolveReal` root handling.
+ */
+function withRealRoots(roots: string[], ctx: WindowsPathContext): string[] {
+  if (ctx.skipHostRealpath) return roots;
+  const resolver =
+    ctx.windowsRealpath ?? (process.platform === "win32" ? resolveAncestorRealPath : undefined);
+  if (!resolver) return roots;
+  const out = new Set(roots);
+  for (const root of roots) {
+    let real: string;
+    try {
+      real = resolver(root.replaceAll("/", "\\"));
+    } catch {
+      continue;
+    }
+    for (const r of windowsRoots([real])) out.add(r);
   }
   return Array.from(out);
 }
@@ -717,19 +745,30 @@ export function classifyWindowsPath(
   const pluginDirRaw = (
     ctx.pluginDataDir ?? win32.join(homeWin, ".paseo", "permission-guardian")
   ).replaceAll("/", "\\");
-  const pluginFwdLower = toForwardSlash(win32.normalize(pluginDirRaw)).toLowerCase();
-  if (isWinPathUnder(realFwdLower, pluginFwdLower) || isWinPathUnder(normFwdLower, pluginFwdLower)) {
+  const pluginFwdLowers = withRealRoots(
+    [toForwardSlash(win32.normalize(pluginDirRaw)).replace(/\/+$/, "").toLowerCase()],
+    ctx,
+  );
+  if (
+    pluginFwdLowers.some(
+      (pluginFwdLower) =>
+        isWinPathUnder(realFwdLower, pluginFwdLower) || isWinPathUnder(normFwdLower, pluginFwdLower),
+    )
+  ) {
     isProtected = true;
     isPluginSelf = true;
     matchedRules.push("protected:plugin_self");
   }
 
   // Whole-root plugin-self roots (PASEO_PLUGIN_DIR, PASEO_GUARDIAN_DATA_DIR, data dir).
-  const wholeRoots = windowsRoots([
-    ...(ctx.paseoRoots ?? []),
-    getEnvInsensitive(ctx.envSnapshot, "PASEO_PLUGIN_DIR"),
-    getEnvInsensitive(ctx.envSnapshot, "PASEO_GUARDIAN_DATA_DIR"),
-  ]);
+  const wholeRoots = withRealRoots(
+    windowsRoots([
+      ...(ctx.paseoRoots ?? []),
+      getEnvInsensitive(ctx.envSnapshot, "PASEO_PLUGIN_DIR"),
+      getEnvInsensitive(ctx.envSnapshot, "PASEO_GUARDIAN_DATA_DIR"),
+    ]),
+    ctx,
+  );
   for (const root of wholeRoots) {
     if (candidates.some((c) => relUnder(c, root, true) !== null)) {
       isProtected = true;
@@ -744,11 +783,14 @@ export function classifyWindowsPath(
   }
 
   // Paseo home roots: only specific control subpaths (ruling R11).
-  const homeRoots = windowsRoots([
-    win32.join(homeWin, ".paseo"),
-    getEnvInsensitive(ctx.envSnapshot, "PASEO_HOME"),
-    ...(ctx.paseoHomeRoots ?? []),
-  ]);
+  const homeRoots = withRealRoots(
+    windowsRoots([
+      win32.join(homeWin, ".paseo"),
+      getEnvInsensitive(ctx.envSnapshot, "PASEO_HOME"),
+      ...(ctx.paseoHomeRoots ?? []),
+    ]),
+    ctx,
+  );
   for (const cand of candidates) {
     const rels: string[] = [];
     for (const root of homeRoots) {
