@@ -190,7 +190,7 @@ describe("readAuditWindow", () => {
     expect((await readAuditWindow(dir, since)).records).toHaveLength(1);
   });
 
-  it("reports corrupt middle line, tolerates truncated last line of newest file", async () => {
+  it("reports corrupt middle line AND a truncated last line of the newest file (R13)", async () => {
     const dir = await tmp();
     const bad = '{"event":"before","rec';
     await writeFile(
@@ -207,6 +207,10 @@ describe("readAuditWindow", () => {
       {
         key: `audit-2026-11-20.jsonl#${createHash("sha256").update(bad).digest("hex")}`,
         file: "audit-2026-11-20.jsonl",
+      },
+      {
+        key: `audit-2026-11-21.jsonl#${createHash("sha256").update('{"event":"bef').digest("hex")}`,
+        file: "audit-2026-11-21.jsonl",
       },
     ]);
   });

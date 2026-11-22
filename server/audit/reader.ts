@@ -49,7 +49,6 @@ export async function readAuditDir(
   opts: { minDate?: string } = {},
 ): Promise<AuditDirContents> {
   const all = await listAuditFiles(dataDir);
-  const newest = all[all.length - 1]?.name;
   const files = opts.minDate ? all.filter((f) => f.date >= opts.minDate!) : all;
 
   const records = new Map<string, AuditRecord>();
@@ -72,7 +71,8 @@ export async function readAuditDir(
       try {
         parsed = JSON.parse(raw);
       } catch {
-        if (file.name === newest && i === lines.length - 1) continue;
+        // Every unparsable line is corrupt, including a crash-truncated final line: it may be a
+        // human denial, so the gate must not silently drop it (ruling R13, fail to human).
         corruptLines.push({
           key: `${file.name}#${createHash("sha256").update(raw).digest("hex")}`,
           file: file.name,

@@ -461,3 +461,7 @@ Added 2026-11-22; earlier sections are unchanged.
   are secret reads. `worktrees/**` and every other subpath are ordinary. `PASEO_PLUGIN_DIR`,
   `PASEO_GUARDIAN_DATA_DIR` and the plugin data dir stay whole-root. A worktree that itself lies
   inside a protected subtree (e.g. `~/.paseo/plugins/x`) keeps the protection.
+- **R13 (corrupt lines).** There is no tolerance for an unparsable final line of the newest audit
+  file: a crash-truncated line may be a human denial, so every unparsable line in the window is a
+  corrupt line and the gate is `unavailable` until it is acknowledged. The store still writes a
+  newline before appending to a file that does not end in one.
