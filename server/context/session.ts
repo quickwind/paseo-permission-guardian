@@ -133,6 +133,9 @@ export class SessionContextStore {
       if (item.type !== "tool_call") continue;
       if (state.seenCallIds.has(item.callId)) continue;
       if (item.status === "failed" || item.status === "canceled") continue;
+      // Spec §3.9.8: an unknown tool call taints only once it completed; until then it is not
+      // marked seen, so a later sync re-examines it.
+      if (item.detail.type === "unknown" && item.status !== "completed") continue;
       state.seenCallIds.add(item.callId);
 
       const detail = item.detail;

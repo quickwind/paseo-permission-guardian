@@ -76,6 +76,21 @@ describe("P2a context and settings fail-safes", () => {
     expect(state.untrustedTaint).toBe(true);
   });
 
+  it("M1: running/pending unknown-type tool calls do not taint until completed", async () => {
+    const store = new SessionContextStore();
+    const item = (status: string) =>
+      ({
+        type: "tool_call", callId: "c9", name: "Mystery", status, error: null,
+        detail: { type: "unknown", input: null, output: null },
+      }) as never;
+    for (const status of ["running", "pending"]) {
+      const { state } = await store.syncFromTimeline("a", ctx, async () => [item(status)]);
+      expect(state.untrustedTaint, status).toBe(false);
+    }
+    const { state } = await store.syncFromTimeline("a", ctx, async () => [item("completed")]);
+    expect(state.untrustedTaint).toBe(true);
+  });
+
   it("failed unknown-type tool calls do not taint", async () => {
     const store = new SessionContextStore();
     const { state } = await store.syncFromTimeline("a", ctx, async () => [
