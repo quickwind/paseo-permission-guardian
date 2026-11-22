@@ -307,6 +307,8 @@ function emitWindowsPathAlerts(
   }
 }
 
+const PASEO_ROOT_ENV_VARS = new Set(["PASEO_HOME", "PASEO_PLUGIN_DIR", "PASEO_GUARDIAN_DATA_DIR"]);
+
 function evaluateAssignments(
   assignments: AssignmentFact[],
   effects: EffectTag[],
@@ -319,6 +321,15 @@ function evaluateAssignments(
     const dedupKey = `${a.name}\u0000${a.value}\u0000${a.standalone}\u0000${a.depth}`;
     if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
+
+    if (PASEO_ROOT_ENV_VARS.has(a.name.trim().toUpperCase())) {
+      effects.push({
+        tag: "privilege",
+        layer: a.depth,
+        target: a.name,
+        detail: `paseo_env_override:${a.name.trim().toUpperCase()}`,
+      });
+    }
 
     for (const kind of detectCredentialLiterals(a.value)) {
       effects.push({

@@ -1,10 +1,17 @@
-import { describe, expect, it } from "vitest";
-import { SessionContextStore } from "../server/context/session.js";
+import { afterAll, describe, expect, it } from "vitest";
+import { disposeSharedPwshHost, resolvePwshBinaryPath } from "../server/shell/pwsh-host.js";
 import { decideAction, type DecideOptions } from "../server/decide.js";
 import { collectPathsFromObject } from "../server/normalize/types.js";
 import { isBuildOrScriptEntrypoint, resolvePaseoSelfRoots } from "../server/paths/index.js";
 import { isExecHijackEnvVar } from "../server/secrets/patterns.js";
 import type { Action } from "../shared/types.js";
+
+afterAll(async () => {
+  await disposeSharedPwshHost();
+});
+const hasPwsh7 = Boolean(
+  resolvePwshBinaryPath("pwsh7", { allowPosixHost: process.platform !== "win32" }),
+);
 
 function base(): Omit<Action, "kind"> {
   return {
@@ -87,19 +94,41 @@ describe("p2a path/normalization hardening", () => {
     const r = await decideAction(editAction("$PASEO_HOME/x.ts"), optsWithEnv({}));
     expect(r.decision.level).not.toBe("L3");
   });
-  it("shell assignment PASEO_HOME=/x ls is exec_inline L1, L2 under untrusted taint", async () => {
-    const action: Action = {
+  describe("PASEO_* root assignments are L2 in any shell", () => {
+    const names = ["PASEO_HOME", "PASEO_PLUGIN_DIR", "PASEO_GUARDIAN_DATA_DIR"];
+    const exec = (shell: "bash" | "pwsh7" | "cmd", source: string, os: "darwin" | "windows"): Action => ({
       ...base(),
+      cwd: os === "windows" ? "C:\\repo" : "/repo",
+      worktreeRoot: os === "windows" ? "C:\\repo" : "/repo",
+      host: { os },
       kind: "exec",
       toolName: "Bash",
-      exec: { shell: "bash", source: "PASEO_HOME=/x ls" },
+      exec: { shell, source },
+    });
+    const winOpts: DecideOptions = {
+      denyAsAsk: false,
+      allowPosixPwshHost: true,
+      pathCtx: { os: "windows", cwd: "C:\\repo", worktreeRoot: "C:\\repo", home: "C:\\Users\\alice" },
     };
-    const clean = await decideAction(action, opts);
-    expect(clean.decision.level).toBe("L1");
-    expect(clean.decision.effects?.some((e) => e.tag === "exec_inline")).toBe(true);
-    const sessions = new SessionContextStore();
-    sessions.markUntrustedTaint("agent-1");
-    const tainted = await decideAction(action, { ...opts, session: sessions.getOrCreate("agent-1") });
-    expect(tainted.decision.level).toBe("L2");
+    const forms: Array<[string, (v: string) => Action]> = [
+      ["bash inline prefix", (v) => exec("bash", `${v}=/x ls`, "darwin")],
+      ["bash export", (v) => exec("bash", `export ${v}=/x`, "darwin")],
+      ["pwsh $env:", (v) => exec("pwsh7", `$env:${v} = 'C:\\x'`, "windows")],
+      ["pwsh SetEnvironmentVariable", (v) =>
+        exec("pwsh7", `[Environment]::SetEnvironmentVariable('${v}', 'C:\\x')`, "windows")],
+      ["cmd set", (v) => exec("cmd", `set ${v}=C:\\x`, "windows")],
+    ];
+    for (const [label, mk] of forms) {
+      const t = label.startsWith("pwsh") && !hasPwsh7 ? it.skip : it;
+      t.each(names)(`${label}: %s reaches L2`, async (v) => {
+        const a = mk(v);
+        const r = await decideAction(a, a.host.os === "windows" ? winOpts : opts);
+        expect(r.decision.level, JSON.stringify(r.decision.reasons)).toBe("L2");
+      });
+    }
+    it("unrelated var is unaffected", async () => {
+      const r = await decideAction(exec("bash", "FOO=1 ls", "darwin"), opts);
+      expect(r.decision.level).not.toBe("L2");
+    });
   });
 });
