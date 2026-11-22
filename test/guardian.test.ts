@@ -154,3 +154,29 @@ describe("PermissionGuardianService", () => {
     expect(store.getMetrics().totalRequests).toBe(0);
   });
 });
+
+describe("N4a invalid settings record even when the last valid mode was off", () => {
+  it("records before/after when settings are invalid (effective shadow)", async () => {
+    const dataDir = await makeTempDir();
+    const store = new AuditStore({ dataDir, pluginVersion: "0.1.0" });
+    const service = new PermissionGuardianService({
+      auditStore: store,
+      pluginVersion: "0.1.0",
+      initialSettings: { ...DEFAULT_GUARDIAN_SETTINGS, mode: "off" },
+    });
+    service.markSettingsInvalid("bad_schema");
+    expect(service.getEffectiveBaseMode()).toBe("shadow");
+    await service.handlePermissionBefore({
+      agent: sampleAgent,
+      request: { id: "req-inv", provider: "claude", name: "Bash", kind: "tool", input: { command: "ls" } },
+    });
+    await service.handlePermissionAfter({
+      agent: sampleAgent,
+      requestId: "req-inv",
+      resolution: { behavior: "allow" },
+    });
+    await service.flush();
+    expect(store.getRecord("req-inv")?.decision).toBeDefined();
+    expect(store.getRecord("req-inv")?.resolution?.behavior).toBe("allow");
+  });
+});

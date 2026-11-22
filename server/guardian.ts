@@ -188,7 +188,8 @@ export class PermissionGuardianService {
     fetchTimeline?: TimelineFetcher,
     ctx?: PermissionBeforeContext,
   ): Promise<void> {
-    if (this.settings.mode === "off") {
+    // N4: invalid settings fall back to effective shadow, which still records.
+    if (this.getEffectiveBaseMode() === "off") {
       return;
     }
 
@@ -291,7 +292,8 @@ export class PermissionGuardianService {
   async handlePermissionAfter(
     payload: PluginHookEvents["agent.permission.after"],
   ): Promise<void> {
-    if (this.settings.mode === "off") {
+    // N4: invalid settings fall back to effective shadow, which still records.
+    if (this.getEffectiveBaseMode() === "off") {
       return;
     }
 

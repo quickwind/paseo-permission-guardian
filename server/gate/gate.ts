@@ -152,6 +152,8 @@ export class GateController {
   // ---------------------------------------------------------------- configuration
 
   configure(input: GateConfigureInput): void {
+    // N4: a late activateGate()/configure after plugin teardown must not resurrect the gate.
+    if (this.disposed) return;
     try {
       const prevSettings = this.settings;
       const prevFingerprint = this.fingerprint;

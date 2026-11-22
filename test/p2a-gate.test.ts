@@ -1017,3 +1017,16 @@ describe("GateController — N2 orphan human deny is an integrity problem", () =
     expect(g.status().state).toBe("unavailable");
   });
 });
+
+describe("GateController — N4b configure after dispose", () => {
+  it("a late configure() after dispose is a no-op (no replay, no state)", async () => {
+    await seedSamples(200);
+    const g = makeGate();
+    await g.dispose();
+    configure(g);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(g.status().reason).toBe("not_configured");
+    expect(g.effectiveMode()).toBe("shadow");
+    expect(await readGateState(dir)).toBeNull();
+  });
+});
