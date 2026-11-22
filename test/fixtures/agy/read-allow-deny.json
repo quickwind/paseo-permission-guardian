@@ -1,0 +1,54 @@
+[
+  {
+    "id": "fixture-1",
+    "name": "File src/file.tsx",
+    "kind": "tool",
+    "title": "File src/file.tsx",
+    "input": {
+      "Path": "/repo/src/file1.tsx"
+    },
+    "detail": {
+      "type": "read",
+      "filePath": "/repo/src/file1.tsx"
+    },
+    "actions": [
+      {
+        "id": "allow",
+        "label": "Allow",
+        "behavior": "allow"
+      },
+      {
+        "id": "deny",
+        "label": "Deny",
+        "behavior": "deny"
+      }
+    ],
+    "provider": "agy"
+  },
+  {
+    "id": "fixture-2",
+    "name": "File src/file.tsx",
+    "kind": "tool",
+    "title": "File src/file.tsx",
+    "input": {
+      "Path": "/repo/src/file2.tsx"
+    },
+    "detail": {
+      "type": "read",
+      "filePath": "/repo/src/file2.tsx"
+    },
+    "actions": [
+      {
+        "id": "allow",
+        "label": "Allow",
+        "behavior": "allow"
+      },
+      {
+        "id": "deny",
+        "label": "Deny",
+        "behavior": "deny"
+      }
+    ],
+    "provider": "agy"
+  }
+]
