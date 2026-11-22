@@ -14,6 +14,7 @@ Significant architectural, security, and platform-integration decisions for `pas
 | [ADR-0006](./0006-windows-env-classification-shell-hardening-and-static-cwd.md) | Windows environment classification, shell hardening, and cross-shell static CWD tracking | Accepted | 2026-11-21 |
 | [ADR-0007](./0007-pwsh5-named-pipe-transport-and-cmdlet-free-cold-start.md) | Windows PowerShell 5.1 host transport over authenticated named pipe and cmdlet-free cold start | Accepted | 2026-11-22 |
 | [ADR-0008](./0008-act-mode-evidence-gate.md) | `act` mode behind an evidence gate, replay with the current engine, and provider option mapping | Accepted | 2026-11-22 |
+| [ADR-0009](./0009-uncommitted-delete-requires-human.md) | Uncommitted deletes require a human; committed files stay L0 | Accepted | 2026-11-23 |
 
 ## Creating a New ADR
 

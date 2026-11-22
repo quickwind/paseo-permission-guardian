@@ -179,7 +179,8 @@ paseo-permission-guardian/
       handlers/            # JS ports for commands needing code (curl, …)
     paths/                 # normalization, ancestor realpath, WSL mapping, sensitive/protected catalogs, Paseo self subpaths (R11)
     secrets/               # stateless credential literal patterns & env var classifiers (ADR-0005)
-    context/               # incremental timeline sync, taint, secretTaint, provenance, scope grants
+    context/               # incremental timeline sync, taint, secretTaint, provenance, scope grants,
+                           # git-state.ts (tracked+clean lookup for deletes, ADR-0009)
     effects.ts             # effect vocabulary + combination rules
     policy/                # layered YAML loading, schema, project sha256 pinning
     decide.ts              # levels, LLM grey zone, epoch-keyed LLM cache, actor tracking
@@ -447,8 +448,8 @@ See [ADR-0002](./adr/0002-session-context-taint-and-cache-invalidation.md) for r
 
 | Level | Typical effects | Decision |
 | --- | --- | --- |
-| L0 | `read`, `write_worktree`, `exec_project` (allow-listed, entrypoints unmodified), `net_read` to trusted domains | allow (select the provider's **allow-once** option; never "always") |
-| L1 | unknown commands, opaque, `pkg_install`, `write_outside` to temp-like dirs, unlisted MCP tools | grey zone → LLM judge (if enabled) may return allow or ask; default ask |
+| L0 | `read`, `write_worktree`, `exec_project` (allow-listed, entrypoints unmodified), `net_read` to trusted domains, non-recursive `delete_worktree` of git-tracked files with no uncommitted changes | allow (select the provider's **allow-once** option; never "always") |
+| L1 | unknown commands, opaque, `pkg_install`, `write_outside` to temp-like dirs, unlisted MCP tools, recursive `delete_worktree`, non-recursive `delete_worktree` of an uncommitted/untracked/ignored target (`delete_uncommitted:<path>`) | grey zone → LLM judge (if enabled) may return allow or ask; default ask |
 | L2 | `vcs_remote`, `infra_mutate`, `privilege`, `write_protected`, untrusted egress, `secretTaint` egress | ask (human) |
 | L3 | combination-rule denies, `system_destructive` | deny with an explanatory message the agent can act on |
 
@@ -461,6 +462,15 @@ Rules:
   every request. Only LLM judge responses may be cached, keyed by
   `(normalizedActionHash, policyVersion, taintEpoch, worktreeMutationEpoch, scopeGrantVersion)`.
 - Deny can be downgraded to ask globally by policy for teams that prefer no auto-deny.
+- **Uncommitted deletes** ([ADR-0009](./adr/0009-uncommitted-delete-requires-human.md)): a
+  non-recursive `delete_worktree` (bash `rm`, PowerShell `Remove-Item`, cmd `del`/`erase`, provider
+  `delete`) is L0 only if every target is a regular tracked git entry with no worktree/index
+  changes. `server/context/git-state.ts` asks `git` (`execFile`, no shell, `GIT_OPTIONAL_LOCKS=0`,
+  literal pathspecs, 1500 ms budget, hook signal). Anything else — untracked, ignored, modified,
+  staged, outside the worktree or repository, not a repo, git error/timeout — is L1
+  `delete_uncommitted:<path>`. The provider is injected (`gitStateProvider`); `decideAction` never
+  spawns git itself. Replay uses the recorded `contextSnapshot.deleteTargetsClean` and never calls
+  git; a missing entry is not clean.
 
 **What `act` answers** ([ADR-0008](./adr/0008-act-mode-evidence-gate.md)): only when the effective
 mode is `act` (the evidence gate is open, see §12.1/§13.2). L0 `allow` is answered with the
@@ -604,8 +614,9 @@ notifications. Timeout ⇒ normal human flow. The plugin detects and prefers it 
   (secrets redacted), layers, effects, reasons, decision, mode, actor attribution, final
   resolution, latency, plugin and data versions. P2a adds `offeredActions` (the provider's offered
   options), `contextSnapshot` (taint flags, modified entrypoints/files before the decision, paths
-  redacted, files capped at 200 with a truncation flag, and `contextUnavailable` when the timeline
-  could not be synced), and `actOutcome` (`sent | answered | unconfirmed | lost_race | error`;
+  redacted, files capped at 200 with a truncation flag, `contextUnavailable` when the timeline
+  could not be synced, and `deleteTargetsClean` — per non-recursive worktree delete target, keyed
+  by the redacted target, whether it was tracked and clean in git at decision time, ADR-0009), and `actOutcome` (`sent | answered | unconfirmed | lost_race | error`;
   `skipped` exists in the type but is never written). Lines for the same `requestId` merge
   field-wise: a later line's defined values win and missing fields never erase earlier ones.
   Every unparsable line is a corrupt line, including a crash-truncated final line.
@@ -636,7 +647,7 @@ would deny at L3 (judged by level, independent of `denyAsAsk`). Metrics come fro
 recorded history with the current engine (at most 20 000 records in the window; more ⇒
 `replay_truncated` ⇒ `unavailable`); the engine fingerprint is `sha256(pluginVersion,
 ENGINE_DATA_VERSION, policy hash, denyAsAsk, windowsDefaultShell, env digest of the Paseo roots and
-whether CDPATH is set)`, and a fingerprint change clears the latch and invalidates the override.
+whether CDPATH is set)` (`ENGINE_DATA_VERSION` is 2 since ADR-0009), and a fingerprint change clears the latch and invalidates the override.
 Replay never counts a human-attributed allow whose `actOutcome` is `sent`/`unconfirmed`/`lost_race`
 as a sample, and treats a snapshot taken with `contextUnavailable` like a missing snapshot.
 A human denial that cannot be re-evaluated is listed as an `unevaluable_deny` entry so it can be
