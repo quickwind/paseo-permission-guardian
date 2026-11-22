@@ -451,3 +451,13 @@ Added 2026-11-22; earlier sections are unchanged.
 - **R10 (replay samples).** Replay never counts a human-attributed allow whose `actOutcome` is
   `unconfirmed` or `lost_race` as a sample (the outcome of the plugin's own answer is unclear, so the record is not trusted
   as human evidence).
+- **R11 (Paseo self roots).** §3.9.4's literal `~/.paseo/**` also covers Paseo's default worktree
+  location `~/.paseo/worktrees/...`, which made ordinary worktree edits L3 and repo `config.json`
+  reads secret reads. For the Paseo home roots `~/.paseo` and `$PASEO_HOME` (POSIX and Windows,
+  including `%USERPROFILE%\.paseo`, `%PASEO_HOME%` and `$env:PASEO_HOME`) only these are plugin-self:
+  the root itself, `config.json`, `settings.json`, `plugin-settings/**`, `plugins/**`,
+  `permission-guardian/**`, `state/**`, and root-level `*.key`, `*.pem` and `daemon*.json`. Writes to
+  them are L3 plugin-self; reads of `config.json`, `settings.json` and `plugin-settings/**/*.json`
+  are secret reads. `worktrees/**` and every other subpath are ordinary. `PASEO_PLUGIN_DIR`,
+  `PASEO_GUARDIAN_DATA_DIR` and the plugin data dir stay whole-root. A worktree that itself lies
+  inside a protected subtree (e.g. `~/.paseo/plugins/x`) keeps the protection.

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { resolvePaseoSelfRoots } from "../paths/index.js";
+import { resolvePaseoHomeRoots, resolvePaseoSelfRoots } from "../paths/index.js";
 
 /** Version of the persisted engine data layout. Bump when stored gate data changes shape. */
 export const ENGINE_DATA_VERSION = 1;
@@ -25,6 +25,7 @@ export function computeEnvDigest(
 ): string {
   const canonical = JSON.stringify({
     paseoRoots: resolvePaseoSelfRoots(env, home, dataDir),
+    paseoHomeRoots: resolvePaseoHomeRoots(env, home),
     cdpathSet: Boolean(env.CDPATH),
   });
   return createHash("sha256").update(canonical).digest("hex");

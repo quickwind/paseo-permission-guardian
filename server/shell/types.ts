@@ -56,6 +56,11 @@ export interface LayerContext {
   cwd: string;
   worktreeRoot?: string;
   home?: string;
+  /** Carried from the outer path context so inner-layer path classification matches (F2). */
+  pluginDataDir?: string;
+  paseoRoots?: string[];
+  paseoHomeRoots?: string[];
+  skipHostRealpath?: boolean;
   depth: number;
   pwshHost?: PwshHostMode;
   pwshHostProvider?: PwshHostProvider;

@@ -78,7 +78,7 @@ describe("p2a path/normalization hardening", () => {
 
   it.each([
     "$PASEO_PLUGIN_DIR/x.json", "${PASEO_PLUGIN_DIR}/x.json", "$PASEO_GUARDIAN_DATA_DIR/x",
-    "${PASEO_GUARDIAN_DATA_DIR}/x", "${PASEO_HOME}/x", "$PASEO_HOME",
+    "${PASEO_GUARDIAN_DATA_DIR}/x", "${PASEO_HOME}/config.json", "$PASEO_HOME",
   ])("writes to %s are L3 when the variable is set", async (p) => {
     const r = await decideAction(
       editAction(p),

@@ -10,6 +10,7 @@ import {
   type WindowsPathClassification,
   type WindowsPathContext,
 } from "./windows.js";
+import { matchPaseoHomeRel, relUnder } from "./paseo-self.js";
 
 export {
   classifyWindowsPath,
@@ -29,8 +30,13 @@ export interface PathContext {
   extraSensitivePatterns?: string[];
   extraProtectedPatterns?: string[];
   skipHostRealpath?: boolean;
-  /** Extra plugin-self roots (already resolved); see resolvePaseoSelfRoots. */
+  /** Whole-root plugin-self roots (already resolved); see resolvePaseoSelfRoots. */
   paseoRoots?: string[];
+  /**
+   * Paseo home roots (`~/.paseo`, `$PASEO_HOME`) where only specific control subpaths are
+   * plugin-self (ruling R11); see resolvePaseoHomeRoots / matchPaseoHomeRel.
+   */
+  paseoHomeRoots?: string[];
   envSnapshot?: Record<string, string | undefined>;
 }
 
@@ -137,22 +143,7 @@ const ENTRYPOINT_BASENAMES = new Set([
   "directory.build.targets",
 ]);
 
-/**
- * Roots whose contents belong to Paseo or this plugin (plugin-self). Only defined,
- * absolute values are returned.
- */
-export function resolvePaseoSelfRoots(
-  env: Record<string, string | undefined>,
-  home: string,
-  pluginDataDir?: string,
-): string[] {
-  const candidates = [
-    joinAware(home, ".paseo"),
-    env.PASEO_HOME,
-    env.PASEO_PLUGIN_DIR,
-    env.PASEO_GUARDIAN_DATA_DIR,
-    pluginDataDir,
-  ];
+function absoluteRoots(candidates: Array<string | undefined>): string[] {
   const roots: string[] = [];
   for (const c of candidates) {
     if (!c) continue;
@@ -160,6 +151,31 @@ export function resolvePaseoSelfRoots(
     if (t && (posix.isAbsolute(t) || isAbsolute(t))) roots.push(t);
   }
   return Array.from(new Set(roots));
+}
+
+/**
+ * Whole-root plugin-self roots: everything below them belongs to Paseo plugins or this plugin
+ * (`PASEO_PLUGIN_DIR`, `PASEO_GUARDIAN_DATA_DIR`, the plugin data dir). Only defined, absolute
+ * values are returned. Paseo home roots are separate (ruling R11): see resolvePaseoHomeRoots.
+ */
+export function resolvePaseoSelfRoots(
+  env: Record<string, string | undefined>,
+  _home: string,
+  pluginDataDir?: string,
+): string[] {
+  return absoluteRoots([env.PASEO_PLUGIN_DIR, env.PASEO_GUARDIAN_DATA_DIR, pluginDataDir]);
+}
+
+/**
+ * Paseo home roots (`~/.paseo`, `$PASEO_HOME`). Only the control subpaths listed in
+ * `matchPaseoHomeRel` are plugin-self below them; `worktrees/**` (Paseo's default worktree
+ * location) is ordinary (ruling R11).
+ */
+export function resolvePaseoHomeRoots(
+  env: Record<string, string | undefined>,
+  home: string,
+): string[] {
+  return absoluteRoots([joinAware(home, ".paseo"), env.PASEO_HOME]);
 }
 
 function toPosixSlash(value: string): string {
@@ -299,6 +315,7 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
   const home = ctx.home ?? homedir();
   const realHome = resolveReal(home);
   const paseoRoots = ctx.paseoRoots ?? resolvePaseoSelfRoots(ctx.envSnapshot ?? {}, home, ctx.pluginDataDir);
+  const paseoHomeRoots = ctx.paseoHomeRoots ?? resolvePaseoHomeRoots(ctx.envSnapshot ?? {}, home);
   let pathInput = rawPath;
   const varMatch = /^\$(?:\{(PASEO_HOME|PASEO_PLUGIN_DIR|PASEO_GUARDIAN_DATA_DIR)\}|(PASEO_HOME|PASEO_PLUGIN_DIR|PASEO_GUARDIAN_DATA_DIR))(?=\/|$)/.exec(
     rawPath.trim(),
@@ -385,6 +402,27 @@ export function classifyPosixPath(rawPath: string, ctx: PathContext): PathClassi
       if (base === "config.json" || base === "settings.json") {
         isSensitive = true;
         matchedRules.push(`sensitive:paseo_self:${base}`);
+      }
+    }
+  }
+
+  // Paseo home roots: only specific control subpaths (ruling R11).
+  for (const root of paseoHomeRoots) {
+    const realRoot = resolveReal(root);
+    for (const c of candidates) {
+      for (const r of new Set([root, realRoot])) {
+        const rel = relUnder(c, r, false);
+        if (rel === null) continue;
+        const m = matchPaseoHomeRel(rel);
+        if (m.protected) {
+          isProtected = true;
+          isPluginSelf = true;
+          matchedRules.push("protected:plugin_self", `protected:paseo_home:${rel || "."}`);
+        }
+        if (m.secret) {
+          isSensitive = true;
+          matchedRules.push(`sensitive:paseo_self:${base}`);
+        }
       }
     }
   }

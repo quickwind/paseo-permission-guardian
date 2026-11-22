@@ -1,7 +1,7 @@
 import type { Action } from "../shared/types.js";
 import type { SessionState } from "./context/session.js";
 import type { DecideOptions } from "./decide.js";
-import { resolvePaseoSelfRoots, type WindowsPathContext } from "./paths/index.js";
+import { resolvePaseoHomeRoots, resolvePaseoSelfRoots, type WindowsPathContext } from "./paths/index.js";
 import type { PwshHostProvider } from "./shell/pwsh-host.js";
 
 /**
@@ -38,6 +38,7 @@ export function buildDecidePathCtx(input: DecidePathCtxInput): WindowsPathContex
     worktreeRoot: action.worktreeRoot ?? input.agentCwd ?? action.cwd,
     pluginDataDir: input.dataDir,
     paseoRoots: resolvePaseoSelfRoots(input.env, input.home, input.dataDir),
+    paseoHomeRoots: resolvePaseoHomeRoots(input.env, input.home),
   };
   if (input.skipHostRealpath) pathCtx.skipHostRealpath = true;
   return pathCtx;
