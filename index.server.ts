@@ -38,6 +38,7 @@ export default function contribute(server: PluginServerContext) {
       if (state.status === "ready") {
         guardian.updateSettings(state.values);
       } else {
+        guardian.markSettingsInvalid(state.error ?? "invalid");
         console.error(
           `[paseo-permission-guardian] Stored settings invalid (${state.error}); using defaults.`,
         );
@@ -50,6 +51,8 @@ export default function contribute(server: PluginServerContext) {
   const unsubscribeSettings = settingsHandle.subscribe((state) => {
     if (state.status === "ready") {
       guardian.updateSettings(state.values);
+    } else {
+      guardian.markSettingsInvalid(state.error ?? "invalid");
     }
   });
 

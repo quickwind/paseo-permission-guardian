@@ -44,6 +44,8 @@ export interface EffectAnalysisOptions {
   allowPosixPwshHost?: boolean;
   pwshBinaryPath?: string;
   envSnapshot?: Record<string, string | undefined>;
+  /** Session timeline could not be synced; context-sensitive calls must not be auto-allowed. */
+  contextUnavailable?: boolean;
 }
 
 const DEFAULT_TRUSTED_DOMAINS = [
@@ -1659,6 +1661,10 @@ export async function analyzeActionEffects(
   let touchedUntrusted = false;
   if (action.sandboxBypass) {
     effects.push({ tag: "privilege", layer: 0, detail: "sandbox_bypass" });
+  }
+  if (options.contextUnavailable) {
+    effects.push({ tag: "opaque", layer: 0, detail: "context_unavailable" });
+    opaqueReasons.push("context_unavailable");
   }
 
   const basePathCtx: WindowsPathContext = {

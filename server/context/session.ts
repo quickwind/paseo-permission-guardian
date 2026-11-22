@@ -116,17 +116,17 @@ export class SessionContextStore {
     agentId: string,
     pathCtx: PathContext,
     fetchTimeline?: TimelineFetcher,
-  ): Promise<SessionState> {
+  ): Promise<{ state: SessionState; contextAvailable: boolean }> {
     const state = this.getOrCreate(agentId);
     if (!fetchTimeline) {
-      return state;
+      return { state, contextAvailable: true };
     }
 
     let items: AgentTimelineItem[];
     try {
       items = await fetchTimeline(agentId);
     } catch {
-      return state;
+      return { state, contextAvailable: false };
     }
 
     for (const item of items) {
@@ -153,10 +153,13 @@ export class SessionContextStore {
         if (SENSITIVE_SHELL_SECRET_REGEX.test(detail.command)) {
           this.markSecretTaint(agentId);
         }
+      } else {
+        // Unknown tool-call types may have consumed untrusted content (fail safe).
+        this.markUntrustedTaint(agentId);
       }
     }
 
-    return state;
+    return { state, contextAvailable: true };
   }
 
   /**

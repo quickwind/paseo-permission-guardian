@@ -7,7 +7,7 @@ import type {
   ResolutionActor,
 } from "../shared/types.js";
 import { AuditStore } from "./audit/store.js";
-import { SessionContextStore, type TimelineFetcher } from "./context/session.js";
+import { SessionContextStore, type SessionState, type TimelineFetcher } from "./context/session.js";
 import { decideAction } from "./decide.js";
 import { resolvePaseoSelfRoots } from "./paths/index.js";
 import { detectHostOs, normalizePermissionRequest } from "./normalize/index.js";
@@ -38,6 +38,7 @@ export class PermissionGuardianService {
   private readonly answeredByPlugin = new Map<string, PluginAnsweredEntry>();
 
   private settings: GuardianSettings;
+  private settingsInvalid = false;
 
   constructor(options: GuardianServiceOptions) {
     this.auditStore = options.auditStore;
@@ -50,6 +51,7 @@ export class PermissionGuardianService {
 
   updateSettings(next: GuardianSettings): void {
     this.settings = next;
+    this.settingsInvalid = false;
   }
 
   getSettings(): GuardianSettings {
@@ -60,11 +62,19 @@ export class PermissionGuardianService {
     return this.sessionStore;
   }
 
+  markSettingsInvalid(_reason: string): void {
+    this.settingsInvalid = true;
+  }
+
+  getEffectiveBaseMode(): "off" | "shadow" | "act" {
+    return this.settingsInvalid ? "shadow" : this.settings.mode;
+  }
+
   getStatus(): GuardianStatusSnapshot {
     return {
       pluginVersion: this.pluginVersion,
       mode: this.settings.mode,
-      effectiveMode: this.settings.mode === "off" ? "off" : "shadow",
+      effectiveMode: this.getEffectiveBaseMode() === "off" ? "off" : "shadow",
       dataDir: this.auditStore.getDataDir(),
       metrics: this.auditStore.getMetrics(),
     };
@@ -112,13 +122,24 @@ export class PermissionGuardianService {
       };
 
       // Incremental same-turn timeline sync for context-sensitive calls (ADR-0002)
-      const session = CONTEXT_SENSITIVE_KINDS.has(normalized.action.kind)
-        ? await this.sessionStore.syncFromTimeline(payload.agent.id, pathCtx, fetchTimeline)
-        : this.sessionStore.getOrCreate(payload.agent.id);
+      let contextUnavailable = false;
+      let session: SessionState;
+      if (CONTEXT_SENSITIVE_KINDS.has(normalized.action.kind)) {
+        const synced = await this.sessionStore.syncFromTimeline(
+          payload.agent.id,
+          pathCtx,
+          fetchTimeline,
+        );
+        session = synced.state;
+        contextUnavailable = !synced.contextAvailable;
+      } else {
+        session = this.sessionStore.getOrCreate(payload.agent.id);
+      }
 
       const evaluated = await decideAction(normalized.action, {
         pathCtx,
         session,
+        contextUnavailable,
         denyAsAsk: this.settings.denyAsAsk,
         envSnapshot: process.env,
       });
